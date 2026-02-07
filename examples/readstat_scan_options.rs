@@ -1,6 +1,6 @@
 use polars::prelude::*;
 use std::path::PathBuf;
-use stata_reader::{readstat_scan, ReadStatFormat, ScanOptions};
+use polars_readstat_rs::{readstat_scan, ReadStatFormat, ScanOptions};
 
 /// Usage:
 ///   readstat_scan_options <file>

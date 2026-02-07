@@ -1,5 +1,4 @@
-use polars::prelude::*;
-use stata_reader::reader::Sas7bdatReader;
+use polars_readstat_rs::reader::Sas7bdatReader;
 use std::path::Path;
 
 #[test]

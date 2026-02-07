@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use stata_reader::stata::metadata_json;
+use polars_readstat_rs::stata::metadata_json;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

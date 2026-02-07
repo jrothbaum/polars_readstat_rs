@@ -1,9 +1,6 @@
-use stata_reader::header::{check_header, read_header};
-use stata_reader::metadata::read_metadata;
+use polars_readstat_rs::header::{check_header, read_header};
+use polars_readstat_rs::metadata::read_metadata;
 use std::fs::File;
-
-// Import from lib
-use stata_reader::*;
 
 // We need to access internal modules for testing
 // Since DataReader and ValueParser are not exported, we'll create a simpler test

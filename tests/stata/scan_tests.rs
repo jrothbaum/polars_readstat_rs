@@ -1,6 +1,6 @@
 use polars::prelude::*;
 use std::path::PathBuf;
-use stata_reader::{scan_dta, ScanOptions, StataReader};
+use polars_readstat_rs::{scan_dta, ScanOptions, StataReader};
 
 fn test_data_path(filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

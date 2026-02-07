@@ -1,13 +1,11 @@
-use stata_reader::header::{check_header, read_header};
-use stata_reader::metadata::read_metadata;
+use polars_readstat_rs::header::{check_header, read_header};
+use polars_readstat_rs::metadata::read_metadata;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 
 // Helper to make internal modules accessible for testing
 mod integration {
     use super::*;
-    use stata_reader::*;
-
     // We need to manually construct the pipeline since modules aren't public
     #[test]
     fn test_end_to_end_read() {

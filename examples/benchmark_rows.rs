@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use stata_reader::Sas7bdatReader;
+use polars_readstat_rs::Sas7bdatReader;
 
 /// Usage:
 ///   benchmark_rows <file> <n_rows|full> [--columns a,b,c] [--col-count N] [--pipeline] [--chunk-size N] [--profile]

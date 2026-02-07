@@ -1,6 +1,6 @@
 use std::path::PathBuf;
-use stata_reader::SpssReader;
-use stata_reader::spss::arrow_output::{read_to_arrow_ffi, read_to_arrow_stream_ffi};
+use polars_readstat_rs::SpssReader;
+use polars_readstat_rs::spss::arrow_output::{read_to_arrow_ffi, read_to_arrow_stream_ffi};
 use polars_arrow::ffi::ArrowArrayStreamReader;
 
 fn test_data_path(filename: &str) -> PathBuf {

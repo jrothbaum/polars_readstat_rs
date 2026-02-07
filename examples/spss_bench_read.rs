@@ -1,4 +1,4 @@
-use stata_reader::SpssReader;
+use polars_readstat_rs::SpssReader;
 use std::path::PathBuf;
 use std::time::Instant;
 

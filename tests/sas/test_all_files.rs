@@ -1,5 +1,5 @@
-use stata_reader::header::{check_header, read_header};
-use stata_reader::metadata::read_metadata;
+use polars_readstat_rs::header::{check_header, read_header};
+use polars_readstat_rs::metadata::read_metadata;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;

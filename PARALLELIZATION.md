@@ -65,7 +65,7 @@ Decompress        ├──> Parse rows ───> Build DataFrame chunk
 
 ### Simple API (Recommended)
 ```rust
-use stata_reader::reader::Sas7bdatReader;
+use polars_readstat_rs::reader::Sas7bdatReader;
 
 // Automatically chooses best method
 let reader = Sas7bdatReader::open("file.sas7bdat")?;

@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use stata_reader::sas::arrow_output::{read_to_arrow_array_ffi, read_to_arrow_schema_ffi, read_to_arrow_stream_ffi};
+use polars_readstat_rs::sas::arrow_output::{read_to_arrow_array_ffi, read_to_arrow_schema_ffi, read_to_arrow_stream_ffi};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

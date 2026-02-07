@@ -1,4 +1,4 @@
-use stata_reader::StataReader;
+use polars_readstat_rs::StataReader;
 
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

@@ -24,6 +24,7 @@ pub fn all_sas_files() -> Vec<PathBuf> {
 }
 
 /// Get test files by category
+#[allow(dead_code)]
 pub fn files_by_pattern(pattern: &str) -> Vec<PathBuf> {
     let search_pattern = format!(
         "{}/tests/sas/data/**/*{}*.sas7bdat",
@@ -38,6 +39,7 @@ pub fn files_by_pattern(pattern: &str) -> Vec<PathBuf> {
 }
 
 /// Count total files and print summary
+#[allow(dead_code)]
 pub fn test_file_summary() {
     let files = all_sas_files();
     println!("Found {} SAS7BDAT test files", files.len());

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use stata_reader::reader::Sas7bdatReader;
+use polars_readstat_rs::reader::Sas7bdatReader;
 use std::path::PathBuf;
 use glob::glob;
 
@@ -55,7 +55,7 @@ fn bench_thread_scaling(c: &mut Criterion) {
                 |b, &num_threads| {
                     b.iter(|| {
                         let reader = Sas7bdatReader::open(black_box(&file)).unwrap();
-                        reader.read().with_threads(black_box(num_threads)).finish().unwrap()
+                        reader.read().with_n_threads(black_box(num_threads)).finish().unwrap()
                     });
                 },
             );

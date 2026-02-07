@@ -1,8 +1,7 @@
 mod common;
 
-use stata_reader::reader::Sas7bdatReader;
+use polars_readstat_rs::reader::Sas7bdatReader;
 use common::{all_sas_files, test_data_path};
-use std::sync::Arc;
 
 #[test]
 fn test_all_files_can_be_opened() {
@@ -47,18 +46,14 @@ fn test_all_files_can_read_metadata() {
 fn test_all_files_can_read_data() {
     let files = all_sas_files();
     let mut failed = Vec::new();
-    let mut skipped = 0;
-
     for file in &files {
         if file.to_string_lossy().contains("zero_variables.sas7bdat") {
-            skipped += 1;
             continue;
         }
 
         // Limit check for test speed
         if let Ok(m) = std::fs::metadata(file) {
             if m.len() > 500 * 1024 * 1024 { // Skip > 500MB for general CI
-                skipped += 1;
                 continue;
             }
         }

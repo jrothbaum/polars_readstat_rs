@@ -1,7 +1,7 @@
 mod common;
 
-use stata_reader::reader::Sas7bdatReader;
-use stata_reader::{scan_sas7bdat, ScanOptions};
+use polars_readstat_rs::reader::Sas7bdatReader;
+use polars_readstat_rs::{scan_sas7bdat, ScanOptions};
 use common::{test_data_path, all_sas_files};
 use polars::prelude::*;
 
@@ -89,7 +89,7 @@ fn test_compressed_data_validity() {
     }
 }
 
-// NOTE: test_arrow_stream_integration removed - stata_reader::arrow_output::read_to_arrow
+// NOTE: test_arrow_stream_integration removed - polars_readstat_rs::arrow_output::read_to_arrow
 // no longer exists. Only read_to_arrow_ffi remains in the arrow_output module.
 
 /// Regression test: verify metadata accessibility

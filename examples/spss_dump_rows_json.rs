@@ -1,5 +1,5 @@
-use stata_reader::SpssReader;
-use stata_reader::spss::VarType;
+use polars_readstat_rs::SpssReader;
+use polars_readstat_rs::spss::VarType;
 
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

@@ -27,7 +27,7 @@ Using optimal types provides:
 ### Arrow Streaming
 
 ```rust
-use stata_reader::arrow_output::{infer_arrow_schema, ArrowBatchStream};
+use polars_readstat_rs::arrow_output::{infer_arrow_schema, ArrowBatchStream};
 
 // Pass 1: Infer schema
 let schema = infer_arrow_schema("data.sas7bdat", 10000, true)?;
@@ -43,7 +43,7 @@ while let Some(batch) = stream.next_batch()? {
 ### Polars Reading
 
 ```rust
-use stata_reader::reader::Sas7bdatReader;
+use polars_readstat_rs::reader::Sas7bdatReader;
 use polars::prelude::*;
 use std::sync::Arc;
 
@@ -112,7 +112,7 @@ The inference algorithm scans all values in each numeric column:
 ### Example 1: Basic Inference
 
 ```rust
-use stata_reader::arrow_output::{read_to_arrow, read_to_arrow_inferred};
+use polars_readstat_rs::arrow_output::{read_to_arrow, read_to_arrow_inferred};
 
 // Default: all numerics as Float64
 let batch_default = read_to_arrow("data.sas7bdat")?;
@@ -151,8 +151,8 @@ writer.close()?;
 ### Example 3: Custom Schema Control
 
 ```rust
-use stata_reader::arrow_output::{infer_arrow_schema, dataframe_to_arrow_with_schema};
-use stata_reader::reader::Sas7bdatReader;
+use polars_readstat_rs::arrow_output::{infer_arrow_schema, dataframe_to_arrow_with_schema};
+use polars_readstat_rs::reader::Sas7bdatReader;
 
 // Infer without boolean detection
 let schema = infer_arrow_schema("data.sas7bdat", 10000, false)?;
@@ -178,7 +178,7 @@ let batch = dataframe_to_arrow_with_schema(df, schema)?;
 ### Example: Stream to Parquet
 
 ```rust
-use stata_reader::arrow_output::{infer_arrow_schema, ArrowBatchStream};
+use polars_readstat_rs::arrow_output::{infer_arrow_schema, ArrowBatchStream};
 use parquet::arrow::ArrowWriter;
 use std::fs::File;
 

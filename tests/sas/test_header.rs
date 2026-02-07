@@ -1,4 +1,4 @@
-use stata_reader::header::{check_header, read_header};
+use polars_readstat_rs::header::{check_header, read_header};
 use std::fs::File;
 
 #[test]

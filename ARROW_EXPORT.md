@@ -5,7 +5,7 @@ The SAS7BDAT reader can export data as Apache Arrow RecordBatches, enabling inte
 ## Quick Start
 
 ```rust
-use stata_reader::arrow_output::read_to_arrow;
+use polars_readstat_rs::arrow_output::read_to_arrow;
 
 // Read entire file as Arrow RecordBatch
 let batch = read_to_arrow("data.sas7bdat")?;
@@ -31,7 +31,7 @@ let batch = dataframe_to_arrow(df)?;
 ### Streaming Large Files
 
 ```rust
-use stata_reader::arrow_output::ArrowBatchStream;
+use polars_readstat_rs::arrow_output::ArrowBatchStream;
 
 // Stream in 10,000-row batches
 let mut stream = ArrowBatchStream::new("large_file.sas7bdat", 10_000)?;
@@ -149,7 +149,7 @@ print(table.schema)
 
 ```toml
 [dependencies]
-stata_reader = "0.1"
+polars_readstat_rs = "0.1"
 arrow = "54.0"
 
 # Optional: for Parquet export

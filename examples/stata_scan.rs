@@ -1,5 +1,5 @@
 use polars::prelude::*;
-use stata_reader::{scan_dta, ScanOptions};
+use polars_readstat_rs::{scan_dta, ScanOptions};
 
 fn main() -> PolarsResult<()> {
     let args: Vec<String> = std::env::args().collect();

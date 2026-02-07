@@ -1,8 +1,8 @@
 use polars_arrow::ffi::ArrowArrayStreamReader;
 use std::path::PathBuf;
-use stata_reader::sas::arrow_output::read_to_arrow_stream_ffi as sas_stream;
-use stata_reader::stata::arrow_output::read_to_arrow_stream_ffi as stata_stream;
-use stata_reader::spss::arrow_output::read_to_arrow_stream_ffi as spss_stream;
+use polars_readstat_rs::sas::arrow_output::read_to_arrow_stream_ffi as sas_stream;
+use polars_readstat_rs::stata::arrow_output::read_to_arrow_stream_ffi as stata_stream;
+use polars_readstat_rs::spss::arrow_output::read_to_arrow_stream_ffi as spss_stream;
 
 fn big_sas_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

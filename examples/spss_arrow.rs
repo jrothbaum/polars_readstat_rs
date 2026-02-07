@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use stata_reader::spss::arrow_output::{
+use polars_readstat_rs::spss::arrow_output::{
     read_to_arrow_array_ffi, read_to_arrow_schema_ffi, read_to_arrow_stream_ffi,
 };
 

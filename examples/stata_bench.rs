@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use stata_reader::StataReader;
+use polars_readstat_rs::StataReader;
 
 /// Usage:
 ///   stata_bench <file> <n_rows|full> [--columns a,b,c] [--col-count N] [--threads N]

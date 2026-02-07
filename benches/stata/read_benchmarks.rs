@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use glob::glob;
-use stata_reader::StataReader;
+use polars_readstat_rs::StataReader;
 use std::path::PathBuf;
 
 fn find_test_files() -> Vec<PathBuf> {

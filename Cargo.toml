@@ -2,6 +2,10 @@
 name = "polars_readstat_rs"
 version = "0.1.0"
 edition = "2021"
+description = "Pure Rust readers for SAS, Stata, and SPSS with Polars and Arrow outputs"
+license = "MIT"
+repository = "https://github.com/jrothbaum/polars_readstat_rs"
+readme = "README.md"
 
 [dependencies]
 polars = { version = "0.51", features = ["lazy", "dtype-datetime", "dtype-date"] }
@@ -15,8 +19,6 @@ flate2 = "1.0"
 serde_json = "1.0"
 
 [dev-dependencies]
-walkdir = "2.4"
-parquet = "54.0"
 criterion = "0.5"
 glob = "0.3"
 
