@@ -34,6 +34,18 @@ pub enum Error {
 
     #[error("Arrow conversion error: {0}")]
     ConversionError(String),
+
+    #[error("Unsupported type for Stata writer: {0}")]
+    UnsupportedType(String),
+
+    #[error("Invalid Stata variable name: {0}")]
+    InvalidName(String),
+
+    #[error("String value is too long for Stata: {0}")]
+    StringTooLong(String),
+
+    #[error("Numeric value is out of range for Stata")]
+    NumericOutOfRange,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

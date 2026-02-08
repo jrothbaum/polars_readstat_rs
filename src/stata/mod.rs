@@ -1,4 +1,5 @@
 pub(crate) mod data;
+pub(crate) mod compress;
 pub(crate) mod encoding;
 pub(crate) mod error;
 pub(crate) mod header;
@@ -10,9 +11,22 @@ pub mod polars_output;
 
 pub mod arrow_output;
 pub mod reader;
+pub mod writer;
 
 pub use error::{Error, Result};
 pub use reader::StataReader;
+pub use compress::{compress_df, CompressOptions};
+pub use writer::{
+    pandas_make_stata_column_names,
+    pandas_prepare_df_for_stata,
+    pandas_rename_df,
+    StataWriter,
+    ValueLabelMap,
+    ValueLabels,
+    VariableLabels,
+    StataWriteColumn,
+    StataWriteSchema,
+};
 pub use polars_output::scan_dta;
 pub use types::{Endian, Header, Metadata, NumericType, VarType};
 

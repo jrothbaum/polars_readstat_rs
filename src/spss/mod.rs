@@ -2,6 +2,7 @@ pub(crate) mod error;
 pub(crate) mod header;
 pub(crate) mod metadata;
 pub(crate) mod types;
+pub mod writer;
 pub(crate) mod data;
 pub(crate) mod reader;
 pub mod polars_output;
@@ -9,6 +10,15 @@ pub mod arrow_output;
 
 pub use error::{Error, Result};
 pub use reader::SpssReader;
+pub use writer::{
+    SpssValueLabelKey,
+    SpssValueLabelMap,
+    SpssValueLabels,
+    SpssVariableLabels,
+    SpssWriteColumn,
+    SpssWriteSchema,
+    SpssWriter,
+};
 pub use polars_output::scan_sav;
 pub use types::{Endian, Header, Metadata, VarType};
 

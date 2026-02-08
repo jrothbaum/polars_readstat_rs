@@ -74,10 +74,12 @@ pub fn read_f32(buf: &[u8], endian: Endian, rules: MissingRules) -> Option<f32> 
         Endian::Little => cursor.read_u32::<LittleEndian>().ok()?,
         Endian::Big => cursor.read_u32::<BigEndian>().ok()?,
     };
-    if bits > rules.max_float {
+    let v = f32::from_bits(bits);
+    let sign = (bits & 0x8000_0000) != 0;
+    if v.is_nan() || (!sign && bits > rules.max_float) {
         None
     } else {
-        Some(f32::from_bits(bits))
+        Some(v)
     }
 }
 
@@ -87,10 +89,12 @@ pub fn read_f64(buf: &[u8], endian: Endian, rules: MissingRules) -> Option<f64> 
         Endian::Little => cursor.read_u64::<LittleEndian>().ok()?,
         Endian::Big => cursor.read_u64::<BigEndian>().ok()?,
     };
-    if bits > rules.max_double {
+    let v = f64::from_bits(bits);
+    let sign = (bits & 0x8000_0000_0000_0000) != 0;
+    if v.is_nan() || (!sign && bits > rules.max_double) {
         None
     } else {
-        Some(f64::from_bits(bits))
+        Some(v)
     }
 }
 

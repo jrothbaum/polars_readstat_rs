@@ -36,7 +36,32 @@ pub use sas::{Compression, Endian, Format, Platform};
 pub use sas::scan_sas7bdat;
 
 pub use spss::{Error as SpssError, Result as SpssResult, SpssReader, scan_sav};
-pub use stata::{Error as StataError, Result as StataResult, StataReader, scan_dta};
+pub use spss::{
+    SpssValueLabelKey,
+    SpssValueLabelMap,
+    SpssValueLabels,
+    SpssVariableLabels,
+    SpssWriteColumn,
+    SpssWriteSchema,
+    SpssWriter,
+};
+pub use stata::{
+    Error as StataError,
+    Result as StataResult,
+    StataReader,
+    StataWriteColumn,
+    StataWriteSchema,
+    StataWriter,
+    ValueLabelMap,
+    ValueLabels,
+    VariableLabels,
+    compress_df,
+    CompressOptions,
+    pandas_make_stata_column_names,
+    pandas_prepare_df_for_stata,
+    pandas_rename_df,
+    scan_dta,
+};
 
 use std::path::Path;
 
