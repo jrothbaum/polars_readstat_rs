@@ -1901,6 +1901,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "polars-readstat-rs"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "chrono",
+ "criterion",
+ "encoding_rs",
+ "flate2",
+ "glob",
+ "polars",
+ "polars-arrow",
+ "rayon",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "polars-row"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2041,23 +2058,6 @@ dependencies = [
  "stacker",
  "uuid",
  "version_check",
-]
-
-[[package]]
-name = "polars_readstat_rs"
-version = "0.1.0"
-dependencies = [
- "byteorder",
- "chrono",
- "criterion",
- "encoding_rs",
- "flate2",
- "glob",
- "polars",
- "polars-arrow",
- "rayon",
- "serde_json",
- "thiserror 1.0.69",
 ]
 
 [[package]]

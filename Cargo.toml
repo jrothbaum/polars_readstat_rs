@@ -1,5 +1,5 @@
 [package]
-name = "polars_readstat_rs"
+name = "polars-readstat-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Pure Rust readers for SAS, Stata, and SPSS with Polars and Arrow outputs"
