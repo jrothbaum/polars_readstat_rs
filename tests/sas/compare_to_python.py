@@ -132,7 +132,10 @@ def main():
     print("Build OK\n")
 
     # Find all test files
-    sas_files = sorted(TEST_DATA_DIR.glob("**/*.sas7bdat"))
+    sas_files = sorted(
+        f for f in TEST_DATA_DIR.glob("**/*.sas7bdat")
+        if "too_big" not in f.parts
+    )
     sas_files = [f for f in sas_files if f.stat().st_size <= MAX_FILE_SIZE]
 
     if not sas_files:

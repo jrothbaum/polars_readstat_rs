@@ -8,7 +8,7 @@ use polars::prelude::*;
 /// Regression test: verify specific data values using the Lazy API
 #[test]
 fn test_test1_data_values() {
-    let path = test_data_path("test1.sas7bdat");
+    let path = test_data_path("data_pandas/test1.sas7bdat");
     if !path.exists() { return; }
 
     // Use the new AnonymousScan entry point
@@ -34,7 +34,7 @@ fn test_test1_data_values() {
 /// Regression test: verify that Projection Pushdown (column selection) works
 #[test]
 fn test_column_projection() {
-    let path = test_data_path("test1.sas7bdat");
+    let path = test_data_path("data_pandas/test1.sas7bdat");
     if !path.exists() { return; }
 
     // This specifically tests that your SasScan resolves names to indices correctly
@@ -51,7 +51,7 @@ fn test_column_projection() {
 /// Regression test: verify limit pushdown
 #[test]
 fn test_limit_pushdown() {
-    let path = test_data_path("test1.sas7bdat");
+    let path = test_data_path("data_pandas/test1.sas7bdat");
     if !path.exists() { return; }
 
     // This tests that opts.n_rows is passed correctly to your pipeline
@@ -95,9 +95,7 @@ fn test_compressed_data_validity() {
 /// Regression test: verify metadata accessibility
 #[test]
 fn test_metadata_accuracy() {
-    let files: Vec<_> = all_sas_files().into_iter()
-        .filter(|f| std::fs::metadata(f).map(|m| m.len() < 500 * 1024 * 1024).unwrap_or(false))
-        .collect();
+    let files: Vec<_> = all_sas_files().into_iter().collect();
     let sample = files.iter().take(5);
 
     for file in sample {

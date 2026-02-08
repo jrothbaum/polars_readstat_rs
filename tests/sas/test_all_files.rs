@@ -1,5 +1,6 @@
 use polars_readstat_rs::header::{check_header, read_header};
 use polars_readstat_rs::metadata::read_metadata;
+use polars_readstat_rs::reader::Sas7bdatReader;
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
 use std::path::Path;
@@ -46,25 +47,34 @@ fn test_file(path: &Path) -> Result<(), String> {
         }
     }
 
+    // Read only a small subset of rows to avoid high memory usage
+    let reader = Sas7bdatReader::open(path)
+        .map_err(|e| format!("Failed to open for data read: {}", e))?;
+    let limit = usize::min(100_000, reader.metadata().row_count);
+    let df = reader
+        .read()
+        .with_limit(limit)
+        .finish()
+        .map_err(|e| format!("Read failed: {}", e))?;
+    if df.height() != limit {
+        return Err(format!(
+            "Row count mismatch: expected {}, got {}",
+            limit,
+            df.height()
+        ));
+    }
+
     Ok(())
 }
 
 #[test]
 fn test_all_sas7bdat_files() {
-    let test_dir = "crates/cpp-sas7bdat/vendor/test";
-
-    let paths = std::fs::read_dir(test_dir)
-        .expect("Failed to read test directory");
+    let test_dir = "tests/sas/data";
 
     let mut files = Vec::new();
-    for entry in paths {
-        let entry = entry.unwrap();
-        let path = entry.path();
-
-        // Recursively find all .sas7bdat files
-        if path.is_dir() {
-            find_sas_files(&path, &mut files);
-        }
+    let root = Path::new(test_dir);
+    if root.exists() {
+        find_sas_files(root, &mut files);
     }
 
     println!("\n=== Testing {} SAS7BDAT files ===\n", files.len());
@@ -112,6 +122,9 @@ fn find_sas_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                if path.file_name().and_then(|s| s.to_str()) == Some("too_big") {
+                    continue;
+                }
                 find_sas_files(&path, files);
             } else if path.extension().and_then(|s| s.to_str()) == Some("sas7bdat") {
                 files.push(path);

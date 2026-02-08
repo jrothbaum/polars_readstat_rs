@@ -52,18 +52,15 @@ fn test_all_files_can_read_data() {
         }
 
         // Limit check for test speed
-        if let Ok(m) = std::fs::metadata(file) {
-            if m.len() > 500 * 1024 * 1024 { // Skip > 500MB for general CI
-                continue;
-            }
-        }
+        // file size already filtered above
 
         match Sas7bdatReader::open(file) {
             Ok(reader) => {
                 // Using new builder pattern
-                match reader.read().finish() {
+                let limit = usize::min(200_000, reader.metadata().row_count);
+                match reader.read().with_limit(limit).finish() {
                     Ok(df) => {
-                        assert_eq!(df.height(), reader.metadata().row_count);
+                        assert_eq!(df.height(), limit);
                         assert_eq!(df.width(), reader.metadata().column_count);
                     }
                     Err(e) => failed.push((file.clone(), e.to_string())),
@@ -77,11 +74,12 @@ fn test_all_files_can_read_data() {
 
 #[test]
 fn test_batch_reading_matches_full_read() {
-    let test_file = test_data_path("test1.sas7bdat");
+    let test_file = test_data_path("data_pandas/test1.sas7bdat");
     if !test_file.exists() { return; }
 
     let reader = Sas7bdatReader::open(&test_file).unwrap();
-    let full_df = reader.read().finish().unwrap();
+    let limit = usize::min(200_000, reader.metadata().row_count);
+    let full_df = reader.read().with_limit(limit).finish().unwrap();
 
     let mid = full_df.height() / 2;
     
@@ -108,13 +106,14 @@ fn test_parallel_and_pipeline_match() {
     let reader = Sas7bdatReader::open(&test_file).unwrap();
 
     // 1. Parallel (default)
-    let df_par = reader.read().finish().unwrap();
+    let limit = usize::min(200_000, reader.metadata().row_count);
+    let df_par = reader.read().with_limit(limit).finish().unwrap();
 
     // 2. Sequential
-    let df_seq = reader.read().sequential().finish().unwrap();
+    let df_seq = reader.read().sequential().with_limit(limit).finish().unwrap();
 
     // 3. Pipeline
-    let df_pipe = reader.read().pipeline().finish().unwrap();
+    let df_pipe = reader.read().pipeline().with_limit(limit).finish().unwrap();
 
     assert_eq!(df_par.height(), df_seq.height());
     assert_eq!(df_par.height(), df_pipe.height());
@@ -122,20 +121,31 @@ fn test_parallel_and_pipeline_match() {
 
 #[test]
 fn test_column_selection_builder() {
-    let test_file = test_data_path("psam_p17.sas7bdat");
+    let test_file = test_data_path("test1.sas7bdat");
     if !test_file.exists() { return; }
 
     let reader = Sas7bdatReader::open(&test_file).unwrap();
-    let selected = vec!["RT".to_string(), "AGEP".to_string()];
+    let selected: Vec<String> = reader
+        .metadata()
+        .columns
+        .iter()
+        .take(2)
+        .map(|c| c.name.clone())
+        .collect();
+
+    if selected.len() < 2 {
+        return;
+    }
 
     let df = reader.read()
         .with_columns(selected.clone())
+        .with_limit(usize::min(200_000, reader.metadata().row_count))
         .finish()
         .unwrap();
 
     assert_eq!(df.width(), 2);
-    assert!(df.column("RT").is_ok());
-    assert!(df.column("AGEP").is_ok());
+    assert!(df.column(&selected[0]).is_ok());
+    assert!(df.column(&selected[1]).is_ok());
 }
 
 #[test]

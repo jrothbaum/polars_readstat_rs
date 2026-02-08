@@ -230,7 +230,14 @@ def main():
         sys.exit(1)
     print("Build OK\n")
 
-    sav_files = sorted(TEST_DATA_DIR.glob("**/*.sav")) + sorted(TEST_DATA_DIR.glob("**/*.zsav"))
+    sav_files = [
+        f for f in TEST_DATA_DIR.glob("**/*.sav")
+        if "too_big" not in f.parts
+    ] + [
+        f for f in TEST_DATA_DIR.glob("**/*.zsav")
+        if "too_big" not in f.parts
+    ]
+    sav_files = sorted(sav_files)
     sav_files = [f for f in sav_files if f.stat().st_size <= MAX_FILE_SIZE]
 
     if not sav_files:

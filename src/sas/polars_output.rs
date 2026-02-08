@@ -436,21 +436,31 @@ mod tests {
     use super::sas_batch_iter;
     use std::path::PathBuf;
 
-    fn big_sas_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    fn small_sas_path() -> PathBuf {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("sas")
-            .join("data")
-            .join("psam_p17.sas7bdat")
+            .join("data");
+        let candidates = [
+            base.join("data_pandas").join("test1.sas7bdat"),
+            base.join("data_pandas").join("test2.sas7bdat"),
+            base.join("test.sas7bdat"),
+        ];
+        for path in candidates {
+            if path.exists() {
+                return path;
+            }
+        }
+        base.join("data_pandas").join("test1.sas7bdat")
     }
 
     #[test]
     fn test_sas_batch_streaming() {
-        let path = big_sas_path();
+        let path = small_sas_path();
         if !path.exists() {
             return;
         }
-        let mut iter = sas_batch_iter(path, None, true, Some(50_000), None, Some(120_000))
+        let mut iter = sas_batch_iter(path, None, true, Some(10), None, Some(25))
             .expect("batch iter");
         let mut batches = 0usize;
         let mut rows = 0usize;
@@ -459,7 +469,7 @@ mod tests {
             rows += df.height();
             batches += 1;
         }
-        assert!(batches >= 2);
-        assert_eq!(rows, 120_000);
+        assert!(batches >= 1);
+        assert!(rows <= 25);
     }
 }

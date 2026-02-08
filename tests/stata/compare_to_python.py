@@ -116,6 +116,9 @@ def compare_file(stata_file: Path, n_rows: int, n_cols: int) -> tuple[int, int]:
 
 def main() -> None:
     args = parse_args()
+    if "too_big" in args.file.parts:
+        print("SKIP: file is in too_big")
+        return
     print("=== Comparing Rust Stata reader vs polars_readstat ===")
     print(f"Checking first {args.rows} rows\n")
 

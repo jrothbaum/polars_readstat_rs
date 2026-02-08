@@ -3,7 +3,7 @@ use std::path::Path;
 
 #[test]
 fn test_parallel_vs_sequential_reading() {
-    let test_file = "crates/cpp-sas7bdat/vendor/test/data_pandas/test1.sas7bdat";
+    let test_file = "tests/sas/data/data_pandas/test1.sas7bdat";
 
     if !Path::new(test_file).exists() {
         println!("Test file not found, skipping test");
@@ -11,23 +11,26 @@ fn test_parallel_vs_sequential_reading() {
     }
 
     let reader = Sas7bdatReader::open(test_file).expect("Failed to open file");
+    let limit = usize::min(200_000, reader.metadata().row_count);
 
     println!("File: {}", test_file);
     println!("Compression: {:?}", reader.metadata().compression);
     println!("Row count: {}", reader.metadata().row_count);
 
     // 1. Read using default (Parallel for uncompressed)
-    let df_parallel = reader.read().finish().expect("Failed to read (parallel)");
+    let df_parallel = reader.read().with_limit(limit).finish().expect("Failed to read (parallel)");
 
     // 2. Read using Sequential explicitly
     let df_sequential = reader.read()
         .sequential()
+        .with_limit(limit)
         .finish()
         .expect("Failed to read (sequential)");
 
     // 3. Read using Pipeline explicitly
     let df_pipeline = reader.read()
         .pipeline()
+        .with_limit(limit)
         .finish()
         .expect("Failed to read (pipeline)");
 
@@ -41,8 +44,8 @@ fn test_parallel_vs_sequential_reading() {
 #[test]
 fn test_parallel_reading_multiple_files() {
     let test_files = vec![
-        "crates/cpp-sas7bdat/vendor/test/data_pandas/test1.sas7bdat",
-        "crates/cpp-sas7bdat/vendor/test/data_pandas/zero_variables.sas7bdat",
+        "tests/sas/data/data_pandas/test1.sas7bdat",
+        "tests/sas/data/data_pandas/zero_variables.sas7bdat",
     ];
 
     for test_file in test_files {
@@ -55,7 +58,8 @@ fn test_parallel_reading_multiple_files() {
         let reader = Sas7bdatReader::open(test_file).expect("Failed to open file");
 
         // The builder automatically handles selection of the best strategy
-        match reader.read().finish() {
+        let limit = usize::min(200_000, reader.metadata().row_count);
+        match reader.read().with_limit(limit).finish() {
             Ok(df) => {
                 println!("  Compression: {:?}", reader.metadata().compression);
                 println!("  Shape: {:?}", df.shape());
@@ -68,7 +72,7 @@ fn test_parallel_reading_multiple_files() {
 
 #[test]
 fn test_read_builder_boundaries() {
-    let test_file = "crates/cpp-sas7bdat/vendor/test/data_pandas/test1.sas7bdat";
+    let test_file = "tests/sas/data/data_pandas/test1.sas7bdat";
 
     if !Path::new(test_file).exists() {
         println!("Test file not found, skipping test");
@@ -77,6 +81,7 @@ fn test_read_builder_boundaries() {
 
     let reader = Sas7bdatReader::open(test_file).expect("Failed to open file");
     let total_rows = reader.metadata().row_count;
+    let max_total = usize::min(200_000, total_rows);
 
     println!("Testing builder boundaries on file with {} rows", total_rows);
 
@@ -91,18 +96,29 @@ fn test_read_builder_boundaries() {
     println!("  ✓ Limit 1: OK");
 
     // Test reading all rows with offset
-    if total_rows > 5 {
+    if max_total > 5 {
         let offset = 5;
-        let expected = total_rows - offset;
-        let df = reader.read().with_offset(offset).finish().expect("Failed offset");
+        let expected = max_total - offset;
+        let df = reader
+            .read()
+            .with_offset(offset)
+            .with_limit(max_total - offset)
+            .finish()
+            .expect("Failed offset");
         assert_eq!(df.height(), expected);
         println!("  ✓ Offset {}: OK", offset);
     }
 
     // Test reading past the end
     // Our logic handles this by saturating the limit to available rows
-    let df = reader.read().with_offset(0).with_limit(total_rows + 100).finish().expect("Failed past end");
-    assert_eq!(df.height(), total_rows);
+    let limit = usize::min(200_000, max_total.saturating_add(100));
+    let df = reader
+        .read()
+        .with_offset(0)
+        .with_limit(limit)
+        .finish()
+        .expect("Failed past end");
+    assert_eq!(df.height(), usize::min(total_rows, limit));
     println!("  ✓ Reading past end (clamped to total): OK");
 
     println!("\n✓ All boundary tests passed using ReadBuilder");

@@ -1,0 +1,23 @@
+name: Manual Publish
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Tests
+        # Run default (small-file) tests only, single-threaded
+        run: cargo test -- --test-threads=1
+
+
+      - name: Cargo Publish
+        # This only runs if the 'Run Tests' step above succeeded (exit code 0)
+        run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }}

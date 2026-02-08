@@ -36,9 +36,7 @@ ehthumbs.db
 *~
 # etc.
 
-*.sas7bdat
-*.dta
-*.sav
+*.csv
 
 cpp-sas7bdat
-data/
+tests/**/data/too_big/
