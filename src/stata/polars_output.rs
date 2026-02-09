@@ -18,6 +18,7 @@ pub fn scan_dta(
         missing_string_as_null,
         value_labels_as_strings,
         opts.chunk_size,
+        opts.compress_opts,
     ));
     LazyFrame::anonymous_scan(scan_ptr, Default::default())
 }
@@ -71,6 +72,7 @@ pub struct StataScan {
     missing_string_as_null: bool,
     value_labels_as_strings: Option<bool>,
     chunk_size: Option<usize>,
+    compress_opts: crate::CompressOptionsLite,
 }
 
 impl StataScan {
@@ -80,8 +82,9 @@ impl StataScan {
         missing_string_as_null: bool,
         value_labels_as_strings: Option<bool>,
         chunk_size: Option<usize>,
+        compress_opts: crate::CompressOptionsLite,
     ) -> Self {
-        Self { path, threads, missing_string_as_null, value_labels_as_strings, chunk_size }
+        Self { path, threads, missing_string_as_null, value_labels_as_strings, chunk_size, compress_opts }
     }
 }
 
@@ -195,7 +198,14 @@ impl AnonymousScan for StataScan {
                 out = Some(df);
             }
         }
-        Ok(out.unwrap_or_else(DataFrame::empty))
+        let df = out.unwrap_or_else(DataFrame::empty);
+        if self.compress_opts.enabled {
+            let compressed = crate::compress_df_if_enabled(&df, &self.compress_opts)
+                .map_err(|e| PolarsError::ComputeError(e.into()))?;
+            Ok(compressed)
+        } else {
+            Ok(df)
+        }
     }
 
     fn schema(&self, _n_rows: Option<usize>) -> PolarsResult<SchemaRef> {

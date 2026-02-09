@@ -71,6 +71,7 @@ pub use stata::{
 };
 
 use std::path::Path;
+use polars::prelude::DataFrame;
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -79,6 +80,7 @@ pub struct ScanOptions {
     pub missing_string_as_null: Option<bool>,
     pub user_missing_as_null: Option<bool>,
     pub value_labels_as_strings: Option<bool>,
+    pub compress_opts: CompressOptionsLite,
 }
 
 impl Default for ScanOptions {
@@ -89,8 +91,48 @@ impl Default for ScanOptions {
             missing_string_as_null: Some(true),
             user_missing_as_null: Some(true),
             value_labels_as_strings: Some(true),
+            compress_opts: CompressOptionsLite::default(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompressOptionsLite {
+    pub enabled: bool,
+    pub cols: Option<Vec<String>>,
+    pub compress_numeric: bool,
+    pub datetime_to_date: bool,
+    pub string_to_numeric: bool,
+}
+
+impl Default for CompressOptionsLite {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cols: None,
+            compress_numeric: false,
+            datetime_to_date: false,
+            string_to_numeric: false,
+        }
+    }
+}
+
+pub(crate) fn compress_df_if_enabled(
+    df: &DataFrame,
+    opts: &CompressOptionsLite,
+) -> std::result::Result<DataFrame, String> {
+    if !opts.enabled {
+        return Ok(df.clone());
+    }
+    let mut stata_opts = CompressOptions::default();
+    stata_opts.compress_numeric = opts.compress_numeric;
+    stata_opts.check_date_time = opts.datetime_to_date;
+    stata_opts.check_string = opts.string_to_numeric;
+    stata_opts.check_string_only = false;
+    stata_opts.cast_all_null_to_boolean = true;
+    stata_opts.no_boolean = false;
+    stata_opts.cols = opts.cols.clone();
+    compress_df(df, stata_opts).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

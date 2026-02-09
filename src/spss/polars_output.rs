@@ -18,6 +18,7 @@ pub fn scan_sav(
         user_missing_as_null,
         opts.value_labels_as_strings,
         opts.chunk_size,
+        opts.compress_opts,
     ));
     LazyFrame::anonymous_scan(scan_ptr, Default::default())
 }
@@ -149,6 +150,7 @@ pub struct SpssScan {
     user_missing_as_null: bool,
     value_labels_as_strings: Option<bool>,
     chunk_size: Option<usize>,
+    compress_opts: crate::CompressOptionsLite,
 }
 
 impl SpssScan {
@@ -159,6 +161,7 @@ impl SpssScan {
         user_missing_as_null: bool,
         value_labels_as_strings: Option<bool>,
         chunk_size: Option<usize>,
+        compress_opts: crate::CompressOptionsLite,
     ) -> Self {
         Self {
             path,
@@ -167,6 +170,7 @@ impl SpssScan {
             user_missing_as_null,
             value_labels_as_strings,
             chunk_size,
+            compress_opts,
         }
     }
 }
@@ -196,7 +200,14 @@ impl AnonymousScan for SpssScan {
                 out = Some(df);
             }
         }
-        Ok(out.unwrap_or_else(DataFrame::empty))
+        let df = out.unwrap_or_else(DataFrame::empty);
+        if self.compress_opts.enabled {
+            let compressed = crate::compress_df_if_enabled(&df, &self.compress_opts)
+                .map_err(|e| PolarsError::ComputeError(e.into()))?;
+            Ok(compressed)
+        } else {
+            Ok(df)
+        }
     }
 
     fn schema(&self, _n_rows: Option<usize>) -> PolarsResult<SchemaRef> {

@@ -9,7 +9,13 @@ use polars_readstat_rs::{readstat_scan, ReadStatFormat, ScanOptions};
 ///       [--offset N] [--limit N]
 ///       [--threads N] [--chunk-size N]
 ///       [--missing-string-as-null true|false]
+///       [--user-missing-as-null true|false]
 ///       [--value-labels-as-strings true|false]
+///       [--compress true|false]
+///       [--compress-cols a,b,c]
+///       [--compress-numeric true|false]
+///       [--compress-datetime-to-date true|false]
+///       [--compress-string-to-numeric true|false]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let file = args.next().ok_or("missing <file>")?;
@@ -62,9 +68,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let v = args.next().ok_or("missing --missing-string-as-null value")?;
                 opts.missing_string_as_null = Some(parse_bool(&v)?);
             }
+            "--user-missing-as-null" => {
+                let v = args.next().ok_or("missing --user-missing-as-null value")?;
+                opts.user_missing_as_null = Some(parse_bool(&v)?);
+            }
             "--value-labels-as-strings" => {
                 let v = args.next().ok_or("missing --value-labels-as-strings value")?;
                 opts.value_labels_as_strings = Some(parse_bool(&v)?);
+            }
+            "--compress" => {
+                let v = args.next().ok_or("missing --compress value")?;
+                opts.compress_opts.enabled = parse_bool(&v)?;
+            }
+            "--compress-cols" => {
+                let v = args.next().ok_or("missing --compress-cols value")?;
+                let cols = v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>();
+                if !cols.is_empty() {
+                    opts.compress_opts.cols = Some(cols);
+                }
+            }
+            "--compress-numeric" => {
+                let v = args.next().ok_or("missing --compress-numeric value")?;
+                opts.compress_opts.compress_numeric = parse_bool(&v)?;
+            }
+            "--compress-datetime-to-date" => {
+                let v = args.next().ok_or("missing --compress-datetime-to-date value")?;
+                opts.compress_opts.datetime_to_date = parse_bool(&v)?;
+            }
+            "--compress-string-to-numeric" => {
+                let v = args.next().ok_or("missing --compress-string-to-numeric value")?;
+                opts.compress_opts.string_to_numeric = parse_bool(&v)?;
             }
             _ => return Err(format!("unknown arg: {}", arg).into()),
         }

@@ -262,6 +262,7 @@ pub struct SasScan {
     num_threads: Option<usize>,
     missing_string_as_null: bool,
     chunk_size: Option<usize>,
+    compress_opts: crate::CompressOptionsLite,
 }
 
 impl SasScan {
@@ -270,8 +271,9 @@ impl SasScan {
         threads: Option<usize>,
         missing_string_as_null: bool,
         chunk_size: Option<usize>,
+        compress_opts: crate::CompressOptionsLite,
     ) -> Self {
-        Self { path, num_threads: threads, missing_string_as_null, chunk_size }
+        Self { path, num_threads: threads, missing_string_as_null, chunk_size, compress_opts }
     }
 }
 
@@ -386,7 +388,14 @@ impl AnonymousScan for SasScan {
                 out = Some(df);
             }
         }
-        Ok(out.unwrap_or_else(DataFrame::empty))
+        let df = out.unwrap_or_else(DataFrame::empty);
+        if self.compress_opts.enabled {
+            let compressed = crate::compress_df_if_enabled(&df, &self.compress_opts)
+                .map_err(|e| PolarsError::ComputeError(e.into()))?;
+            Ok(compressed)
+        } else {
+            Ok(df)
+        }
     }
 
     // FIX: method signature updated to include Option<usize>
@@ -427,7 +436,13 @@ pub fn scan_sas7bdat(
 ) -> PolarsResult<LazyFrame> {
     let path = path.into();
     let missing_string_as_null = opts.missing_string_as_null.unwrap_or(true);
-    let scan_ptr = Arc::new(SasScan::new(path, opts.threads, missing_string_as_null, opts.chunk_size));
+    let scan_ptr = Arc::new(SasScan::new(
+        path,
+        opts.threads,
+        missing_string_as_null,
+        opts.chunk_size,
+        opts.compress_opts,
+    ));
     LazyFrame::anonymous_scan(scan_ptr, Default::default())
 }
 

@@ -35,6 +35,7 @@ pub fn read_to_arrow_schema_ffi(
         missing_string_as_null: Some(missing_string_as_null),
         user_missing_as_null: None,
         value_labels_as_strings: None,
+        compress_opts: crate::CompressOptionsLite::default(),
     };
     let schema = scan_sas7bdat(path.to_path_buf(), opts)?.collect_schema()?;
     let field = build_struct_field(&schema);
@@ -55,6 +56,7 @@ pub fn read_to_arrow_array_ffi(
         missing_string_as_null: Some(missing_string_as_null),
         user_missing_as_null: None,
         value_labels_as_strings: None,
+        compress_opts: crate::CompressOptionsLite::default(),
     };
     let df = scan_sas7bdat(path.to_path_buf(), opts)?.collect()?;
     let field = build_struct_field(&df.schema());
@@ -78,6 +80,7 @@ pub fn read_to_arrow_stream_ffi(
         missing_string_as_null: Some(missing_string_as_null),
         user_missing_as_null: None,
         value_labels_as_strings: None,
+        compress_opts: crate::CompressOptionsLite::default(),
     };
     let mut lf = scan_sas7bdat(path.to_path_buf(), opts.clone())?;
     let schema = lf.collect_schema()?;
