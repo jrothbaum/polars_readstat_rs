@@ -103,6 +103,7 @@ pub struct Metadata {
     pub compression: Compression,
     pub row_count: usize,
     pub row_length: usize,
+    pub mix_page_row_count: usize,
     pub column_count: usize,
     pub columns: Vec<Column>,
     pub creator: String,

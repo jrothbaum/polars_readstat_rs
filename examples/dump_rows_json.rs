@@ -1,3 +1,4 @@
+use polars_readstat_rs::sas::debug_dump_raw_column;
 use polars_readstat_rs::Sas7bdatReader;
 
 fn json_escape(s: &str) -> String {
@@ -18,14 +19,43 @@ fn json_escape(s: &str) -> String {
 
 /// Dumps first N rows of a SAS file as JSON for comparison testing.
 /// Usage: dump_rows_json <file> <n_rows>
+/// Debug raw bytes: dump_rows_json <file> --raw <column> <start_row> <count>
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: dump_rows_json <file> <n_rows>");
+        eprintln!("   or: dump_rows_json <file> --raw <column> <start_row> <count>");
         std::process::exit(1);
     }
 
     let file = &args[1];
+    if args[2] == "--raw" {
+        if args.len() < 6 {
+            eprintln!("Usage: dump_rows_json <file> --raw <column> <start_row> <count>");
+            std::process::exit(1);
+        }
+        let col_name = &args[3];
+        let start_row: usize = args[4].parse()?;
+        let count: usize = args[5].parse()?;
+        let dump = debug_dump_raw_column(file, col_name, start_row, count)?;
+        println!(
+            "encoding_byte={} encoding={} compression={:?} row_length={} offset={} length={}",
+            dump.encoding_byte,
+            dump.encoding_name,
+            dump.compression,
+            dump.row_length,
+            dump.offset,
+            dump.length
+        );
+        for row in dump.rows {
+            println!(
+                "row {}: raw_hex={} trimmed_hex={} decoded='{}'",
+                row.row_idx, row.raw_hex, row.trimmed_hex, row.decoded
+            );
+        }
+        return Ok(());
+    }
+
     let n_rows: usize = args[2].parse()?;
 
     let reader = Sas7bdatReader::open(file)?;

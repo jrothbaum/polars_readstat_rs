@@ -255,9 +255,10 @@ impl<R: Read + Seek> DataReader<R> {
                         offset += 8 - (offset % 8);
                     }
 
-                    let row_count = self.metadata.row_count.min(
-                        page_header.block_count as usize,
-                    );
+                    let row_count = self
+                        .metadata
+                        .row_count
+                        .min(self.metadata.mix_page_row_count);
 
                     return Ok(Some(PageState::Mix {
                         row_count,

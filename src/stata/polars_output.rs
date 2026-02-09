@@ -1,6 +1,7 @@
 use crate::stata::reader::StataReader;
 use crate::stata::types::{VarType, NumericType};
 use polars::prelude::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -87,6 +88,7 @@ impl StataScan {
 pub(crate) struct StataBatchIter {
     reader: StataReader,
     cols: Option<Vec<String>>,
+    time_formats: Vec<(String, StataTimeFormatKind)>,
     offset: usize,
     remaining: usize,
     batch_size: usize,
@@ -120,7 +122,13 @@ impl Iterator for StataBatchIter {
         if let Some(cols) = &self.cols {
             builder = builder.with_columns(cols.clone());
         }
-        let out = builder.finish().map_err(|e| PolarsError::ComputeError(e.to_string().into()));
+        let out = builder
+            .finish()
+            .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
+            .and_then(|mut df| {
+                apply_stata_time_formats(&mut df, &self.time_formats)?;
+                Ok(df)
+            });
         self.offset += take;
         self.remaining -= take;
         Some(out)
@@ -140,9 +148,19 @@ pub(crate) fn stata_batch_iter(
         .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
     let total = n_rows.unwrap_or(reader.metadata().row_count as usize);
     let batch_size = chunk_size.unwrap_or(100_000).max(1);
+    let selected = cols.as_ref().map(|c| c.iter().cloned().collect::<HashSet<_>>());
+    let mut time_formats = Vec::new();
+    for var in &reader.metadata().variables {
+        if let Some(kind) = stata_time_format_kind(var.format.as_deref(), &var.var_type) {
+            if selected.as_ref().map(|s| s.contains(&var.name)).unwrap_or(true) {
+                time_formats.push((var.name.clone(), kind));
+            }
+        }
+    }
     Ok(StataBatchIter {
         reader,
         cols,
+        time_formats,
         offset: 0,
         remaining: total,
         batch_size,
@@ -190,13 +208,21 @@ impl AnonymousScan for StataScan {
             let dtype = if use_labels && var.value_label_name.is_some() {
                 DataType::String
             } else {
-                match var.var_type {
-                    VarType::Numeric(NumericType::Byte) => DataType::Int8,
-                    VarType::Numeric(NumericType::Int) => DataType::Int16,
-                    VarType::Numeric(NumericType::Long) => DataType::Int32,
-                    VarType::Numeric(NumericType::Float) => DataType::Float32,
-                    VarType::Numeric(NumericType::Double) => DataType::Float64,
-                    VarType::Str(_) | VarType::StrL => DataType::String,
+                if let Some(kind) = stata_time_format_kind(var.format.as_deref(), &var.var_type) {
+                    match kind {
+                        StataTimeFormatKind::Date => DataType::Date,
+                        StataTimeFormatKind::DateTime => DataType::Datetime(TimeUnit::Milliseconds, None),
+                        StataTimeFormatKind::Time { .. } => DataType::Time,
+                    }
+                } else {
+                    match var.var_type {
+                        VarType::Numeric(NumericType::Byte) => DataType::Int8,
+                        VarType::Numeric(NumericType::Int) => DataType::Int16,
+                        VarType::Numeric(NumericType::Long) => DataType::Int32,
+                        VarType::Numeric(NumericType::Float) => DataType::Float32,
+                        VarType::Numeric(NumericType::Double) => DataType::Float64,
+                        VarType::Str(_) | VarType::StrL => DataType::String,
+                    }
                 }
             };
             schema.with_column(var.name.as_str().into(), dtype);
@@ -204,4 +230,142 @@ impl AnonymousScan for StataScan {
 
         Ok(Arc::new(schema))
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StataTimeFormatKind {
+    Date,
+    DateTime,
+    Time { null_on_datetime: bool },
+}
+
+fn allow_date(var_type: &VarType) -> bool {
+    matches!(
+        var_type,
+        VarType::Numeric(NumericType::Long)
+            | VarType::Numeric(NumericType::Float)
+            | VarType::Numeric(NumericType::Double)
+    )
+}
+
+fn allow_datetime(var_type: &VarType) -> bool {
+    matches!(
+        var_type,
+        VarType::Numeric(NumericType::Long)
+            | VarType::Numeric(NumericType::Float)
+            | VarType::Numeric(NumericType::Double)
+    )
+}
+
+pub(crate) fn stata_time_format_kind(
+    format: Option<&str>,
+    var_type: &VarType,
+) -> Option<StataTimeFormatKind> {
+    let fmt = format?.trim();
+    if fmt.starts_with("%t") {
+        let mut chars = fmt.chars();
+        chars.next();
+        chars.next();
+        let unit = chars.next()?;
+        return match unit {
+            'c' | 'C' => {
+                let rest: String = chars.collect();
+                if rest.is_empty() {
+                    if allow_datetime(var_type) {
+                        Some(StataTimeFormatKind::DateTime)
+                    } else {
+                        None
+                    }
+                } else {
+                    if allow_datetime(var_type) {
+                        let has_date_tokens = rest.chars().any(|c| matches!(c, 'C' | 'c' | 'Y' | 'y' | 'N' | 'n' | 'D' | 'd'));
+                        Some(StataTimeFormatKind::Time { null_on_datetime: has_date_tokens })
+                    } else {
+                        None
+                    }
+                }
+            }
+            'd' | 'w' | 'm' | 'q' | 'h' | 'y' => {
+                if allow_date(var_type) {
+                    Some(StataTimeFormatKind::Date)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+    }
+
+    if fmt.starts_with('%') {
+        let mut chars = fmt.chars();
+        chars.next();
+        let unit = chars.next()?;
+        return match unit {
+            'c' | 'C' => {
+                if allow_datetime(var_type) {
+                    Some(StataTimeFormatKind::DateTime)
+                } else {
+                    None
+                }
+            }
+            'd' | 'w' | 'm' | 'q' | 'h' | 'y' => {
+                if allow_date(var_type) {
+                    Some(StataTimeFormatKind::Date)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+    }
+
+    None
+}
+
+pub(crate) fn apply_stata_time_formats(
+    df: &mut DataFrame,
+    formats: &[(String, StataTimeFormatKind)],
+) -> PolarsResult<()> {
+    if formats.is_empty() {
+        return Ok(());
+    }
+    let offset_days: i64 = 3653;
+    let offset_ms: i64 = offset_days * 86_400_000;
+    let day_ms: i64 = 86_400_000;
+    let mut exprs = Vec::with_capacity(formats.len());
+    for (name, kind) in formats {
+        let dtype_ok = df.column(name).map(|s| s.dtype().is_numeric()).unwrap_or(false);
+        if !dtype_ok {
+            continue;
+        }
+        let expr = match kind {
+            StataTimeFormatKind::Date => {
+                (col(name).cast(DataType::Int64) - lit(offset_days))
+                    .cast(DataType::Date)
+                    .alias(name)
+            }
+            StataTimeFormatKind::DateTime => {
+                (col(name).cast(DataType::Int64) - lit(offset_ms))
+                    .cast(DataType::Datetime(TimeUnit::Milliseconds, None))
+                    .alias(name)
+            }
+            StataTimeFormatKind::Time { null_on_datetime } => {
+                if *null_on_datetime {
+                    lit(NULL).cast(DataType::Time).alias(name)
+                } else {
+                    ((col(name).cast(DataType::Int64) % lit(day_ms) + lit(day_ms)) % lit(day_ms) * lit(1_000_000i64))
+                        .cast(DataType::Time)
+                        .alias(name)
+                }
+            }
+        };
+        exprs.push(expr);
+    }
+    let df_owned = std::mem::take(df);
+    *df = df_owned
+        .lazy()
+        .with_columns(exprs)
+        .collect()
+        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+    Ok(())
 }

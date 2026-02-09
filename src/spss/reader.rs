@@ -46,6 +46,7 @@ pub struct ReadBuilder<'a> {
     num_threads: Option<usize>,
     chunk_size: Option<usize>,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 }
 
@@ -61,6 +62,7 @@ impl<'a> ReadBuilder<'a> {
             num_threads: None,
             chunk_size: None,
             missing_string_as_null: true,
+            user_missing_as_null: true,
             value_labels_as_strings: true,
         }
     }
@@ -73,6 +75,7 @@ impl<'a> ReadBuilder<'a> {
     pub fn with_chunk_size(mut self, n: usize) -> Self { self.chunk_size = Some(n); self }
     pub fn sequential(mut self) -> Self { self.parallel = false; self }
     pub fn missing_string_as_null(mut self, v: bool) -> Self { self.missing_string_as_null = v; self }
+    pub fn user_missing_as_null(mut self, v: bool) -> Self { self.user_missing_as_null = v; self }
     pub fn value_labels_as_strings(mut self, v: bool) -> Self { self.value_labels_as_strings = v; self }
 
     pub fn finish(self) -> Result<DataFrame> {
@@ -80,7 +83,7 @@ impl<'a> ReadBuilder<'a> {
         let limit = self.limit.unwrap_or(self.reader.metadata.row_count as usize);
         let cols = resolve_column_indices(&self.reader.metadata, self.columns.as_deref())?;
 
-        let mut df = if self.parallel && limit > 0 {
+            let mut df = if self.parallel && limit > 0 {
             self.reader.read_parallel(
                 self.offset,
                 limit,
@@ -88,6 +91,7 @@ impl<'a> ReadBuilder<'a> {
                 self.chunk_size,
                 cols.as_deref(),
                 self.missing_string_as_null,
+                self.user_missing_as_null,
                 self.value_labels_as_strings,
             )?
         } else {
@@ -101,6 +105,7 @@ impl<'a> ReadBuilder<'a> {
                 self.offset,
                 limit,
                 self.missing_string_as_null,
+                self.user_missing_as_null,
                 self.value_labels_as_strings,
             )?
         };
@@ -125,6 +130,7 @@ impl SpssReader {
         chunk_size: Option<usize>,
         cols: Option<&[usize]>,
         missing_string_as_null: bool,
+        user_missing_as_null: bool,
         value_labels_as_strings: bool,
     ) -> Result<DataFrame> {
         if self.header.compression != 0 {
@@ -138,6 +144,7 @@ impl SpssReader {
                 offset,
                 count,
                 missing_string_as_null,
+                user_missing_as_null,
                 value_labels_as_strings,
             );
         }
@@ -157,6 +164,7 @@ impl SpssReader {
                 offset,
                 count,
                 missing_string_as_null,
+                user_missing_as_null,
                 value_labels_as_strings,
             );
         }
@@ -188,6 +196,7 @@ impl SpssReader {
                         start,
                         cnt,
                         missing_string_as_null,
+                        user_missing_as_null,
                         value_labels_as_strings,
                     )
                     .map(|df| (i, df))

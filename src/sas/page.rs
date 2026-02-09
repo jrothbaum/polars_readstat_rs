@@ -1,6 +1,7 @@
-use crate::buffer::Buffer;
 use crate::error::Result;
 use crate::types::{Endian, Format, Header, PageType};
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
+use std::io::Cursor;
 use std::io::{Read, Seek};
 
 /// Page header containing metadata about the page
@@ -27,17 +28,32 @@ pub struct PageReader<R: Read + Seek> {
     endian: Endian,
     format: Format,
     page_buffer: Vec<u8>,
+    page_bit_offset: usize,
+    integer_size: usize,
+    subheader_size: usize,
 }
 
 impl<R: Read + Seek> PageReader<R> {
     pub fn new(reader: R, header: Header, endian: Endian, format: Format) -> Self {
         let page_buffer = vec![0u8; header.page_length];
+        let page_bit_offset = match format {
+            Format::Bit64 => 32,
+            Format::Bit32 => 16,
+        };
+        let integer_size = match format {
+            Format::Bit64 => 8,
+            Format::Bit32 => 4,
+        };
+        let subheader_size = 3 * integer_size;
         Self {
             reader,
             header,
             endian,
             format,
             page_buffer,
+            page_bit_offset,
+            integer_size,
+            subheader_size,
         }
     }
 
@@ -52,18 +68,10 @@ impl<R: Read + Seek> PageReader<R> {
 
     /// Get page header from current buffer
     pub fn get_page_header(&self) -> Result<PageHeader> {
-        let buf = Buffer::from_vec(self.page_buffer.clone(), self.endian);
-
-        // Page header offset depends on format
-        let page_bit_offset = match self.format {
-            Format::Bit64 => 32,
-            Format::Bit32 => 16,
-        };
-
-        let page_type_val = buf.get_u16(page_bit_offset)?;
+        let page_type_val = self.read_u16(self.page_bit_offset)?;
         let page_type = PageType::from_u16(page_type_val);
-        let block_count = buf.get_u16(page_bit_offset + 2)?;
-        let subheader_count = buf.get_u16(page_bit_offset + 4)?;
+        let block_count = self.read_u16(self.page_bit_offset + 2)?;
+        let subheader_count = self.read_u16(self.page_bit_offset + 4)?;
 
         Ok(PageHeader {
             page_type,
@@ -74,28 +82,15 @@ impl<R: Read + Seek> PageReader<R> {
 
     /// Get all subheaders from current page
     pub fn get_subheaders(&self, page_header: &PageHeader) -> Result<Vec<PageSubheader>> {
-        let buf = Buffer::from_vec(self.page_buffer.clone(), self.endian);
-
-        let page_bit_offset = match self.format {
-            Format::Bit64 => 32,
-            Format::Bit32 => 16,
-        };
-
-        let integer_size = match self.format {
-            Format::Bit64 => 8,
-            Format::Bit32 => 4,
-        };
-
-        let subheader_size = 3 * integer_size; // offset, length, compression+type
         let mut subheaders = Vec::new();
 
         for i in 0..page_header.subheader_count {
-            let offset = page_bit_offset + 8 + (i as usize * subheader_size);
+            let offset = self.page_bit_offset + 8 + (i as usize * self.subheader_size);
 
-            let sub_offset = buf.get_integer(offset, self.format)? as usize;
-            let sub_length = buf.get_integer(offset + integer_size, self.format)? as usize;
-            let compression = buf.get_u8(offset + integer_size * 2)?;
-            let subheader_type = buf.get_u8(offset + integer_size * 2 + 1)?;
+            let sub_offset = self.read_integer(offset)? as usize;
+            let sub_length = self.read_integer(offset + self.integer_size)? as usize;
+            let compression = self.read_u8(offset + self.integer_size * 2)?;
+            let subheader_type = self.read_u8(offset + self.integer_size * 2 + 1)?;
 
             // Skip empty or truncated subheaders
             if sub_length == 0 || compression == 1 {
@@ -121,6 +116,59 @@ impl<R: Read + Seek> PageReader<R> {
     /// Get header reference
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    fn read_u8(&self, offset: usize) -> Result<u8> {
+        self.page_buffer
+            .get(offset)
+            .copied()
+            .ok_or(crate::error::Error::BufferOutOfBounds { offset, length: 1 })
+    }
+
+    fn read_u16(&self, offset: usize) -> Result<u16> {
+        let slice = self
+            .page_buffer
+            .get(offset..offset + 2)
+            .ok_or(crate::error::Error::BufferOutOfBounds { offset, length: 2 })?;
+        let mut cursor = Cursor::new(slice);
+        match self.endian {
+            Endian::Big => cursor.read_u16::<BigEndian>(),
+            Endian::Little => cursor.read_u16::<LittleEndian>(),
+        }
+        .map_err(|e| e.into())
+    }
+
+    fn read_u32(&self, offset: usize) -> Result<u32> {
+        let slice = self
+            .page_buffer
+            .get(offset..offset + 4)
+            .ok_or(crate::error::Error::BufferOutOfBounds { offset, length: 4 })?;
+        let mut cursor = Cursor::new(slice);
+        match self.endian {
+            Endian::Big => cursor.read_u32::<BigEndian>(),
+            Endian::Little => cursor.read_u32::<LittleEndian>(),
+        }
+        .map_err(|e| e.into())
+    }
+
+    fn read_u64(&self, offset: usize) -> Result<u64> {
+        let slice = self
+            .page_buffer
+            .get(offset..offset + 8)
+            .ok_or(crate::error::Error::BufferOutOfBounds { offset, length: 8 })?;
+        let mut cursor = Cursor::new(slice);
+        match self.endian {
+            Endian::Big => cursor.read_u64::<BigEndian>(),
+            Endian::Little => cursor.read_u64::<LittleEndian>(),
+        }
+        .map_err(|e| e.into())
+    }
+
+    fn read_integer(&self, offset: usize) -> Result<u64> {
+        match self.format {
+            Format::Bit32 => self.read_u32(offset).map(|v| v as u64),
+            Format::Bit64 => self.read_u64(offset),
+        }
     }
 }
 

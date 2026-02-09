@@ -39,12 +39,17 @@ fn test_spss_value_and_variable_labels() {
 
     let reader = SpssReader::open(&path).unwrap();
     let meta = reader.metadata();
-    let var = meta.variables.iter().find(|v| v.name == "status").unwrap();
+    let var = meta
+        .variables
+        .iter()
+        .find(|v| v.short_name.eq_ignore_ascii_case("status") || v.name.eq_ignore_ascii_case("status"))
+        .expect("status variable");
     assert_eq!(var.label.as_deref(), Some("Status Label"));
     assert!(var.value_label.is_some());
 
     let out = reader.read().value_labels_as_strings(true).finish().unwrap();
-    let col = out.column("status").unwrap().str().unwrap();
+    let col_name = var.name.as_str();
+    let col = out.column(col_name).unwrap().str().unwrap();
     let vals: Vec<Option<&str>> = col.into_iter().collect();
     assert_eq!(vals, vec![Some("one"), Some("two"), Some("three")]);
 

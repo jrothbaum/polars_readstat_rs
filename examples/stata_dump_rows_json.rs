@@ -53,6 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .take(cols_to_read)
         .map(|c| match c.dtype() {
             polars::prelude::DataType::String => "character",
+            polars::prelude::DataType::Date => "character",
+            polars::prelude::DataType::Datetime(_, _) => "character",
+            polars::prelude::DataType::Time => "character",
             _ => "numeric",
         })
         .collect();
@@ -74,6 +77,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if i > 0 { print!(","); }
         print!("\"{}\"", ct);
     }
+    print!("],\"dtypes\":[");
+    for (i, col) in df.get_columns().iter().enumerate() {
+        if i > 0 { print!(","); }
+        print!("\"{}\"", col.dtype());
+    }
     print!("],\"rows\":[");
 
     for row_idx in 0..df.height() {
@@ -85,13 +93,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let val = series.get(row_idx).unwrap();
             match val {
                 polars::prelude::AnyValue::Null => print!("null"),
-                polars::prelude::AnyValue::Float64(v) => print!("{}", v),
-                polars::prelude::AnyValue::Float32(v) => print!("{}", v),
+                polars::prelude::AnyValue::Float64(v) => print!("{:.15}", v),
+                polars::prelude::AnyValue::Float32(v) => print!("{:.15}", v),
                 polars::prelude::AnyValue::Int8(v) => print!("{}", v),
                 polars::prelude::AnyValue::Int16(v) => print!("{}", v),
                 polars::prelude::AnyValue::Int32(v) => print!("{}", v),
                 polars::prelude::AnyValue::String(s) => {
                     print!("\"{}\"", json_escape(s));
+                }
+                polars::prelude::AnyValue::Datetime(_, polars::prelude::TimeUnit::Milliseconds, _) => {
+                    let raw = val.to_string();
+                    let formatted = if let Some((prefix, frac)) = raw.rsplit_once('.') {
+                        if frac.len() == 3 {
+                            format!("{prefix}.{frac}000")
+                        } else {
+                            raw
+                        }
+                    } else {
+                        raw
+                    };
+                    print!("\"{}\"", json_escape(&formatted));
                 }
                 other => print!("\"{}\"", json_escape(&other.to_string())),
             }

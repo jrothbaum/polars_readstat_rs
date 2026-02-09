@@ -65,6 +65,7 @@ struct MetadataBuilder {
     encoding_byte: u8,
     row_count: Option<usize>,
     row_length: Option<usize>,
+    mix_page_row_count: Option<usize>,
     column_count: Option<usize>,
     compression: Compression,
     columns: Vec<ColumnBuilder>,
@@ -93,6 +94,7 @@ impl MetadataBuilder {
             encoding_byte,
             row_count: None,
             row_length: None,
+            mix_page_row_count: None,
             column_count: None,
             compression: Compression::None,
             columns: Vec::new(),
@@ -174,6 +176,8 @@ impl MetadataBuilder {
 
         let _col_count_p1 = buf.get_integer(offset + 9 * integer_size, format)? as usize;
         let _col_count_p2 = buf.get_integer(offset + 10 * integer_size, format)? as usize;
+        let mix_page_row_count = buf.get_integer(offset + 15 * integer_size, format)? as usize;
+        self.mix_page_row_count = Some(mix_page_row_count);
 
         // NOTE: C++ code does NOT set column_count here!
         // It only stores col_count_p1 and col_count_p2 for reference.
@@ -394,6 +398,7 @@ impl MetadataBuilder {
         let row_count = self.row_count.ok_or(Error::MissingMetadata)?;
         let row_length = self.row_length.ok_or(Error::MissingMetadata)?;
         let column_count = self.column_count.ok_or(Error::MissingMetadata)?;
+        let mix_page_row_count = self.mix_page_row_count.unwrap_or(row_count);
 
         // Check for empty column names and return error if found
         let empty_count = self.columns.iter().filter(|c| c.name.is_empty()).count();
@@ -422,6 +427,7 @@ impl MetadataBuilder {
             compression: self.compression,
             row_count,
             row_length,
+            mix_page_row_count,
             column_count,
             columns,
             creator: self.creator,

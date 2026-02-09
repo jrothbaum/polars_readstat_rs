@@ -401,6 +401,7 @@ fn infer_columns(df: Option<&DataFrame>, schema: Option<&StataWriteSchema>) -> R
             let format = match col.dtype {
                 DataType::Date => Some("%td".to_string()),
                 DataType::Datetime(_, _) => Some("%tc".to_string()),
+                DataType::Time => Some("%tcHH:MM:SS".to_string()),
                 _ => None,
             };
             columns.push(ColumnSpec {
@@ -423,10 +424,15 @@ fn infer_columns(df: Option<&DataFrame>, schema: Option<&StataWriteSchema>) -> R
         } else {
             None
         };
-        let kind = kind_from_dtype(dtype.clone(), width)?;
+        let kind = if matches!(dtype, DataType::String) && string_has_nul(series)? {
+            ColumnKind::StrL
+        } else {
+            kind_from_dtype(dtype.clone(), width)?
+        };
         let format = match dtype {
             DataType::Date => Some("%td".to_string()),
             DataType::Datetime(_, _) => Some("%tc".to_string()),
+            DataType::Time => Some("%tcHH:MM:SS".to_string()),
             _ => None,
         };
         columns.push(ColumnSpec {
@@ -500,7 +506,7 @@ fn kind_from_dtype(dtype: DataType, width: Option<usize>) -> Result<ColumnKind> 
         DataType::Int16 => ColumnKind::Int16,
         DataType::Int32 | DataType::Date => ColumnKind::Int32,
         DataType::Float32 => ColumnKind::Float32,
-        DataType::Float64 | DataType::Datetime(_, _) => ColumnKind::Float64,
+        DataType::Float64 | DataType::Datetime(_, _) | DataType::Time => ColumnKind::Float64,
         DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
             ColumnKind::Float64
         }
@@ -601,8 +607,7 @@ fn build_value_label_table(mapping: &ValueLabelMap) -> Result<Vec<u8>> {
         table.extend_from_slice(&off.to_le_bytes());
     }
     for value in values {
-        let raw = twos_to_ones_i32(value);
-        table.extend_from_slice(&raw.to_le_bytes());
+        table.extend_from_slice(&value.to_le_bytes());
     }
     table.extend_from_slice(&text);
     Ok(table)
@@ -618,6 +623,18 @@ fn max_string_width(column: &Column) -> Result<usize> {
         }
     }
     Ok(max_len.max(1))
+}
+
+fn string_has_nul(series: &Series) -> Result<bool> {
+    let utf8 = series.str().map_err(|e| Error::Polars(e))?;
+    for opt in utf8.into_iter() {
+        if let Some(s) = opt {
+            if s.as_bytes().iter().any(|b| *b == 0) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn type_code_for_column(col: &ColumnSpec) -> Result<u16> {
@@ -1151,8 +1168,7 @@ fn write_i8(buf: &mut [u8], series: &Series, row_idx: usize) -> Result<()> {
     if v > DTA_113_MAX_INT8 as i64 || v < DTA_113_MIN_INT8 as i64 {
         return Err(Error::NumericOutOfRange);
     }
-    let raw = twos_to_ones_i8(v as i8);
-    buf[0] = raw as u8;
+    buf[0] = (v as i8) as u8;
     Ok(())
 }
 
@@ -1166,8 +1182,7 @@ fn write_i16(buf: &mut [u8], series: &Series, row_idx: usize) -> Result<()> {
     if v > DTA_113_MAX_INT16 as i64 || v < DTA_113_MIN_INT16 as i64 {
         return Err(Error::NumericOutOfRange);
     }
-    let raw = twos_to_ones_i16(v as i16);
-    buf[..2].copy_from_slice(&raw.to_le_bytes());
+    buf[..2].copy_from_slice(&(v as i16).to_le_bytes());
     Ok(())
 }
 
@@ -1184,8 +1199,7 @@ fn write_i32(buf: &mut [u8], series: &Series, row_idx: usize) -> Result<()> {
     if v > DTA_113_MAX_INT32 as i64 || v < DTA_113_MIN_INT32 as i64 {
         return Err(Error::NumericOutOfRange);
     }
-    let raw = twos_to_ones_i32(v as i32);
-    buf[..4].copy_from_slice(&raw.to_le_bytes());
+    buf[..4].copy_from_slice(&(v as i32).to_le_bytes());
     Ok(())
 }
 
@@ -1223,6 +1237,8 @@ fn write_f64(buf: &mut [u8], series: &Series, row_idx: usize, spec: &ColumnSpec)
             TimeUnit::Nanoseconds => (v as i64) / 1_000_000,
         };
         v = (base + offset_ms) as f64;
+    } else if matches!(spec.dtype, DataType::Time) {
+        v = (v as i64 / 1_000_000) as f64;
     }
     let max_dbl = f64::from_bits(DTA_113_MAX_DOUBLE);
     if v > max_dbl {
@@ -1302,6 +1318,7 @@ fn anyvalue_to_f64(v: AnyValue) -> Option<f64> {
         AnyValue::Date(v) => Some(v as f64),
         AnyValue::Datetime(v, _, _) => Some(v as f64),
         AnyValue::DatetimeOwned(v, _, _) => Some(v as f64),
+        AnyValue::Time(v) => Some(v as f64),
         _ => None,
     }
 }
@@ -1405,18 +1422,6 @@ fn max_abs_f64(series: &Series) -> Result<f64> {
         }
     }
     Ok(max)
-}
-
-fn twos_to_ones_i8(v: i8) -> i8 {
-    if v < 0 { v - 1 } else { v }
-}
-
-fn twos_to_ones_i16(v: i16) -> i16 {
-    if v < 0 { v - 1 } else { v }
-}
-
-fn twos_to_ones_i32(v: i32) -> i32 {
-    if v < 0 { v - 1 } else { v }
 }
 
 fn write_dta_strls<W: Write>(writer: &mut W, prepared: &PreparedWrite) -> Result<()> {

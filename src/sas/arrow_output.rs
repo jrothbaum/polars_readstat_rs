@@ -33,6 +33,7 @@ pub fn read_to_arrow_schema_ffi(
         threads,
         chunk_size,
         missing_string_as_null: Some(missing_string_as_null),
+        user_missing_as_null: None,
         value_labels_as_strings: None,
     };
     let schema = scan_sas7bdat(path.to_path_buf(), opts)?.collect_schema()?;
@@ -52,6 +53,7 @@ pub fn read_to_arrow_array_ffi(
         threads,
         chunk_size,
         missing_string_as_null: Some(missing_string_as_null),
+        user_missing_as_null: None,
         value_labels_as_strings: None,
     };
     let df = scan_sas7bdat(path.to_path_buf(), opts)?.collect()?;
@@ -74,6 +76,7 @@ pub fn read_to_arrow_stream_ffi(
         threads,
         chunk_size,
         missing_string_as_null: Some(missing_string_as_null),
+        user_missing_as_null: None,
         value_labels_as_strings: None,
     };
     let mut lf = scan_sas7bdat(path.to_path_buf(), opts.clone())?;

@@ -34,6 +34,8 @@ pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
             "name": v.name,
             "type": format!("{:?}", v.var_type),
             "string_len": v.string_len,
+            "format_type": v.format_type,
+            "format_class": v.format_class.map(|c| format!("{:?}", c)),
             "label": v.label,
             "value_label": v.value_label,
             "missing_range": v.missing_range,

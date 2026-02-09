@@ -1,5 +1,5 @@
 use crate::spss::error::{Error, Result};
-use crate::spss::types::{Endian, Metadata, VarType, Variable};
+use crate::spss::types::{Endian, Metadata, VarType, Variable, FormatClass};
 use flate2::read::ZlibDecoder;
 use polars::prelude::*;
 use std::collections::HashSet;
@@ -14,6 +14,10 @@ use std::time::Instant;
 const SAV_MISSING_DOUBLE: u64 = 0xFFEFFFFFFFFFFFFF;
 const SAV_LOWEST_DOUBLE: u64 = 0xFFEFFFFFFFFFFFFE;
 const SAV_HIGHEST_DOUBLE: u64 = 0x7FEFFFFFFFFFFFFF;
+const SPSS_SEC_SHIFT: i64 = 12_219_379_200;
+const SEC_PER_DAY: i64 = 86_400;
+const SEC_MILLISECOND: i64 = 1_000;
+const SEC_NANOSECOND: i64 = 1_000_000_000;
 
 static PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
 static PROFILE_NUM_NS: AtomicU64 = AtomicU64::new(0);
@@ -76,6 +80,7 @@ pub fn read_data_frame(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<DataFrame> {
     let data_offset = metadata.data_offset.ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
@@ -135,7 +140,12 @@ pub fn read_data_frame(
                 builder: StringChunkedBuilder::new(name.into(), limit),
                 num_cache: Some(NumericStringCache::new()),
             },
-            (VarType::Numeric, false) => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), limit)),
+            (VarType::Numeric, false) => match var.format_class {
+                Some(FormatClass::Date) => ColumnBuilder::Date(PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), limit)),
+                Some(FormatClass::DateTime) => ColumnBuilder::DateTime(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit)),
+                Some(FormatClass::Time) => ColumnBuilder::Time(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit)),
+                None => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), limit)),
+            },
             (VarType::Str, _) => ColumnBuilder::Utf8 {
                 builder: StringChunkedBuilder::new(name.into(), limit),
                 num_cache: None,
@@ -153,6 +163,7 @@ pub fn read_data_frame(
             label_map,
             missing_set,
             missing_string_as_null,
+            user_missing_as_null,
         );
         builders.push(builder);
         plans.push(plan);
@@ -250,6 +261,7 @@ pub fn read_data_columns_uncompressed(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<Vec<Series>> {
     let data_offset = metadata.data_offset.ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
@@ -309,7 +321,12 @@ pub fn read_data_columns_uncompressed(
                 builder: StringChunkedBuilder::new(name.into(), limit),
                 num_cache: Some(NumericStringCache::new()),
             },
-            (VarType::Numeric, false) => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), limit)),
+            (VarType::Numeric, false) => match var.format_class {
+                Some(FormatClass::Date) => ColumnBuilder::Date(PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), limit)),
+                Some(FormatClass::DateTime) => ColumnBuilder::DateTime(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit)),
+                Some(FormatClass::Time) => ColumnBuilder::Time(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit)),
+                None => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), limit)),
+            },
             (VarType::Str, _) => ColumnBuilder::Utf8 {
                 builder: StringChunkedBuilder::new(name.into(), limit),
                 num_cache: None,
@@ -327,6 +344,7 @@ pub fn read_data_columns_uncompressed(
             label_map,
             missing_set,
             missing_string_as_null,
+            user_missing_as_null,
         );
         builders.push(builder);
         plans.push(plan);
@@ -422,7 +440,7 @@ fn append_numeric_row(
                 if is_missing_numeric(col_plan, v, bits) {
                     b.append_null();
                 } else {
-                    b.append_value(v);
+                    b.append_value(apply_format_class(v, col_plan.format_class));
                 }
             }
             _ => return Err(Error::ParseError("column type mismatch".to_string())),
@@ -450,11 +468,50 @@ fn append_value(
             if is_missing_numeric(plan, v, bits) {
                 b.append_null();
             } else {
-                b.append_value(v);
+                b.append_value(apply_format_class(v, plan.format_class));
             }
             if let Some(t0) = t0 {
                 add_ns(&PROFILE_NUM_NS, t0.elapsed());
                 PROFILE_NUM_CT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        (ColumnBuilder::Date(b), VarType::Numeric) => {
+            let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| Error::ParseError("short numeric value".to_string()))?;
+            let v = match endian {
+                Endian::Little => f64::from_le_bytes(bytes),
+                Endian::Big => f64::from_be_bytes(bytes),
+            };
+            let bits = v.to_bits();
+            if is_missing_numeric(plan, v, bits) {
+                b.append_null();
+            } else {
+                b.append_value(apply_format_class_date(v));
+            }
+        }
+        (ColumnBuilder::DateTime(b), VarType::Numeric) => {
+            let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| Error::ParseError("short numeric value".to_string()))?;
+            let v = match endian {
+                Endian::Little => f64::from_le_bytes(bytes),
+                Endian::Big => f64::from_be_bytes(bytes),
+            };
+            let bits = v.to_bits();
+            if is_missing_numeric(plan, v, bits) {
+                b.append_null();
+            } else {
+                b.append_value(apply_format_class_datetime(v));
+            }
+        }
+        (ColumnBuilder::Time(b), VarType::Numeric) => {
+            let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| Error::ParseError("short numeric value".to_string()))?;
+            let v = match endian {
+                Endian::Little => f64::from_le_bytes(bytes),
+                Endian::Big => f64::from_be_bytes(bytes),
+            };
+            let bits = v.to_bits();
+            if is_missing_numeric(plan, v, bits) {
+                b.append_null();
+            } else {
+                b.append_value(apply_format_class_time(v));
             }
         }
         (ColumnBuilder::Utf8 { builder, num_cache }, VarType::Numeric) => {
@@ -544,11 +601,23 @@ fn append_value(
                 end -= 1;
             }
             let t_decode = if profile_enabled() { Some(Instant::now()) } else { None };
-            let s = encoding.decode_without_bom_handling(&raw[..end]).0;
+            let s_owned;
+            let s = if encoding == encoding_rs::UTF_8 {
+                let mut slice = &raw[..end];
+                if let Err(err) = std::str::from_utf8(slice) {
+                    let valid = err.valid_up_to();
+                    slice = &slice[..valid];
+                }
+                s_owned = std::str::from_utf8(slice).unwrap_or("").to_string();
+                s_owned.as_str()
+            } else {
+                let decoded = encoding.decode_without_bom_handling(&raw[..end]).0;
+                s_owned = decoded.into_owned();
+                s_owned.as_str()
+            };
             if let Some(t_decode) = t_decode {
                 add_ns(&PROFILE_DECODE_NS, t_decode.elapsed());
             }
-            let s = s.as_ref();
 
             if plan.fast_no_checks {
                 builder.append_value(s);
@@ -556,7 +625,8 @@ fn append_value(
             }
 
             let is_missing = (plan.missing_string_as_null && s.is_empty())
-                || plan.missing_set.as_ref().map_or(false, |set| set.contains(s));
+                || (plan.user_missing_as_null
+                    && plan.missing_set.as_ref().map_or(false, |set| set.contains(s)));
             if is_missing {
                 builder.append_null();
             } else if let Some(labels) = plan.label_map.as_deref() {
@@ -587,6 +657,9 @@ fn is_missing_numeric(plan: &ColumnPlan, v: f64, bits: u64) -> bool {
     if bits == SAV_MISSING_DOUBLE || bits == SAV_LOWEST_DOUBLE || bits == SAV_HIGHEST_DOUBLE || v.is_nan() {
         return true;
     }
+    if !plan.user_missing_as_null {
+        return false;
+    }
     if plan.missing_doubles.is_empty() {
         return false;
     }
@@ -609,15 +682,38 @@ fn is_missing_numeric(plan: &ColumnPlan, v: f64, bits: u64) -> bool {
     }
 }
 
+fn apply_format_class(v: f64, class: Option<FormatClass>) -> f64 {
+    match class {
+        Some(FormatClass::Date) => ((v as i64 - SPSS_SEC_SHIFT) / SEC_PER_DAY) as f64,
+        Some(FormatClass::DateTime) => ((v as i64 - SPSS_SEC_SHIFT) * SEC_MILLISECOND) as f64,
+        Some(FormatClass::Time) => ((v as i64) * SEC_NANOSECOND) as f64,
+        None => v,
+    }
+}
+
+fn apply_format_class_date(v: f64) -> i32 {
+    ((v as i64 - SPSS_SEC_SHIFT) / SEC_PER_DAY) as i32
+}
+
+fn apply_format_class_datetime(v: f64) -> i64 {
+    (v as i64 - SPSS_SEC_SHIFT) * SEC_MILLISECOND
+}
+
+fn apply_format_class_time(v: f64) -> i64 {
+    (v as i64) * SEC_NANOSECOND
+}
+
 #[derive(Debug, Clone)]
 struct ColumnPlan {
     var_type: VarType,
+    format_class: Option<FormatClass>,
     offset: usize,
     width: usize,
     string_len_bytes: usize,
     label_map: Option<Arc<LabelMap>>,
     missing_set: Option<Arc<HashSet<String>>>,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     fast_no_checks: bool,
     missing_range: bool,
     missing_doubles: Arc<Vec<f64>>,
@@ -632,6 +728,7 @@ impl ColumnPlan {
         label_map: Option<Arc<LabelMap>>,
         missing_set: Option<Arc<HashSet<String>>>,
         missing_string_as_null: bool,
+        user_missing_as_null: bool,
     ) -> Self {
         let fast_no_checks = matches!(var.var_type, VarType::Str)
             && !missing_string_as_null
@@ -644,12 +741,14 @@ impl ColumnPlan {
         };
         Self {
             var_type: var.var_type,
+            format_class: var.format_class,
             offset,
             width,
             string_len_bytes,
             label_map,
             missing_set,
             missing_string_as_null,
+            user_missing_as_null,
             fast_no_checks,
             missing_range: var.missing_range,
             missing_doubles: Arc::new(var.missing_doubles.clone()),
@@ -660,6 +759,9 @@ impl ColumnPlan {
 
 enum ColumnBuilder {
     Float64(PrimitiveChunkedBuilder<Float64Type>),
+    Date(PrimitiveChunkedBuilder<Int32Type>),
+    DateTime(PrimitiveChunkedBuilder<Int64Type>),
+    Time(PrimitiveChunkedBuilder<Int64Type>),
     Utf8 {
         builder: StringChunkedBuilder,
         num_cache: Option<NumericStringCache>,
@@ -670,6 +772,9 @@ impl ColumnBuilder {
     fn finish(self) -> Series {
         match self {
             ColumnBuilder::Float64(b) => b.finish().into_series(),
+            ColumnBuilder::Date(b) => b.finish().into_date().into_series(),
+            ColumnBuilder::DateTime(b) => b.finish().into_datetime(TimeUnit::Milliseconds, None).into_series(),
+            ColumnBuilder::Time(b) => b.finish().into_time().into_series(),
             ColumnBuilder::Utf8 { builder, .. } => builder.finish().into_series(),
         }
     }

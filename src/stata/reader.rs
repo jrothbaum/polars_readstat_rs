@@ -2,6 +2,7 @@ use crate::stata::error::Result;
 use crate::stata::header::read_header;
 use crate::stata::metadata::read_metadata;
 use crate::stata::data::{read_data_frame, read_data_frame_range, build_shared_decode};
+use crate::stata::polars_output::{apply_stata_time_formats, stata_time_format_kind};
 use crate::stata::types::{Header, Metadata};
 use polars::prelude::*;
 use rayon::prelude::*;
@@ -94,6 +95,18 @@ impl StataReader {
                 _opts.value_labels_as_strings,
             )?
         };
+
+        if !df.is_empty() {
+            let mut formats = Vec::new();
+            for var in &self.metadata.variables {
+                if let Some(kind) = stata_time_format_kind(var.format.as_deref(), &var.var_type) {
+                    formats.push((var.name.clone(), kind));
+                }
+            }
+            if !formats.is_empty() {
+                apply_stata_time_formats(&mut df, &formats)?;
+            }
+        }
 
         if let Some(schema) = _opts.schema {
             df = cast_dataframe(df, &schema)?;

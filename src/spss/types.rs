@@ -10,6 +10,13 @@ pub enum VarType {
     Str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatClass {
+    Date,
+    DateTime,
+    Time,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueLabelKey {
     Double(f64),
@@ -30,9 +37,12 @@ pub struct Header {
 #[derive(Debug, Clone)]
 pub struct Variable {
     pub name: String,
+    pub short_name: String,
     pub var_type: VarType,
     pub width: usize,     // number of 8-byte segments
     pub string_len: usize, // declared string length in bytes (0 for numeric)
+    pub format_type: u8,
+    pub format_class: Option<FormatClass>,
     pub label: Option<String>,
     pub value_label: Option<String>,
     pub offset: usize, // segment offset within row

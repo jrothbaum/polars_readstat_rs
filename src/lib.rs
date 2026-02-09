@@ -32,6 +32,13 @@ pub use sas::reader;
 
 pub use sas::{Error, Result, Sas7bdatReader};
 pub use sas::{Compression, Endian, Format, Platform};
+pub use sas::{
+    SasValueLabelKey,
+    SasValueLabelMap,
+    SasValueLabels,
+    SasVariableLabels,
+    SasWriter,
+};
 
 pub use sas::scan_sas7bdat;
 
@@ -70,6 +77,7 @@ pub struct ScanOptions {
     pub threads: Option<usize>,
     pub chunk_size: Option<usize>,
     pub missing_string_as_null: Option<bool>,
+    pub user_missing_as_null: Option<bool>,
     pub value_labels_as_strings: Option<bool>,
 }
 
@@ -79,6 +87,7 @@ impl Default for ScanOptions {
             threads: None,
             chunk_size: None,
             missing_string_as_null: Some(true),
+            user_missing_as_null: Some(true),
             value_labels_as_strings: Some(true),
         }
     }

@@ -55,7 +55,7 @@ fn test_very_long_string_metadata() {
         .metadata()
         .variables
         .iter()
-        .find(|v| v.name == "STARTDAT")
+        .find(|v| v.short_name.eq_ignore_ascii_case("STARTDAT") || v.name.eq_ignore_ascii_case("STARTDAT"))
         .expect("STARTDAT variable");
     assert!(var.string_len >= 1024, "expected STARTDAT string_len >= 1024");
     assert!(var.width * 8 >= var.string_len, "expected width bytes to cover string_len");
@@ -69,7 +69,7 @@ fn test_long_string_metadata() {
         .metadata()
         .variables
         .iter()
-        .find(|v| v.name == "Q16BR9OE")
+        .find(|v| v.short_name.eq_ignore_ascii_case("Q16BR9OE") || v.name.eq_ignore_ascii_case("Q16BR9OE"))
         .expect("Q16BR9OE variable");
     assert!(var.string_len >= 512, "expected Q16BR9OE string_len >= 512");
     assert!(var.width * 8 >= var.string_len, "expected width bytes to cover string_len");

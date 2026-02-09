@@ -1,5 +1,5 @@
 use crate::spss::error::{Error, Result};
-use crate::spss::types::{Endian, Header, Metadata, VarType, Variable};
+use crate::spss::types::{Endian, Header, Metadata, VarType, Variable, FormatClass};
 use std::io::{Read, Seek, SeekFrom};
 
 const REC_TYPE_VARIABLE: u32 = 2;
@@ -11,6 +11,7 @@ const REC_TYPE_DICT_TERMINATION: u32 = 999;
 
 const SUBTYPE_CHAR_ENCODING: u32 = 20;
 const SUBTYPE_INTEGER_INFO: u32 = 3;
+const SUBTYPE_LONG_VAR_NAME: u32 = 13;
 const SUBTYPE_VERY_LONG_STR: u32 = 14;
 const SUBTYPE_LONG_STRING_VALUE_LABELS: u32 = 21;
 const SUBTYPE_LONG_STRING_MISSING_VALUES: u32 = 22;
@@ -67,6 +68,10 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
                     let mut buf = vec![0u8; data_len];
                     reader.read_exact(&mut buf)?;
                     parse_very_long_string_record(&buf, &mut metadata)?;
+                } else if subtype == SUBTYPE_LONG_VAR_NAME && data_len > 0 {
+                    let mut buf = vec![0u8; data_len];
+                    reader.read_exact(&mut buf)?;
+                    parse_long_variable_names_record(&buf, &mut metadata)?;
                 } else if subtype == SUBTYPE_LONG_STRING_VALUE_LABELS && data_len > 0 {
                     let mut buf = vec![0u8; data_len];
                     reader.read_exact(&mut buf)?;
@@ -137,7 +142,7 @@ fn read_variable_record<R: Read + Seek>(
     let typ = read_i32(&buf[0..4], header.endian);
     let has_label = read_i32(&buf[4..8], header.endian);
     let n_missing = read_i32(&buf[8..12], header.endian);
-    let _print = read_i32(&buf[12..16], header.endian);
+    let print_format = read_i32(&buf[12..16], header.endian);
     let _write = read_i32(&buf[16..20], header.endian);
     let name = read_name(&buf[20..28]);
 
@@ -153,6 +158,9 @@ fn read_variable_record<R: Read + Seek>(
     let width = 1;
     let offset = *current_offset;
     *current_offset += width;
+
+    let format_type = ((print_format as u32) >> 16) as u8;
+    let format_class = format_class_from_type(format_type);
 
     let mut label: Option<String> = None;
     if has_label != 0 {
@@ -194,10 +202,13 @@ fn read_variable_record<R: Read + Seek>(
     }
 
     Ok(Some(Variable {
-        name,
+        name: name.clone(),
+        short_name: name,
         var_type,
         width,
         string_len,
+        format_type,
+        format_class,
         label,
         value_label: None,
         offset,
@@ -206,6 +217,18 @@ fn read_variable_record<R: Read + Seek>(
         missing_double_bits,
         missing_strings,
     }))
+}
+
+fn format_class_from_type(code: u8) -> Option<FormatClass> {
+    match code {
+        // DATE, ADATE, JDATE, EDATE, SDATE
+        20 | 23 | 24 | 38 | 39 => Some(FormatClass::Date),
+        // TIME, DTIME
+        21 | 25 => Some(FormatClass::Time),
+        // DATETIME, YMDHMS
+        22 | 41 => Some(FormatClass::DateTime),
+        _ => None,
+    }
 }
 
 fn read_value_label_record<R: Read + Seek>(
@@ -299,7 +322,7 @@ fn read_i32(buf: &[u8], endian: Endian) -> i32 {
 
 fn read_name(buf: &[u8]) -> String {
     let s = String::from_utf8_lossy(buf).trim().to_string();
-    s.trim_end_matches('\u{0}').to_string()
+    s.trim_end_matches('\u{0}').to_ascii_uppercase()
 }
 
 fn read_f64(buf: &[u8], endian: Endian) -> f64 {
@@ -400,9 +423,44 @@ fn parse_very_long_string_record(data: &[u8], metadata: &mut Metadata) -> Result
             let key = String::from_utf8_lossy(&entry[..eq]).to_string();
             let val = String::from_utf8_lossy(&entry[eq + 1..]).trim().to_string();
             if let Ok(len) = val.parse::<usize>() {
-                if let Some(var) = metadata.variables.iter_mut().find(|v| v.name.eq_ignore_ascii_case(&key)) {
+                if let Some(var) = metadata
+                    .variables
+                    .iter_mut()
+                    .find(|v| v.short_name.eq_ignore_ascii_case(&key) || v.name.eq_ignore_ascii_case(&key))
+                {
                     var.string_len = len;
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_long_variable_names_record(data: &[u8], metadata: &mut Metadata) -> Result<()> {
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let end = data[pos..]
+            .iter()
+            .position(|&b| b == b'\t')
+            .map(|i| pos + i)
+            .unwrap_or(data.len());
+        let entry: Vec<u8> = data[pos..end].iter().copied().filter(|b| *b != 0).collect();
+        pos = if end < data.len() { end + 1 } else { end };
+        if entry.is_empty() {
+            continue;
+        }
+        if let Some(eq) = entry.iter().position(|&b| b == b'=') {
+            let key = String::from_utf8_lossy(&entry[..eq]).trim().to_string();
+            let val = String::from_utf8_lossy(&entry[eq + 1..]).trim().to_string();
+            if key.is_empty() || val.is_empty() {
+                continue;
+            }
+            if let Some(var) = metadata
+                .variables
+                .iter_mut()
+                .find(|v| v.name.eq_ignore_ascii_case(&key))
+            {
+                var.name = val;
             }
         }
     }

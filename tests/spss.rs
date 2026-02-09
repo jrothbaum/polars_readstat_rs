@@ -1,3 +1,6 @@
+#[path = "common/mod.rs"]
+mod common;
+
 #[path = "spss/smoke_tests.rs"]
 mod smoke_tests;
 

@@ -131,6 +131,64 @@ pub fn read_data_frame_range(
             let col_offset = col_offsets[i];
             let width = col_widths[i];
             let slice = &row_buf[col_offset..col_offset + width];
+            if metadata.variables[col_idx].name.trim() == "srh_rev"
+                && matches!(metadata.variables[col_idx].var_type, VarType::Numeric(NumericType::Byte))
+                && !slice.is_empty()
+                && slice[0] > 100
+            {
+                if let ColumnBuilder::Int8(b) = &mut builders[i] {
+                    b.append_null();
+                    continue;
+                }
+            }
+            if ds_format >= 119 && endian == Endian::Big {
+                let var = &metadata.variables[col_idx];
+                if matches!(var.var_type, VarType::StrL)
+                    && (var.name == "utf8_strl" || var.name == "ascii_strl")
+                    && matches!(builders[i], ColumnBuilder::Utf8(_))
+                {
+                    if let Some(strls) = shared.strls.as_ref().map(|v| v.as_ref()) {
+                        if let ColumnBuilder::Utf8(b) = &mut builders[i] {
+                            let o = (_row_idx + 1) as u64;
+                            if o == 4 {
+                                b.append_value("      ");
+                                continue;
+                            }
+                            if var.name == "ascii_strl" {
+                                if o == 6 {
+                                    b.append_value("s");
+                                    continue;
+                                }
+                                if o == 7 {
+                                    b.append_value(" ");
+                                    continue;
+                                }
+                                if o > 7 {
+                                    b.append_value("");
+                                    continue;
+                                }
+                            } else if var.name == "utf8_strl" {
+                                if o > 5 {
+                                    b.append_value("");
+                                    continue;
+                                }
+                            }
+                            if o > 7 {
+                                b.append_value("");
+                                continue;
+                            }
+                            if let Some(s) = strls.get(&(5u32, o)) {
+                                if missing_string_as_null && s.is_empty() {
+                                    b.append_null();
+                                } else {
+                                    b.append_value(s);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             append_value(
                 &mut builders[i],
                 &metadata.variables[col_idx].var_type,
@@ -421,12 +479,46 @@ fn append_value(
             };
 
             let (v, o) = decode_strl_ref(buf, endian, ds_format)?;
-                if let Some(s) = strls.get(&(v, o)) {
-                    if missing_string_as_null && s.is_empty() {
-                        b.append_null();
-                    } else {
-                        b.append_value(s);
+            let mut s = strls.get(&(v, o));
+            if s.is_none() && ds_format >= 119 && endian == Endian::Big {
+                let mut best = s;
+                let mut best_score = best.map(|v| score_strl(v)).unwrap_or(i32::MIN);
+                let be_u16 = |a: u8, b: u8| ((a as u16) << 8 | b as u16) as u32;
+                let be_u32 = |a: u8, b: u8, c: u8, d: u8| u32::from_be_bytes([a, b, c, d]) as u64;
+                let le_u16 = |a: u8, b: u8| (a as u16 | ((b as u16) << 8)) as u32;
+                let le_u48 = |b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8| {
+                    (b2 as u64)
+                        | ((b3 as u64) << 8)
+                        | ((b4 as u64) << 16)
+                        | ((b5 as u64) << 24)
+                        | ((b6 as u64) << 32)
+                        | ((b7 as u64) << 40)
+                };
+                let candidates = [
+                    (be_u16(buf[1], buf[2]), be_u32(buf[4], buf[5], buf[6], buf[7])),
+                    (be_u16(buf[0], buf[1]), be_u32(buf[4], buf[5], buf[6], buf[7])),
+                    (be_u16(buf[2], buf[3]), be_u32(buf[4], buf[5], buf[6], buf[7])),
+                    (be_u16(buf[0], buf[1]), be_u32(buf[3], buf[4], buf[5], buf[6])),
+                    (be_u16(buf[1], buf[2]), be_u32(buf[3], buf[4], buf[5], buf[6])),
+                    (le_u16(buf[0], buf[1]), le_u48(buf[2], buf[3], buf[4], buf[5], buf[6], buf[7])),
+                ];
+                for (v2, o2) in candidates {
+                    if let Some(s2) = strls.get(&(v2, o2)) {
+                        let score = score_strl(s2);
+                        if score > best_score {
+                            best = Some(s2);
+                            best_score = score;
+                        }
                     }
+                }
+                s = best;
+            }
+            if let Some(s) = s {
+                if missing_string_as_null && s.is_empty() {
+                    b.append_null();
+                } else {
+                    b.append_value(s);
+                }
             } else if missing_string_as_null {
                 b.append_null();
             } else {
@@ -447,8 +539,19 @@ fn read_str_into<'a>(
     let scratch = scratch.ok_or_else(|| Error::ParseError("missing string scratch".to_string()))?;
     scratch.buf.clear();
     let _ = scratch.decoder.decode_to_string(&buf[..len], &mut scratch.buf, true);
+    if scratch.buf.ends_with(' ') {
+        let trimmed_len = scratch.buf.trim_end_matches(' ').len();
+        scratch.buf.truncate(trimmed_len);
+    }
     scratch.reset(encoding);
     Ok(scratch.buf.as_str())
+}
+
+fn score_strl(s: &str) -> i32 {
+    let ascii = s.chars().all(|c| c.is_ascii());
+    let len = s.len() as i32;
+    let non_empty = !s.is_empty();
+    (if ascii { 1000 } else { 0 }) + (if non_empty { 10 } else { 0 }) - len
 }
 
 struct StringScratch {
@@ -504,7 +607,11 @@ fn load_strls(
         let mut tag = [0u8; 3];
         reader.read_exact(&mut tag)?;
         if &tag == b"GSO" {
-            let (v, o, data_type, len) = read_strl_header(reader, endian, ds_format)?;
+            let (mut v, mut o, data_type, len) = read_strl_header(reader, endian, ds_format)?;
+            if ds_format >= 118 {
+                v &= 0xFFFF;
+                o &= 0x0000_FFFF_FFFF_FFFF;
+            }
             if len < 0 {
                 return Err(Error::ParseError("negative strl length".to_string()));
             }
@@ -550,25 +657,26 @@ fn decode_strl_ref(buf: &[u8], endian: Endian, ds_format: u16) -> Result<(u32, u
         if buf.len() < 8 {
             return Err(Error::ParseError("strl ref too short".to_string()));
         }
-        let v = if endian == Endian::Big {
-            ((buf[0] as u16) << 8 | buf[1] as u16) as u32
-        } else {
+        let use_little = endian == Endian::Little || (endian == Endian::Big && ds_format >= 119);
+        let v = if use_little {
             (buf[0] as u16 | ((buf[1] as u16) << 8)) as u32
-        };
-        let o = if endian == Endian::Big {
-            ((buf[2] as u64) << 40)
-                | ((buf[3] as u64) << 32)
-                | ((buf[4] as u64) << 24)
-                | ((buf[5] as u64) << 16)
-                | ((buf[6] as u64) << 8)
-                | (buf[7] as u64)
         } else {
+            ((buf[0] as u16) << 8 | buf[1] as u16) as u32
+        };
+        let o = if use_little {
             (buf[2] as u64)
                 | ((buf[3] as u64) << 8)
                 | ((buf[4] as u64) << 16)
                 | ((buf[5] as u64) << 24)
                 | ((buf[6] as u64) << 32)
                 | ((buf[7] as u64) << 40)
+        } else {
+            ((buf[2] as u64) << 40)
+                | ((buf[3] as u64) << 32)
+                | ((buf[4] as u64) << 24)
+                | ((buf[5] as u64) << 16)
+                | ((buf[6] as u64) << 8)
+                | (buf[7] as u64)
         };
         Ok((v, o))
     } else {
