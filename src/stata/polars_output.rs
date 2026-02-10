@@ -1,7 +1,12 @@
+use crate::stata::data::{build_shared_decode, read_data_frame_range};
 use crate::stata::reader::StataReader;
 use crate::stata::types::{VarType, NumericType};
 use polars::prelude::*;
-use std::collections::HashSet;
+use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::mpsc::{self, Receiver};
+use std::thread::JoinHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,12 +17,14 @@ pub fn scan_dta(
     let path = path.into();
     let missing_string_as_null = opts.missing_string_as_null.unwrap_or(true);
     let value_labels_as_strings = opts.value_labels_as_strings;
+    let preserve_order = opts.preserve_order.unwrap_or(false);
     let scan_ptr = Arc::new(StataScan::new(
         path,
         opts.threads,
         missing_string_as_null,
         value_labels_as_strings,
         opts.chunk_size,
+        preserve_order,
         opts.compress_opts,
     ));
     LazyFrame::anonymous_scan(scan_ptr, Default::default())
@@ -52,7 +59,7 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let mut iter = stata_batch_iter(path, None, true, true, Some(10), None, Some(25))
+        let mut iter = stata_batch_iter(path, None, true, true, Some(10), false, None, Some(25))
             .expect("batch iter");
         let mut batches = 0usize;
         let mut rows = 0usize;
@@ -72,6 +79,7 @@ pub struct StataScan {
     missing_string_as_null: bool,
     value_labels_as_strings: Option<bool>,
     chunk_size: Option<usize>,
+    preserve_order: bool,
     compress_opts: crate::CompressOptionsLite,
 }
 
@@ -82,13 +90,64 @@ impl StataScan {
         missing_string_as_null: bool,
         value_labels_as_strings: Option<bool>,
         chunk_size: Option<usize>,
+        preserve_order: bool,
         compress_opts: crate::CompressOptionsLite,
     ) -> Self {
-        Self { path, threads, missing_string_as_null, value_labels_as_strings, chunk_size, compress_opts }
+        Self { path, threads, missing_string_as_null, value_labels_as_strings, chunk_size, preserve_order, compress_opts }
     }
 }
 
-pub(crate) struct StataBatchIter {
+pub(crate) type StataBatchIter = Box<dyn Iterator<Item = PolarsResult<DataFrame>> + Send>;
+
+struct ParallelStataBatchIter {
+    rx: Receiver<(usize, PolarsResult<DataFrame>)>,
+    handle: Option<JoinHandle<()>>,
+    preserve_order: bool,
+    buffer: BTreeMap<usize, PolarsResult<DataFrame>>,
+    next_idx: usize,
+    total_chunks: usize,
+}
+
+impl Iterator for ParallelStataBatchIter {
+    type Item = PolarsResult<DataFrame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.preserve_order {
+            return self.rx.recv().ok().map(|(_, df)| df);
+        }
+        if self.next_idx >= self.total_chunks {
+            return None;
+        }
+        loop {
+            if let Some(item) = self.buffer.remove(&self.next_idx) {
+                self.next_idx += 1;
+                return Some(item);
+            }
+            match self.rx.recv() {
+                Ok((idx, df)) => {
+                    self.buffer.insert(idx, df);
+                }
+                Err(_) => {
+                    if let Some(item) = self.buffer.remove(&self.next_idx) {
+                        self.next_idx += 1;
+                        return Some(item);
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ParallelStataBatchIter {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct SerialStataBatchIter {
     reader: StataReader,
     cols: Option<Vec<String>>,
     time_formats: Vec<(String, StataTimeFormatKind)>,
@@ -101,7 +160,7 @@ pub(crate) struct StataBatchIter {
     chunk_size: Option<usize>,
 }
 
-impl Iterator for StataBatchIter {
+impl Iterator for SerialStataBatchIter {
     type Item = PolarsResult<DataFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -144,6 +203,7 @@ pub(crate) fn stata_batch_iter(
     missing_string_as_null: bool,
     value_labels_as_strings: bool,
     chunk_size: Option<usize>,
+    preserve_order: bool,
     cols: Option<Vec<String>>,
     n_rows: Option<usize>,
 ) -> PolarsResult<StataBatchIter> {
@@ -152,6 +212,19 @@ pub(crate) fn stata_batch_iter(
     let total = n_rows.unwrap_or(reader.metadata().row_count as usize);
     let batch_size = chunk_size.unwrap_or(100_000).max(1);
     let selected = cols.as_ref().map(|c| c.iter().cloned().collect::<HashSet<_>>());
+    let col_indices = cols.as_ref().map(|names| {
+        names
+            .iter()
+            .map(|name| {
+                reader
+                    .metadata()
+                    .variables
+                    .iter()
+                    .position(|v| v.name == *name)
+                    .ok_or_else(|| PolarsError::ColumnNotFound(name.clone().into()))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }).transpose()?;
     let mut time_formats = Vec::new();
     for var in &reader.metadata().variables {
         if let Some(kind) = stata_time_format_kind(var.format.as_deref(), &var.var_type) {
@@ -160,7 +233,78 @@ pub(crate) fn stata_batch_iter(
             }
         }
     }
-    Ok(StataBatchIter {
+
+    let n_threads = threads.unwrap_or_else(|| {
+        let cur = rayon::current_num_threads();
+        cur.min(4).max(1)
+    });
+    if n_threads > 1 && total >= 1000 {
+        let n_chunks = (total + batch_size - 1) / batch_size;
+        let (tx, rx) = mpsc::channel::<(usize, PolarsResult<DataFrame>)>();
+        let path = Arc::new(path);
+        let metadata = Arc::new(reader.metadata().clone());
+        let endian = reader.header().endian;
+        let version = reader.header().version;
+        let cols_idx = col_indices.clone();
+        let formats = Arc::new(time_formats);
+        let missing_null = missing_string_as_null;
+        let labels_as_strings = value_labels_as_strings;
+        let shared = build_shared_decode(
+            &path,
+            &metadata,
+            endian,
+            version,
+            labels_as_strings,
+        )
+        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+        let shared = Arc::new(shared);
+
+        let handle = std::thread::spawn(move || {
+            let pool = ThreadPoolBuilder::new().num_threads(n_threads).build();
+            if let Ok(pool) = pool {
+                pool.install(|| {
+                    (0..n_chunks).into_par_iter().for_each_with(tx, |sender, i| {
+                        let start = i * batch_size;
+                        if start >= total {
+                            return;
+                        }
+                        let end = (total).min(start + batch_size);
+                        let cnt = end - start;
+                        let result = read_data_frame_range(
+                            &path,
+                            &metadata,
+                            endian,
+                            version,
+                            cols_idx.as_deref(),
+                            start,
+                            cnt,
+                            missing_null,
+                            labels_as_strings,
+                            &shared,
+                        )
+                        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
+                        .and_then(|mut df| {
+                            apply_stata_time_formats(&mut df, &formats)?;
+                            Ok(df)
+                        });
+                        let _ = sender.send((i, result));
+                    });
+                });
+            }
+        });
+
+        return Ok(Box::new(ParallelStataBatchIter {
+            rx,
+            handle: Some(handle),
+            preserve_order,
+            buffer: BTreeMap::new(),
+            next_idx: 0,
+            total_chunks: n_chunks,
+        }));
+    }
+
+    let _ = preserve_order;
+    Ok(Box::new(SerialStataBatchIter {
         reader,
         cols,
         time_formats,
@@ -171,7 +315,7 @@ pub(crate) fn stata_batch_iter(
         missing_string_as_null,
         value_labels_as_strings,
         chunk_size,
-    })
+    }))
 }
 
 impl AnonymousScan for StataScan {
@@ -179,19 +323,20 @@ impl AnonymousScan for StataScan {
 
     fn scan(&self, opts: AnonymousScanArgs) -> PolarsResult<DataFrame> {
         let cols = opts.with_columns.map(|c| c.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        let mut iter = stata_batch_iter(
+        let iter = stata_batch_iter(
             self.path.clone(),
             self.threads,
             self.missing_string_as_null,
             self.value_labels_as_strings.unwrap_or(true),
             self.chunk_size,
+            self.preserve_order,
             cols,
             opts.n_rows,
         )?;
 
+        let prefetch = crate::scan_prefetch::spawn_prefetcher(iter.map(|batch| batch));
         let mut out: Option<DataFrame> = None;
-        while let Some(batch) = iter.next() {
-            let df = batch?;
+        while let Some(df) = prefetch.next()? {
             if let Some(acc) = out.as_mut() {
                 acc.vstack_mut(&df).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
             } else {
@@ -252,7 +397,9 @@ pub(crate) enum StataTimeFormatKind {
 fn allow_date(var_type: &VarType) -> bool {
     matches!(
         var_type,
-        VarType::Numeric(NumericType::Long)
+        VarType::Numeric(NumericType::Byte)
+            | VarType::Numeric(NumericType::Int)
+            | VarType::Numeric(NumericType::Long)
             | VarType::Numeric(NumericType::Float)
             | VarType::Numeric(NumericType::Double)
     )

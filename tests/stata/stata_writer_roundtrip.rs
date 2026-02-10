@@ -160,7 +160,9 @@ fn test_stata_roundtrip_small_files() {
             panic!("write failed");
         }
         let roundtrip = StataReader::open(&out_path).unwrap().read().finish().unwrap();
-        assert_df_equal(&original, &roundtrip).unwrap();
+        if let Err(e) = assert_df_equal(&original, &roundtrip) {
+            panic!("roundtrip mismatch for {:?}: {}", path, e);
+        }
         let _ = std::fs::remove_file(&out_path);
     }
 }

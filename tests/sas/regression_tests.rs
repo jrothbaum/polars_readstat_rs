@@ -23,12 +23,20 @@ fn test_test1_data_values() {
     let col_names = df.get_column_names();
     assert!(col_names.iter().any(|&n| n == "Column1"), "Should have Column1");
 
-    // In modern Polars, we use .column() which returns a Series
-    let col1 = df.column("Column1").unwrap();
-    if col1.dtype() == &DataType::Float64 {
-        let values = col1.f64().unwrap();
-        assert!(values.get(0).is_some(), "First row should have Column1 value");
-    }
+    let col1 = df.column("Column1").unwrap().f64().unwrap();
+    let col3 = df.column("Column3").unwrap().f64().unwrap();
+    let col8 = df.column("Column8").unwrap().f64().unwrap();
+
+    // Guard against MIX-page row-start alignment regressions (+4 bytes issue).
+    assert_eq!(col1.get(7), Some(0.148));
+    assert_eq!(col1.get(8), None);
+    assert_eq!(col1.get(9), Some(0.663));
+    assert_eq!(col3.get(7), Some(37.0));
+    assert_eq!(col3.get(8), Some(15.0));
+    assert_eq!(col3.get(9), None);
+    assert_eq!(col8.get(7), Some(8833.0));
+    assert_eq!(col8.get(8), Some(3227.0));
+    assert_eq!(col8.get(9), None);
 }
 
 /// Regression test: verify that Projection Pushdown (column selection) works

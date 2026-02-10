@@ -105,7 +105,6 @@ impl<R: Read + Seek> DataReader<R> {
             }
         };
 
-        // Extract row bytes
         let row_bytes = self.extract_row_bytes(offset, length, compression)?;
 
         // Advance to next row
@@ -116,12 +115,82 @@ impl<R: Read + Seek> DataReader<R> {
 
     /// Skip n rows
     pub fn skip_rows(&mut self, n: usize) -> Result<()> {
-        for _ in 0..n {
-            if self.read_row()?.is_none() {
-                break;
+        let mut remaining = n.min(self.metadata.row_count.saturating_sub(self.current_row));
+
+        while remaining > 0 {
+            let available = self.rows_remaining_in_page();
+            if available == 0 {
+                self.advance_page()?;
+                if self.rows_remaining_in_page() == 0 {
+                    // No more rows available from source.
+                    break;
+                }
+                continue;
             }
+
+            let to_skip = remaining.min(available);
+            self.advance_rows(to_skip);
+            remaining -= to_skip;
         }
+
         Ok(())
+    }
+
+    fn rows_remaining_in_page(&self) -> usize {
+        match &self.page_state {
+            Some(PageState::Meta {
+                data_subheaders,
+                current_index,
+            }) => data_subheaders.len().saturating_sub(*current_index),
+            Some(PageState::Data {
+                block_count,
+                offset,
+                row_length,
+                current_index,
+            }) => {
+                if *row_length == 0 {
+                    return 0;
+                }
+                let page_size = self.page_reader.header().page_length;
+                if *offset >= page_size {
+                    return 0;
+                }
+                let max_fit = (page_size - *offset) / *row_length;
+                let valid_rows = (*block_count).min(max_fit);
+                valid_rows.saturating_sub(*current_index)
+            }
+            Some(PageState::Mix {
+                row_count,
+                offset,
+                row_length,
+                current_index,
+            }) => {
+                if *row_length == 0 {
+                    return 0;
+                }
+                let page_size = self.page_reader.header().page_length;
+                if *offset >= page_size {
+                    return 0;
+                }
+                let max_fit = (page_size - *offset) / *row_length;
+                let valid_rows = (*row_count).min(max_fit);
+                valid_rows.saturating_sub(*current_index)
+            }
+            None => 0,
+        }
+    }
+
+    fn advance_rows(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.current_row += n;
+        match &mut self.page_state {
+            Some(PageState::Meta { current_index, .. }) => *current_index += n,
+            Some(PageState::Data { current_index, .. }) => *current_index += n,
+            Some(PageState::Mix { current_index, .. }) => *current_index += n,
+            None => {}
+        }
     }
 
     /// Get current row offset, length, and compression flag from page state
@@ -248,11 +317,27 @@ impl<R: Read + Seek> DataReader<R> {
                         Format::Bit32 => 4,
                     };
                     let subheader_size = 3 * integer_size;
-                    let mut offset = page_bit_offset + 8 + page_header.subheader_count as usize * subheader_size;
+                    // MIX pages: rows start immediately after the subheader table.
+                    let mut offset =
+                        page_bit_offset + 8 + page_header.subheader_count as usize * subheader_size;
 
-                    // Align to 8 bytes (round up to next multiple of 8)
-                    if offset % 8 != 0 {
-                        offset += 8 - (offset % 8);
+                    // Match ReadStat MIX-page alignment behavior:
+                    // - For non-Stat/Transfer files, always skip 4 bytes when
+                    //   the data pointer is 4-byte misaligned.
+                    // - For Stat/Transfer files, skip only if the next 4 bytes
+                    //   are all zeros or spaces.
+                    if offset % 8 == 4 {
+                        let page_buffer = self.page_reader.page_buffer();
+                        if offset + 4 <= page_buffer.len() {
+                            let pad = &page_buffer[offset..offset + 4];
+                            let vendor_is_stat_transfer =
+                                is_stat_transfer_release(self.page_reader.header().sas_release.as_str());
+                            let pad_is_zero_or_space =
+                                pad == [0, 0, 0, 0] || pad == [b' ', b' ', b' ', b' '];
+                            if !vendor_is_stat_transfer || pad_is_zero_or_space {
+                                offset += 4;
+                            }
+                        }
                     }
 
                     let row_count = self
@@ -381,6 +466,24 @@ impl<R: Read + Seek> DataReader<R> {
         }
     }
 
+}
+
+fn is_stat_transfer_release(release: &str) -> bool {
+    let bytes = release.as_bytes();
+    if bytes.len() < 8 {
+        return false;
+    }
+    let major = bytes[0] as char;
+    if major != '8' && major != '9' {
+        return false;
+    }
+    // Expected pattern: X.YYYYMZ (e.g., 9.0202M0)
+    if bytes[1] != b'.' || bytes[6] != b'M' {
+        return false;
+    }
+    let minor = std::str::from_utf8(&bytes[2..6]).ok().and_then(|s| s.parse::<u32>().ok());
+    let revision = bytes.get(7).copied().filter(|b| b.is_ascii_digit()).map(|b| (b - b'0') as u32);
+    matches!((minor, revision), (Some(0), Some(0)))
 }
 
 /// Check if an 8-byte signature matches any known metadata subheader type.

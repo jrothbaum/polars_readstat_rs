@@ -73,6 +73,7 @@ struct MetadataBuilder {
     creator_proc: String,
     column_texts: Vec<Vec<u8>>, // Keep as bytes to preserve offset indexing
     next_column_name_position: usize, // Track position across multiple COLUMN_NAME subheaders
+    next_column_attributes_position: usize, // Track position across multiple COLUMN_ATTRIBUTES subheaders
     next_format_label_position: usize, // Track position across multiple FORMAT_AND_LABEL subheaders
     data_subheaders: Vec<DataSubheader>, // Data subheaders collected during metadata reading
 }
@@ -102,6 +103,7 @@ impl MetadataBuilder {
             creator_proc: String::new(),
             column_texts: Vec::new(),
             next_column_name_position: 0,
+            next_column_attributes_position: 0,
             next_format_label_position: 0,
             data_subheaders: Vec::new(),
         }
@@ -304,8 +306,6 @@ impl MetadataBuilder {
         // loop increment is integer_size + 8
         let offset_max = offset + subheader.length - 12 - integer_size;
         let mut entry_offset = offset + integer_size + 8;
-        let mut col_idx = 0;
-
         while entry_offset <= offset_max {
             let col_offset = buf.get_integer(entry_offset, format)? as usize;
             let col_length = buf.get_u32(entry_offset + integer_size)? as usize;
@@ -317,14 +317,15 @@ impl MetadataBuilder {
                 ColumnType::Character
             };
 
-            if col_idx < self.columns.len() {
-                self.columns[col_idx].offset = col_offset;
-                self.columns[col_idx].length = col_length;
-                self.columns[col_idx].col_type = col_type;
+            if self.next_column_attributes_position < self.columns.len() {
+                let idx = self.next_column_attributes_position;
+                self.columns[idx].offset = col_offset;
+                self.columns[idx].length = col_length;
+                self.columns[idx].col_type = col_type;
+                self.next_column_attributes_position += 1;
             }
 
             entry_offset += integer_size + 8; // Format-dependent increment
-            col_idx += 1;
         }
 
         Ok(())

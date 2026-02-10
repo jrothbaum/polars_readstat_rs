@@ -32,8 +32,9 @@ pub fn missing_rules(ds_format: u16) -> MissingRules {
             missing_double: 0x7fe0000000000000,
         }
     } else {
-        // Match readstat behavior for Stata 113+:
-        // only system missing values are treated as missing for integer types.
+        // Match pyreadstat/readstat-style behavior for Stata 113+:
+        // treat system missing (.) and extended missing values (.a-.z) as missing
+        // for integer storage types.
         MissingRules {
             max_int8: 0x7f,
             max_int16: 0x7fff,
@@ -52,7 +53,7 @@ pub fn missing_rules(ds_format: u16) -> MissingRules {
 
 pub fn read_i8(buf: &[u8], rules: MissingRules) -> Option<i8> {
     let v = buf[0] as i8;
-    if rules.system_missing_enabled && v == rules.system_missing_int8 {
+    if rules.system_missing_enabled && v >= rules.system_missing_int8 {
         return None;
     }
     if v > rules.max_int8 {
@@ -68,7 +69,7 @@ pub fn read_i16(buf: &[u8], endian: Endian, rules: MissingRules) -> Option<i16> 
         Endian::Little => cursor.read_i16::<LittleEndian>().ok()?,
         Endian::Big => cursor.read_i16::<BigEndian>().ok()?,
     };
-    if rules.system_missing_enabled && v == rules.system_missing_int16 {
+    if rules.system_missing_enabled && v >= rules.system_missing_int16 {
         return None;
     }
     if v > rules.max_int16 {
@@ -84,7 +85,7 @@ pub fn read_i32(buf: &[u8], endian: Endian, rules: MissingRules) -> Option<i32> 
         Endian::Little => cursor.read_i32::<LittleEndian>().ok()?,
         Endian::Big => cursor.read_i32::<BigEndian>().ok()?,
     };
-    if rules.system_missing_enabled && v == rules.system_missing_int32 {
+    if rules.system_missing_enabled && v >= rules.system_missing_int32 {
         return None;
     }
     if v > rules.max_int32 {

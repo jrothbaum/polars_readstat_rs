@@ -2,7 +2,7 @@ use crate::spss::error::{Error, Result};
 use crate::spss::types::{Header, Metadata};
 use crate::spss::header::read_header;
 use crate::spss::metadata::read_metadata;
-use crate::spss::data::{read_data_frame, read_data_columns_uncompressed, profile_print, profile_reset};
+use crate::spss::data::{read_data_frame, read_data_columns_uncompressed};
 use polars::prelude::*;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
@@ -29,6 +29,14 @@ impl SpssReader {
 
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
+    }
+
+    pub fn compression(&self) -> i32 {
+        self.header.compression
+    }
+
+    pub fn endian(&self) -> crate::spss::types::Endian {
+        self.header.endian
     }
 
     pub fn read(&self) -> ReadBuilder<'_> {
@@ -79,11 +87,10 @@ impl<'a> ReadBuilder<'a> {
     pub fn value_labels_as_strings(mut self, v: bool) -> Self { self.value_labels_as_strings = v; self }
 
     pub fn finish(self) -> Result<DataFrame> {
-        profile_reset();
         let limit = self.limit.unwrap_or(self.reader.metadata.row_count as usize);
         let cols = resolve_column_indices(&self.reader.metadata, self.columns.as_deref())?;
 
-            let mut df = if self.parallel && limit > 0 {
+        let mut df = if self.parallel && limit > 0 {
             self.reader.read_parallel(
                 self.offset,
                 limit,
@@ -114,7 +121,6 @@ impl<'a> ReadBuilder<'a> {
             df = cast_dataframe(df, &schema)?;
         }
 
-        profile_print();
         Ok(df)
     }
 }
@@ -208,6 +214,7 @@ impl SpssReader {
         let chunks = dfs.into_iter().map(|(_, df)| df).collect::<Vec<_>>();
         combine_column_chunks(chunks)
     }
+
 }
 
 fn combine_column_chunks(chunks: Vec<Vec<Series>>) -> Result<DataFrame> {

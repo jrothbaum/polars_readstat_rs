@@ -136,11 +136,14 @@ def compare_file(sav_file: Path, n_rows: int) -> tuple[int, int]:
         print(f"  SKIP: polars_readstat failed: {e}")
         return 0, 0
 
+    env = dict(os.environ)
+    env["READSTAT_PRESERVE_ORDER"] = "1"
     result = subprocess.run(
         ["cargo", "run", "--release", "--example", "readstat_dump_parquet", "--",
          str(sav_file), str(rust_path), str(n_rows)],
         capture_output=True, text=True,
         cwd=PROJECT_ROOT,
+        env=env,
     )
 
     if result.returncode != 0:

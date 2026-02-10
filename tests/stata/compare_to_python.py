@@ -150,11 +150,14 @@ def compare_file(stata_file: Path, n_rows: int, n_cols: int=0) -> tuple[int, int
     print(f"  polars_readstat: {df_prs.shape[0]} rows x {df_prs.shape[1]} cols")
 
     # 2. Read with Rust reader -> parquet
+    env = dict(os.environ)
+    env["READSTAT_PRESERVE_ORDER"] = "1"
     result = subprocess.run(
         ["cargo", "run", "--release", "--example", "readstat_dump_parquet", "--",
          str(stata_file), str(rust_path), str(n_rows), str(n_cols)],
         capture_output=True, text=True,
         cwd=PROJECT_ROOT,
+        env=env,
     )
     if result.returncode != 0:
         print(f"  FAIL: Rust reader failed: {result.stderr[:200]}")

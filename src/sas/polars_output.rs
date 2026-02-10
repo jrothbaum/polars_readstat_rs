@@ -1,6 +1,10 @@
 use polars::prelude::*;
+use std::cmp::min;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use crate::constants::{DATETIME_FORMATS, DATE_FORMATS, TIME_FORMATS, SAS_EPOCH_OFFSET_DAYS, SECONDS_PER_DAY};
 use crate::reader::Sas7bdatReader;
 use crate::types::{Column as SasColumn, ColumnType, Metadata};
@@ -277,48 +281,58 @@ impl SasScan {
     }
 }
 
+enum ChunkMessage {
+    Data { idx: usize, df: DataFrame },
+    Done,
+    Err(String),
+}
+
 pub(crate) struct SasBatchIter {
-    reader: Sas7bdatReader,
-    cols: Option<Vec<usize>>,
-    offset: usize,
-    remaining: usize,
-    batch_size: usize,
-    threads: Option<usize>,
-    missing_string_as_null: bool,
-    chunk_size: Option<usize>,
+    rx: mpsc::Receiver<ChunkMessage>,
+    buffer: BTreeMap<usize, DataFrame>,
+    next_idx: usize,
+    completed: usize,
+    total_workers: usize,
+    handles: Vec<JoinHandle<()>>,
 }
 
 impl Iterator for SasBatchIter {
     type Item = PolarsResult<DataFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
+        loop {
+            if let Some(df) = self.buffer.remove(&self.next_idx) {
+                self.next_idx += 1;
+                return Some(Ok(df));
+            }
+
+            if self.completed == self.total_workers {
+                return None;
+            }
+
+            match self.rx.recv() {
+                Ok(ChunkMessage::Data { idx, df }) => {
+                    self.buffer.insert(idx, df);
+                }
+                Ok(ChunkMessage::Done) => {
+                    self.completed += 1;
+                }
+                Ok(ChunkMessage::Err(e)) => {
+                    return Some(Err(PolarsError::ComputeError(e.into())));
+                }
+                Err(_) => {
+                    return None;
+                }
+            }
         }
-        let take = self.batch_size.min(self.remaining);
-        let mut builder = self
-            .reader
-            .read()
-            .with_offset(self.offset)
-            .with_limit(take)
-            .missing_string_as_null(self.missing_string_as_null);
-        if let Some(n) = self.threads {
-            builder = builder.with_n_threads(n);
+    }
+}
+
+impl Drop for SasBatchIter {
+    fn drop(&mut self) {
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
         }
-        if let Some(n) = self.chunk_size {
-            builder = builder.with_chunk_size(n);
-        }
-        if let Some(cols) = &self.cols {
-            let names = cols
-                .iter()
-                .map(|&i| self.reader.metadata().columns[i].name.clone())
-                .collect::<Vec<_>>();
-            builder = builder.with_columns(names);
-        }
-        let out = builder.finish().map_err(|e| PolarsError::ComputeError(e.to_string().into()));
-        self.offset += take;
-        self.remaining -= take;
-        Some(out)
     }
 }
 
@@ -334,15 +348,109 @@ pub(crate) fn sas_batch_iter(
         .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
     let total = n_rows.unwrap_or(reader.metadata().row_count as usize);
     let batch_size = chunk_size.unwrap_or(crate::pipeline::DEFAULT_PIPELINE_CHUNK_SIZE).max(1);
+    let total_chunks = total.div_ceil(batch_size);
+
+    let col_names: Option<Vec<String>> = col_indices.as_ref().map(|indices| {
+        indices
+            .iter()
+            .map(|&i| reader.metadata().columns[i].name.clone())
+            .collect()
+    });
+
+    if total_chunks == 0 {
+        let (_tx, rx) = mpsc::channel::<ChunkMessage>();
+        return Ok(SasBatchIter {
+            rx,
+            buffer: BTreeMap::new(),
+            next_idx: 0,
+            completed: 0,
+            total_workers: 0,
+            handles: Vec::new(),
+        });
+    }
+
+    let default_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    let n_workers = min(threads.unwrap_or(default_threads).max(1), total_chunks.max(1));
+    let (tx, rx) = mpsc::channel::<ChunkMessage>();
+    let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(n_workers);
+
+    let base_chunks = total_chunks / n_workers;
+    let extra_chunks = total_chunks % n_workers;
+    let mut worker_ranges: Vec<(usize, usize)> = Vec::with_capacity(n_workers);
+    let mut next_chunk = 0usize;
+    for worker_idx in 0..n_workers {
+        let worker_chunk_count = base_chunks + usize::from(worker_idx < extra_chunks);
+        if worker_chunk_count == 0 {
+            continue;
+        }
+        let start_chunk = next_chunk;
+        let end_chunk = start_chunk + worker_chunk_count;
+        worker_ranges.push((start_chunk, end_chunk));
+        next_chunk = end_chunk;
+    }
+
+    for (start_chunk, end_chunk) in worker_ranges {
+        let tx = tx.clone();
+        let path = path.clone();
+        let col_names = col_names.clone();
+        let missing_string_as_null = missing_string_as_null;
+        let handle = std::thread::spawn(move || {
+            let reader = match Sas7bdatReader::open(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(ChunkMessage::Err(e.to_string()));
+                    return;
+                }
+            };
+
+            let start_row = start_chunk * batch_size;
+            if start_row >= total {
+                let _ = tx.send(ChunkMessage::Done);
+                return;
+            }
+            let worker_rows = min(total - start_row, (end_chunk - start_chunk) * batch_size);
+            let mut builder = reader
+                .read()
+                .with_offset(start_row)
+                .with_limit(worker_rows)
+                .missing_string_as_null(missing_string_as_null)
+                .sequential();
+            if let Some(cols) = col_names {
+                builder = builder.with_columns(cols);
+            }
+            let worker_df = match builder.finish() {
+                Ok(df) => df,
+                Err(e) => {
+                    let _ = tx.send(ChunkMessage::Err(e.to_string()));
+                    return;
+                }
+            };
+
+            for out_idx in start_chunk..end_chunk {
+                let local_offset = (out_idx - start_chunk) * batch_size;
+                if local_offset >= worker_df.height() {
+                    break;
+                }
+                let local_take = min(batch_size, worker_df.height() - local_offset);
+                let df = worker_df.slice(local_offset as i64, local_take);
+                let _ = tx.send(ChunkMessage::Data { idx: out_idx, df });
+            }
+            let _ = tx.send(ChunkMessage::Done);
+        });
+        handles.push(handle);
+    }
+    drop(tx);
+
     Ok(SasBatchIter {
-        reader,
-        cols: col_indices,
-        offset: 0,
-        remaining: total,
-        batch_size,
-        threads,
-        missing_string_as_null,
-        chunk_size,
+        rx,
+        buffer: BTreeMap::new(),
+        next_idx: 0,
+        completed: 0,
+        total_workers: n_workers,
+        handles,
     })
 }
 

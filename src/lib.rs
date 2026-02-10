@@ -7,6 +7,7 @@
 pub mod sas;
 pub mod spss;
 pub mod stata;
+pub(crate) mod scan_prefetch;
 
 pub use sas::arrow_output as sas_arrow_output;
 pub use sas::polars_output as sas_polars_output;
@@ -80,6 +81,7 @@ pub struct ScanOptions {
     pub missing_string_as_null: Option<bool>,
     pub user_missing_as_null: Option<bool>,
     pub value_labels_as_strings: Option<bool>,
+    pub preserve_order: Option<bool>,
     pub compress_opts: CompressOptionsLite,
 }
 
@@ -91,6 +93,7 @@ impl Default for ScanOptions {
             missing_string_as_null: Some(true),
             user_missing_as_null: Some(true),
             value_labels_as_strings: Some(true),
+            preserve_order: Some(false),
             compress_opts: CompressOptionsLite::default(),
         }
     }

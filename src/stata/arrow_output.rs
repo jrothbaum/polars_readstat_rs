@@ -36,6 +36,7 @@ pub fn read_to_arrow_schema_ffi(
         missing_string_as_null: Some(missing_string_as_null),
         user_missing_as_null: None,
         value_labels_as_strings,
+        preserve_order: Some(true),
         compress_opts: crate::CompressOptionsLite::default(),
     };
     let schema = scan_dta(path.to_path_buf(), opts)?.collect_schema()?;
@@ -57,6 +58,7 @@ pub fn read_to_arrow_array_ffi(
         missing_string_as_null: Some(missing_string_as_null),
         user_missing_as_null: None,
         value_labels_as_strings,
+        preserve_order: Some(true),
         compress_opts: crate::CompressOptionsLite::default(),
     };
     let df = scan_dta(path.to_path_buf(), opts)?.collect()?;
@@ -82,6 +84,7 @@ pub fn read_to_arrow_stream_ffi(
         missing_string_as_null: Some(missing_string_as_null),
         user_missing_as_null: None,
         value_labels_as_strings,
+        preserve_order: Some(true),
         compress_opts: crate::CompressOptionsLite::default(),
     };
     let mut lf = scan_dta(path.to_path_buf(), opts.clone())?;
@@ -95,6 +98,7 @@ pub fn read_to_arrow_stream_ffi(
         missing_string_as_null,
         value_labels_as_strings.unwrap_or(true),
         Some(batch_size),
+        true,
         None,
         None,
     )?;

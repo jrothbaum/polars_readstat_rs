@@ -619,7 +619,10 @@ fn load_strls(
             if data_type == 0x82 {
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
-                let s = encoding::decode_string(&buf, encoding);
+                let mut s = encoding::decode_string(&buf, encoding);
+                while s.ends_with('\0') {
+                    s.pop();
+                }
                 map.insert((v, o), s);
             } else {
                 reader.seek(SeekFrom::Current(len as i64))?;

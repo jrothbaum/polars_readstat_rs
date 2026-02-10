@@ -424,7 +424,9 @@ fn infer_columns(df: Option<&DataFrame>, schema: Option<&StataWriteSchema>) -> R
         } else {
             None
         };
-        let kind = if matches!(dtype, DataType::String) && string_has_nul(series)? {
+        let kind = if matches!(dtype, DataType::String)
+            && (string_has_nul(series)? || string_has_trailing_space(series)?)
+        {
             ColumnKind::StrL
         } else {
             kind_from_dtype(dtype.clone(), width)?
@@ -630,6 +632,18 @@ fn string_has_nul(series: &Series) -> Result<bool> {
     for opt in utf8.into_iter() {
         if let Some(s) = opt {
             if s.as_bytes().iter().any(|b| *b == 0) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn string_has_trailing_space(series: &Series) -> Result<bool> {
+    let utf8 = series.str().map_err(|e| Error::Polars(e))?;
+    for opt in utf8.into_iter() {
+        if let Some(s) = opt {
+            if s.ends_with(' ') {
                 return Ok(true);
             }
         }

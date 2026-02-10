@@ -35,6 +35,7 @@ fn add_ns(target: &AtomicU64, elapsed: std::time::Duration) {
     target.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
 }
 
+#[allow(dead_code)]
 pub(crate) fn profile_reset() {
     if !profile_enabled() {
         return;
@@ -47,6 +48,7 @@ pub(crate) fn profile_reset() {
     PROFILE_STR_CT.store(0, Ordering::Relaxed);
 }
 
+#[allow(dead_code)]
 pub(crate) fn profile_print() {
     if !profile_enabled() {
         return;
@@ -83,11 +85,39 @@ pub fn read_data_frame(
     user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<DataFrame> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    read_data_frame_with_reader(
+        &mut reader,
+        metadata,
+        endian,
+        compression,
+        bias,
+        columns,
+        offset,
+        limit,
+        missing_string_as_null,
+        user_missing_as_null,
+        value_labels_as_strings,
+    )
+}
+
+pub fn read_data_frame_with_reader(
+    reader: &mut BufReader<File>,
+    metadata: &Metadata,
+    endian: Endian,
+    compression: i32,
+    bias: f64,
+    columns: Option<&[usize]>,
+    offset: usize,
+    limit: usize,
+    missing_string_as_null: bool,
+    user_missing_as_null: bool,
+    value_labels_as_strings: bool,
+) -> Result<DataFrame> {
     let data_offset = metadata.data_offset.ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
     let record_len = metadata.variables.iter().map(|v| v.width * 8).sum::<usize>();
 
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
     reader.seek(SeekFrom::Start(data_offset))?;
 
     let total_rows = metadata.row_count as usize;
@@ -120,13 +150,6 @@ pub fn read_data_frame(
     let mut builders = Vec::with_capacity(col_indices.len());
     let mut plans = Vec::with_capacity(col_indices.len());
 
-    let mut running = 0usize;
-    let mut all_offsets = Vec::with_capacity(metadata.variables.len());
-    for v in &metadata.variables {
-        all_offsets.push(running);
-        running += v.width * 8;
-    }
-
     for &idx in &col_indices {
         let var = &metadata.variables[idx];
         let name = var.name.as_str();
@@ -154,11 +177,11 @@ pub fn read_data_frame(
         let missing_set = if var.missing_strings.is_empty() {
             None
         } else {
-            Some(Arc::new(var.missing_strings.iter().cloned().collect::<HashSet<_>>()))
+            Some(var.missing_strings.iter().cloned().collect::<HashSet<_>>())
         };
         let plan = ColumnPlan::new(
             var,
-            all_offsets[idx],
+            var.offset * 8,
             var.width * 8,
             label_map,
             missing_set,
@@ -202,7 +225,7 @@ pub fn read_data_frame(
         let mut decompressor = SavRowDecompressor::new(endian, bias);
         let mut row_idx = 0usize;
         while row_idx < end_row {
-            let status = decompressor.read_row(&mut reader, &mut row_buf, record_len)?;
+            let status = decompressor.read_row(reader, &mut row_buf, record_len)?;
             if status == DecompressStatus::FinishedAll {
                 break;
             }
@@ -230,7 +253,7 @@ pub fn read_data_frame(
     } else if compression == 2 {
         let mut row_buf = vec![0u8; record_len];
         read_zsav_data(
-            &mut reader,
+            reader,
             endian,
             bias,
             record_len,
@@ -301,13 +324,6 @@ pub fn read_data_columns_uncompressed(
     let mut builders = Vec::with_capacity(col_indices.len());
     let mut plans = Vec::with_capacity(col_indices.len());
 
-    let mut running = 0usize;
-    let mut all_offsets = Vec::with_capacity(metadata.variables.len());
-    for v in &metadata.variables {
-        all_offsets.push(running);
-        running += v.width * 8;
-    }
-
     for &idx in &col_indices {
         let var = &metadata.variables[idx];
         let name = var.name.as_str();
@@ -335,11 +351,11 @@ pub fn read_data_columns_uncompressed(
         let missing_set = if var.missing_strings.is_empty() {
             None
         } else {
-            Some(Arc::new(var.missing_strings.iter().cloned().collect::<HashSet<_>>()))
+            Some(var.missing_strings.iter().cloned().collect::<HashSet<_>>())
         };
         let plan = ColumnPlan::new(
             var,
-            all_offsets[idx],
+            var.offset * 8,
             var.width * 8,
             label_map,
             missing_set,
@@ -603,13 +619,14 @@ fn append_value(
             let t_decode = if profile_enabled() { Some(Instant::now()) } else { None };
             let s_owned;
             let s = if encoding == encoding_rs::UTF_8 {
-                let mut slice = &raw[..end];
-                if let Err(err) = std::str::from_utf8(slice) {
-                    let valid = err.valid_up_to();
-                    slice = &slice[..valid];
+                let slice = &raw[..end];
+                match std::str::from_utf8(slice) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        let valid = err.valid_up_to();
+                        std::str::from_utf8(&slice[..valid]).unwrap_or("")
+                    }
                 }
-                s_owned = std::str::from_utf8(slice).unwrap_or("").to_string();
-                s_owned.as_str()
             } else {
                 let decoded = encoding.decode_without_bom_handling(&raw[..end]).0;
                 s_owned = decoded.into_owned();
@@ -711,13 +728,13 @@ struct ColumnPlan {
     width: usize,
     string_len_bytes: usize,
     label_map: Option<Arc<LabelMap>>,
-    missing_set: Option<Arc<HashSet<String>>>,
+    missing_set: Option<HashSet<String>>,
     missing_string_as_null: bool,
     user_missing_as_null: bool,
     fast_no_checks: bool,
     missing_range: bool,
-    missing_doubles: Arc<Vec<f64>>,
-    missing_double_bits: Arc<Vec<u64>>,
+    missing_doubles: Vec<f64>,
+    missing_double_bits: Vec<u64>,
 }
 
 impl ColumnPlan {
@@ -726,7 +743,7 @@ impl ColumnPlan {
         offset: usize,
         width: usize,
         label_map: Option<Arc<LabelMap>>,
-        missing_set: Option<Arc<HashSet<String>>>,
+        missing_set: Option<HashSet<String>>,
         missing_string_as_null: bool,
         user_missing_as_null: bool,
     ) -> Self {
@@ -751,8 +768,8 @@ impl ColumnPlan {
             user_missing_as_null,
             fast_no_checks,
             missing_range: var.missing_range,
-            missing_doubles: Arc::new(var.missing_doubles.clone()),
-            missing_double_bits: Arc::new(var.missing_double_bits.clone()),
+            missing_doubles: var.missing_doubles.clone(),
+            missing_double_bits: var.missing_double_bits.clone(),
         }
     }
 }
