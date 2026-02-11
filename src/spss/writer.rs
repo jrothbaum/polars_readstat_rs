@@ -1,7 +1,6 @@
 use crate::spss::error::{Error, Result};
 use crate::spss::types::VarType;
 use polars::prelude::*;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -603,9 +602,22 @@ fn write_data<W: Write>(
     encoding: &'static encoding_rs::Encoding,
 ) -> Result<()> {
     let mut cols: Vec<&Series> = Vec::with_capacity(columns.len());
+    let mut str_cols: Vec<Option<&StringChunked>> = Vec::with_capacity(columns.len());
+    let mut str_bufs: Vec<Option<Vec<u8>>> = Vec::with_capacity(columns.len());
     for col in columns {
         let series = df.column(&col.name).map_err(|e| Error::ParseError(e.to_string()))?;
-        cols.push(series.as_materialized_series());
+        let series = series.as_materialized_series();
+        cols.push(series);
+        if col.var_type == VarType::Str {
+            let ca = series
+                .str()
+                .map_err(|e| Error::ParseError(e.to_string()))?;
+            str_cols.push(Some(ca));
+            str_bufs.push(Some(vec![b' '; col.width * 8]));
+        } else {
+            str_cols.push(None);
+            str_bufs.push(None);
+        }
     }
 
     for row_idx in 0..df.height() {
@@ -623,15 +635,15 @@ fn write_data<W: Write>(
                     }
                 }
                 VarType::Str => {
-                    let mut buf = vec![b' '; col.width * 8];
-                    let value = series.get(row_idx).map_err(|e| Error::ParseError(e.to_string()))?;
-                    if !value.is_null() {
-                        let s: Cow<'_, str> = match value {
-                            AnyValue::String(s) => Cow::Borrowed(s),
-                            AnyValue::StringOwned(s) => Cow::Owned(s.to_string()),
-                            _ => return Err(Error::ParseError("unsupported string type".to_string())),
-                        };
-                        let (bytes, _, had_errors) = encoding.encode(s.as_ref());
+                    let ca = str_cols[col_idx].ok_or_else(|| {
+                        Error::ParseError("missing utf8 accessor for string column".to_string())
+                    })?;
+                    let buf = str_bufs[col_idx].as_mut().ok_or_else(|| {
+                        Error::ParseError("missing scratch buffer for string column".to_string())
+                    })?;
+                    buf.fill(b' ');
+                    if let Some(s) = ca.get(row_idx) {
+                        let (bytes, _, had_errors) = encoding.encode(s);
                         if had_errors {
                             return Err(Error::ParseError("string not representable in target encoding".to_string()));
                         }
