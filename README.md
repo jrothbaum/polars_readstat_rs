@@ -9,12 +9,19 @@ The crate provides:
 - Arrow FFI export helpers
 - Stata/SPSS writers
 
-This was nearly completed coded by Claude Code and Codex, but with a very particular setup that I hope makes it less likely to be a mess than other moslty-AI code repository.  It was meant to directly replace the C++ and C code in relatively small, existing codebase ([polars_readstat, v0.11.1](https://github.com/jrothbaum/polars_readstat/releases/tag/v0.11.1)) with the ability to exactly validate the new code's output against the old.  For any given regression, the AI models could be told to refer directly to the spot in the code where the prior implementation did the same operation to try to figure out how to solve the issue.  It could also compare any output to the output produced by other similar tools such as [pandas](https://github.com/pandas-dev/pandas) and [pyreadstat](https://github.com/Roche/pyreadstat/).  I'm sure it's not the most beautiful code, but I'm an economist and I wanted a tool to exist that was faster than what's out there and implemented in Rust (so many build issues with using C++ and C across systems.  So many...) but I didn't want to spend months on figuring out records layouts and encoding of SAS, Stata, and SPSS files.  Hence, my first attempt that just directly plugged into other tools ([polars_readstat, v0.11.1](https://github.com/jrothbaum/polars_readstat/releases/tag/v0.11.1)) and the AI-first version of this.
+## Performance at a glance
+
+In project benchmarks, `polars_readstat_rs` is typically faster than pandas/pyreadstat for large SAS/Stata/SPSS reads, especially when selecting a subset of columns or rows. Exact speedups depend on file shape, storage, hardware, and options.
+
+For Python-side benchmark tables and setup details, see the `polars_readstat` README:
+https://github.com/jrothbaum/polars_readstat
+
+This was nearly completely coded by Claude Code and Codex, but with a very particular setup that I hope makes it less likely to be a mess than other moslty-AI code repository.  It was meant to directly replace the C++ and C code in relatively small, existing codebase ([polars_readstat, v0.11.1](https://github.com/jrothbaum/polars_readstat/releases/tag/v0.11.1)) with the ability to exactly validate the new code's output against the old.  For any given regression, the AI models could be told to refer directly to the spot in the code where the prior implementation did the same operation to try to figure out how to solve the issue.  It could also compare any output to the output produced by other similar tools such as [pandas](https://github.com/pandas-dev/pandas) and [pyreadstat](https://github.com/Roche/pyreadstat/).  I'm sure it's not the most beautiful code, but I'm an economist and I wanted a tool to exist that was faster than what's out there and implemented in Rust (so many build issues with using C++ and C across systems.  So many...) but I didn't want to spend months on figuring out records layouts and encoding of SAS, Stata, and SPSS files.  Hence, my first attempt that just directly plugged into other tools ([polars_readstat, v0.11.1](https://github.com/jrothbaum/polars_readstat/releases/tag/v0.11.1)) and the AI-first version of this.
 
 ## Install
 ```toml
 [dependencies]
-polars_readstat_rs = "0.1"
+polars_readstat_rs = "0.2"
 ```
 
 ## Core API
