@@ -44,6 +44,7 @@ fn main() -> PolarsResult<()> {
         missing_string_as_null: Some(missing_string_as_null),
         user_missing_as_null: Some(user_missing_as_null),
         value_labels_as_strings: None,
+        preserve_order: Some(true),
         compress_opts,
     };
     let df = scan_sas7bdat(path, opts)?.collect()?;
