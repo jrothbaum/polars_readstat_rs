@@ -2,12 +2,55 @@ use crate::stata::error::{Error, Result};
 use polars::prelude::*;
 use std::collections::HashSet;
 
-const DTA_113_MAX_INT8: i8 = 0x64;
-const DTA_113_MAX_INT16: i16 = 0x7fe4;
-const DTA_113_MAX_INT32: i32 = 0x7fffffe4;
-const DTA_113_MIN_INT8: i8 = -0x7f;
-const DTA_113_MIN_INT16: i16 = -0x7fff;
-const DTA_113_MIN_INT32: i32 = -0x7fffffff;
+// Stata DTA 113+ bounds (reserves sentinel values for missing data)
+const DTA_113_MAX_INT8: i8 = 0x64;       // 100
+const DTA_113_MAX_INT16: i16 = 0x7fe4;   // 32740
+const DTA_113_MAX_INT32: i32 = 0x7fffffe4; // 2147483620
+const DTA_113_MIN_INT8: i8 = -0x7f;       // -127
+const DTA_113_MIN_INT16: i16 = -0x7fff;   // -32767
+const DTA_113_MIN_INT32: i32 = -0x7fffffff; // -2147483647
+
+// Standard integer bounds (full range)
+const STD_MAX_INT8: i8 = i8::MAX;         // 127
+const STD_MAX_INT16: i16 = i16::MAX;      // 32767
+const STD_MAX_INT32: i32 = i32::MAX;      // 2147483647
+const STD_MIN_INT8: i8 = i8::MIN;         // -128
+const STD_MIN_INT16: i16 = i16::MIN;      // -32768
+const STD_MIN_INT32: i32 = i32::MIN;      // -2147483648
+
+#[derive(Debug, Clone)]
+pub struct IntBounds {
+    pub min_i8: i64,
+    pub max_i8: i64,
+    pub min_i16: i64,
+    pub max_i16: i64,
+    pub min_i32: i64,
+    pub max_i32: i64,
+}
+
+impl IntBounds {
+    pub fn stata() -> Self {
+        Self {
+            min_i8: DTA_113_MIN_INT8 as i64,
+            max_i8: DTA_113_MAX_INT8 as i64,
+            min_i16: DTA_113_MIN_INT16 as i64,
+            max_i16: DTA_113_MAX_INT16 as i64,
+            min_i32: DTA_113_MIN_INT32 as i64,
+            max_i32: DTA_113_MAX_INT32 as i64,
+        }
+    }
+
+    pub fn standard() -> Self {
+        Self {
+            min_i8: STD_MIN_INT8 as i64,
+            max_i8: STD_MAX_INT8 as i64,
+            min_i16: STD_MIN_INT16 as i64,
+            max_i16: STD_MAX_INT16 as i64,
+            min_i32: STD_MIN_INT32 as i64,
+            max_i32: STD_MAX_INT32 as i64,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct CompressOptions {
@@ -18,6 +61,7 @@ pub struct CompressOptions {
     pub cast_all_null_to_boolean: bool,
     pub check_date_time: bool,
     pub no_boolean: bool,
+    pub use_stata_bounds: bool,
 }
 
 impl Default for CompressOptions {
@@ -30,6 +74,7 @@ impl Default for CompressOptions {
             cast_all_null_to_boolean: true,
             check_date_time: true,
             no_boolean: false,
+            use_stata_bounds: true,
         }
     }
 }
@@ -77,7 +122,12 @@ pub fn compress_df(df: &DataFrame, opts: CompressOptions) -> Result<DataFrame> {
         }
 
         if opts.compress_numeric {
-            let compressed = compress_numeric_series(&s, opts.no_boolean)?;
+            let bounds = if opts.use_stata_bounds {
+                IntBounds::stata()
+            } else {
+                IntBounds::standard()
+            };
+            let compressed = compress_numeric_series(&s, opts.no_boolean, &bounds)?;
             out_cols.push(compressed.into_column());
         } else {
             out_cols.push(s.into_column());
@@ -87,7 +137,7 @@ pub fn compress_df(df: &DataFrame, opts: CompressOptions) -> Result<DataFrame> {
     DataFrame::new(out_cols).map_err(Error::Polars)
 }
 
-fn compress_numeric_series(series: &Series, no_boolean: bool) -> Result<Series> {
+fn compress_numeric_series(series: &Series, no_boolean: bool, bounds: &IntBounds) -> Result<Series> {
     match series.dtype() {
         DataType::Float64 | DataType::Float32 => {
             if all_integers(series)? {
@@ -97,13 +147,13 @@ fn compress_numeric_series(series: &Series, no_boolean: bool) -> Result<Series> 
                     if !no_boolean && min >= 0.0 && max <= 1.0 {
                         return series.cast(&DataType::Boolean).map_err(Error::Polars);
                     }
-                    if min >= DTA_113_MIN_INT8 as f64 && max <= DTA_113_MAX_INT8 as f64 {
+                    if min >= bounds.min_i8 as f64 && max <= bounds.max_i8 as f64 {
                         return series.cast(&DataType::Int8).map_err(Error::Polars);
                     }
-                    if min >= DTA_113_MIN_INT16 as f64 && max <= DTA_113_MAX_INT16 as f64 {
+                    if min >= bounds.min_i16 as f64 && max <= bounds.max_i16 as f64 {
                         return series.cast(&DataType::Int16).map_err(Error::Polars);
                     }
-                    if min >= DTA_113_MIN_INT32 as f64 && max <= DTA_113_MAX_INT32 as f64 {
+                    if min >= bounds.min_i32 as f64 && max <= bounds.max_i32 as f64 {
                         return series.cast(&DataType::Int32).map_err(Error::Polars);
                     }
                     return series.cast(&DataType::Float64).map_err(Error::Polars);
@@ -126,13 +176,13 @@ fn compress_numeric_series(series: &Series, no_boolean: bool) -> Result<Series> 
                 if !no_boolean && min >= 0 && max <= 1 {
                     return series.cast(&DataType::Boolean).map_err(Error::Polars);
                 }
-                if min >= DTA_113_MIN_INT8 as i64 && max <= DTA_113_MAX_INT8 as i64 {
+                if min >= bounds.min_i8 && max <= bounds.max_i8 {
                     return series.cast(&DataType::Int8).map_err(Error::Polars);
                 }
-                if min >= DTA_113_MIN_INT16 as i64 && max <= DTA_113_MAX_INT16 as i64 {
+                if min >= bounds.min_i16 && max <= bounds.max_i16 {
                     return series.cast(&DataType::Int16).map_err(Error::Polars);
                 }
-                if min >= DTA_113_MIN_INT32 as i64 && max <= DTA_113_MAX_INT32 as i64 {
+                if min >= bounds.min_i32 && max <= bounds.max_i32 {
                     return series.cast(&DataType::Int32).map_err(Error::Polars);
                 }
                 return series.cast(&DataType::Float64).map_err(Error::Polars);

@@ -120,22 +120,23 @@ impl Default for CompressOptionsLite {
     }
 }
 
-pub(crate) fn compress_df_if_enabled(
+pub fn compress_df_if_enabled(
     df: &DataFrame,
     opts: &CompressOptionsLite,
 ) -> std::result::Result<DataFrame, String> {
     if !opts.enabled {
         return Ok(df.clone());
     }
-    let mut stata_opts = CompressOptions::default();
-    stata_opts.compress_numeric = opts.compress_numeric;
-    stata_opts.check_date_time = opts.datetime_to_date;
-    stata_opts.check_string = opts.string_to_numeric;
-    stata_opts.check_string_only = false;
-    stata_opts.cast_all_null_to_boolean = true;
-    stata_opts.no_boolean = false;
-    stata_opts.cols = opts.cols.clone();
-    compress_df(df, stata_opts).map_err(|e| e.to_string())
+    let mut compress_opts = CompressOptions::default();
+    compress_opts.compress_numeric = opts.compress_numeric;
+    compress_opts.check_date_time = opts.datetime_to_date;
+    compress_opts.check_string = opts.string_to_numeric;
+    compress_opts.check_string_only = false;
+    compress_opts.cast_all_null_to_boolean = true;
+    compress_opts.no_boolean = false;
+    compress_opts.cols = opts.cols.clone();
+    compress_opts.use_stata_bounds = false;
+    compress_df(df, compress_opts).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
