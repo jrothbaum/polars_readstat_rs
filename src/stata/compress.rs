@@ -3,20 +3,20 @@ use polars::prelude::*;
 use std::collections::HashSet;
 
 // Stata DTA 113+ bounds (reserves sentinel values for missing data)
-const DTA_113_MAX_INT8: i8 = 0x64;       // 100
-const DTA_113_MAX_INT16: i16 = 0x7fe4;   // 32740
+const DTA_113_MAX_INT8: i8 = 0x64; // 100
+const DTA_113_MAX_INT16: i16 = 0x7fe4; // 32740
 const DTA_113_MAX_INT32: i32 = 0x7fffffe4; // 2147483620
-const DTA_113_MIN_INT8: i8 = -0x7f;       // -127
-const DTA_113_MIN_INT16: i16 = -0x7fff;   // -32767
+const DTA_113_MIN_INT8: i8 = -0x7f; // -127
+const DTA_113_MIN_INT16: i16 = -0x7fff; // -32767
 const DTA_113_MIN_INT32: i32 = -0x7fffffff; // -2147483647
 
 // Standard integer bounds (full range)
-const STD_MAX_INT8: i8 = i8::MAX;         // 127
-const STD_MAX_INT16: i16 = i16::MAX;      // 32767
-const STD_MAX_INT32: i32 = i32::MAX;      // 2147483647
-const STD_MIN_INT8: i8 = i8::MIN;         // -128
-const STD_MIN_INT16: i16 = i16::MIN;      // -32768
-const STD_MIN_INT32: i32 = i32::MIN;      // -2147483648
+const STD_MAX_INT8: i8 = i8::MAX; // 127
+const STD_MAX_INT16: i16 = i16::MAX; // 32767
+const STD_MAX_INT32: i32 = i32::MAX; // 2147483647
+const STD_MIN_INT8: i8 = i8::MIN; // -128
+const STD_MIN_INT16: i16 = i16::MIN; // -32768
+const STD_MIN_INT32: i32 = i32::MIN; // -2147483648
 
 #[derive(Debug, Clone)]
 pub struct IntBounds {
@@ -82,11 +82,15 @@ impl Default for CompressOptions {
 pub fn compress_df(df: &DataFrame, opts: CompressOptions) -> Result<DataFrame> {
     let target_cols = match &opts.cols {
         Some(cols) => cols.iter().cloned().collect::<HashSet<_>>(),
-        None => df.get_column_names_str().iter().map(|s| s.to_string()).collect(),
+        None => df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     };
 
     let mut out_cols: Vec<Column> = Vec::with_capacity(df.width());
-    for col in df.get_columns() {
+    for col in df.columns() {
         let series = col.as_materialized_series();
         let name = series.name().to_string();
         if !target_cols.contains(&name) {
@@ -134,10 +138,14 @@ pub fn compress_df(df: &DataFrame, opts: CompressOptions) -> Result<DataFrame> {
         }
     }
 
-    DataFrame::new(out_cols).map_err(Error::Polars)
+    DataFrame::new_infer_height(out_cols).map_err(Error::Polars)
 }
 
-fn compress_numeric_series(series: &Series, no_boolean: bool, bounds: &IntBounds) -> Result<Series> {
+fn compress_numeric_series(
+    series: &Series,
+    no_boolean: bool,
+    bounds: &IntBounds,
+) -> Result<Series> {
     match series.dtype() {
         DataType::Float64 | DataType::Float32 => {
             if all_integers(series)? {
@@ -304,7 +312,13 @@ fn min_max_i64(series: &Series) -> Result<(Option<i64>, Option<i64>)> {
             AnyValue::UInt16(v) => v as i64,
             AnyValue::UInt32(v) => v as i64,
             AnyValue::UInt64(v) if v <= i64::MAX as u64 => v as i64,
-            AnyValue::Boolean(v) => if v { 1 } else { 0 },
+            AnyValue::Boolean(v) => {
+                if v {
+                    1
+                } else {
+                    0
+                }
+            }
             _ => continue,
         };
         any = true;

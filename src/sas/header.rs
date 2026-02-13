@@ -17,10 +17,18 @@ pub fn check_header<R: Read + Seek>(reader: &mut R) -> Result<(Endian, Format)> 
     }
 
     // Detect format: byte 32 == '3' means 64-bit
-    let format = if header_bytes[32] == b'3' { Format::Bit64 } else { Format::Bit32 };
+    let format = if header_bytes[32] == b'3' {
+        Format::Bit64
+    } else {
+        Format::Bit32
+    };
 
     // Detect endianness: byte 37 == 0x01 means little-endian
-    let endian = if header_bytes[37] == 0x01 { Endian::Little } else { Endian::Big };
+    let endian = if header_bytes[37] == 0x01 {
+        Endian::Little
+    } else {
+        Endian::Big
+    };
 
     Ok((endian, format))
 }
@@ -60,9 +68,25 @@ pub fn read_header<R: Read + Seek>(
         let buf = Buffer::from_vec(full_header, endian);
 
         // Extract all header fields
-        extract_header_fields(buf, format, endian, platform, header_length, align1, total_align)
+        extract_header_fields(
+            buf,
+            format,
+            endian,
+            platform,
+            header_length,
+            align1,
+            total_align,
+        )
     } else {
-        extract_header_fields(buf, format, endian, platform, header_length, align1, total_align)
+        extract_header_fields(
+            buf,
+            format,
+            endian,
+            platform,
+            header_length,
+            align1,
+            total_align,
+        )
     }
 }
 

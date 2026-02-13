@@ -161,7 +161,7 @@ fn make_unique(name: &str, used: &mut HashSet<String>) -> String {
 
 fn sas_rename_df(df: &DataFrame) -> Result<(DataFrame, HashMap<String, String>)> {
     let mut used = HashSet::new();
-    let names = df.get_column_names_str();
+    let names = df.get_column_names();
     let mut mapping = HashMap::new();
     let mut new_names = Vec::with_capacity(names.len());
     for name in names {
@@ -174,11 +174,15 @@ fn sas_rename_df(df: &DataFrame) -> Result<(DataFrame, HashMap<String, String>)>
         new_names.push(s);
     }
     let mut out = df.clone();
-    out.set_column_names(new_names).map_err(|e| Error::ParseError(e.to_string()))?;
+    out.set_column_names(&new_names)
+        .map_err(|e| Error::ParseError(e.to_string()))?;
     Ok((out, mapping))
 }
 
-fn rename_value_labels(labels: &SasValueLabels, name_map: &HashMap<String, String>) -> SasValueLabels {
+fn rename_value_labels(
+    labels: &SasValueLabels,
+    name_map: &HashMap<String, String>,
+) -> SasValueLabels {
     let mut out = HashMap::new();
     for (name, mapping) in labels {
         let key = name_map.get(name).cloned().unwrap_or_else(|| name.clone());
@@ -187,7 +191,10 @@ fn rename_value_labels(labels: &SasValueLabels, name_map: &HashMap<String, Strin
     out
 }
 
-fn rename_variable_labels(labels: &SasVariableLabels, name_map: &HashMap<String, String>) -> SasVariableLabels {
+fn rename_variable_labels(
+    labels: &SasVariableLabels,
+    name_map: &HashMap<String, String>,
+) -> SasVariableLabels {
     let mut out = HashMap::new();
     for (name, label) in labels {
         let key = name_map.get(name).cloned().unwrap_or_else(|| name.clone());
@@ -198,33 +205,41 @@ fn rename_variable_labels(labels: &SasVariableLabels, name_map: &HashMap<String,
 
 fn prepare_df_for_csv(df: &DataFrame) -> Result<DataFrame> {
     let mut cols = Vec::with_capacity(df.width());
-    for col in df.get_columns() {
+    for col in df.columns() {
         let series = col.as_materialized_series();
         let out = match series.dtype() {
             DataType::Date => {
-                let casted = series.cast(&DataType::Int32).map_err(|e| Error::ParseError(e.to_string()))?;
+                let casted = series
+                    .cast(&DataType::Int32)
+                    .map_err(|e| Error::ParseError(e.to_string()))?;
                 let ca = casted.i32().map_err(|e| Error::ParseError(e.to_string()))?;
                 let name = series.name().clone();
                 let iter = ca.into_iter().map(|opt| opt.map(|v| v as i64 + 3653));
                 Int64Chunked::from_iter_options(name, iter).into_series()
             }
             DataType::Datetime(unit, _) => {
-                let casted = series.cast(&DataType::Int64).map_err(|e| Error::ParseError(e.to_string()))?;
+                let casted = series
+                    .cast(&DataType::Int64)
+                    .map_err(|e| Error::ParseError(e.to_string()))?;
                 let ca = casted.i64().map_err(|e| Error::ParseError(e.to_string()))?;
                 let name = series.name().clone();
-                let iter = ca.into_iter().map(|opt| opt.map(|v| {
-                    let ms = match unit {
-                        TimeUnit::Milliseconds => v,
-                        TimeUnit::Microseconds => v / 1_000,
-                        TimeUnit::Nanoseconds => v / 1_000_000,
-                    };
-                    let secs = ms / 1_000;
-                    secs + 3653i64 * 86_400
-                }));
+                let iter = ca.into_iter().map(|opt| {
+                    opt.map(|v| {
+                        let ms = match unit {
+                            TimeUnit::Milliseconds => v,
+                            TimeUnit::Microseconds => v / 1_000,
+                            TimeUnit::Nanoseconds => v / 1_000_000,
+                        };
+                        let secs = ms / 1_000;
+                        secs + 3653i64 * 86_400
+                    })
+                });
                 Int64Chunked::from_iter_options(name, iter).into_series()
             }
             DataType::Time => {
-                let casted = series.cast(&DataType::Int64).map_err(|e| Error::ParseError(e.to_string()))?;
+                let casted = series
+                    .cast(&DataType::Int64)
+                    .map_err(|e| Error::ParseError(e.to_string()))?;
                 let ca = casted.i64().map_err(|e| Error::ParseError(e.to_string()))?;
                 let name = series.name().clone();
                 let iter = ca.into_iter().map(|opt| opt.map(|v| v / 1_000_000_000));
@@ -234,7 +249,7 @@ fn prepare_df_for_csv(df: &DataFrame) -> Result<DataFrame> {
         };
         cols.push(out.into_column());
     }
-    DataFrame::new(cols).map_err(|e| Error::ParseError(e.to_string()))
+    DataFrame::new_infer_height(cols).map_err(|e| Error::ParseError(e.to_string()))
 }
 
 fn build_sas_script(
@@ -252,7 +267,11 @@ fn build_sas_script(
                 continue;
             }
             let (fmt_name, is_char) = format_name_for_column(col, df)?;
-            script.push_str(&format!("  value {}{}\n", if is_char { "$" } else { "" }, fmt_name));
+            script.push_str(&format!(
+                "  value {}{}\n",
+                if is_char { "$" } else { "" },
+                fmt_name
+            ));
             for (k, v) in mapping {
                 let key = match k {
                     SasValueLabelKey::Num(n) => format!("{}", f64::from_bits(*n)),
@@ -271,7 +290,7 @@ fn build_sas_script(
         csv_path.display()
     ));
 
-    for col in df.get_columns() {
+    for col in df.columns() {
         let series = col.as_materialized_series();
         if matches!(series.dtype(), DataType::String) {
             let width = max_string_width(series)?;
@@ -286,10 +305,15 @@ fn build_sas_script(
                 continue;
             }
             let (fmt_name, is_char) = format_name_for_column(col, df)?;
-            format_lines.push(format!("{} {}{}.", col, if is_char { "$" } else { "" }, fmt_name));
+            format_lines.push(format!(
+                "{} {}{}.",
+                col,
+                if is_char { "$" } else { "" },
+                fmt_name
+            ));
         }
     }
-    for col in df.get_columns() {
+    for col in df.columns() {
         let series = col.as_materialized_series();
         let fmt = match series.dtype() {
             DataType::Date => Some("yymmdd10.".to_string()),
@@ -320,7 +344,7 @@ fn build_sas_script(
     }
 
     script.push_str("  input\n");
-    for col in df.get_columns() {
+    for col in df.columns() {
         let series = col.as_materialized_series();
         let informat = match series.dtype() {
             DataType::String => {

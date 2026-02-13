@@ -1,8 +1,11 @@
-use crate::polars_output::{scan_sas7bdat, sas_batch_iter};
+use crate::polars_output::{sas_batch_iter, scan_sas7bdat};
 use polars::prelude::*;
 use polars_arrow::array::StructArray;
 use polars_arrow::datatypes::{ArrowDataType, Field as ArrowField};
-use polars_arrow::ffi::{export_array_to_c, export_field_to_c, export_iterator, ArrowArray, ArrowArrayStream, ArrowSchema};
+use polars_arrow::ffi::{
+    export_array_to_c, export_field_to_c, export_iterator, ArrowArray, ArrowArrayStream,
+    ArrowSchema,
+};
 use std::path::Path;
 
 fn build_struct_field(schema: &SchemaRef) -> ArrowField {
@@ -16,7 +19,7 @@ fn df_to_struct_array(df: &DataFrame, field: &ArrowField) -> PolarsResult<Struct
     let struct_dtype = field.dtype().clone();
     let len = df.height();
     let arrays: Vec<Box<dyn polars_arrow::array::Array>> = df
-        .get_columns()
+        .columns()
         .iter()
         .map(|col| col.clone().rechunk_to_arrow(CompatLevel::newest()))
         .collect();

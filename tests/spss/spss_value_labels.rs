@@ -1,5 +1,8 @@
 use polars::prelude::*;
-use polars_readstat_rs::{SpssReader, SpssWriter, SpssValueLabelKey, SpssValueLabelMap, SpssValueLabels, SpssVariableLabels};
+use polars_readstat_rs::{
+    SpssReader, SpssValueLabelKey, SpssValueLabelMap, SpssValueLabels, SpssVariableLabels,
+    SpssWriter,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,9 +20,10 @@ fn temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
 
 #[test]
 fn test_spss_value_and_variable_labels() {
-    let df = DataFrame::new(vec![
-        Series::new("status".into(), &[1i32, 2, 3]).into_column(),
-    ]).unwrap();
+    let df = DataFrame::new_infer_height(vec![
+        Series::new("status".into(), &[1i32, 2, 3]).into_column()
+    ])
+    .unwrap();
 
     let mut map: SpssValueLabelMap = HashMap::new();
     map.insert(SpssValueLabelKey::from_f64(1.0), "one".to_string());
@@ -42,12 +46,18 @@ fn test_spss_value_and_variable_labels() {
     let var = meta
         .variables
         .iter()
-        .find(|v| v.short_name.eq_ignore_ascii_case("status") || v.name.eq_ignore_ascii_case("status"))
+        .find(|v| {
+            v.short_name.eq_ignore_ascii_case("status") || v.name.eq_ignore_ascii_case("status")
+        })
         .expect("status variable");
     assert_eq!(var.label.as_deref(), Some("Status Label"));
     assert!(var.value_label.is_some());
 
-    let out = reader.read().value_labels_as_strings(true).finish().unwrap();
+    let out = reader
+        .read()
+        .value_labels_as_strings(true)
+        .finish()
+        .unwrap();
     let col_name = var.name.as_str();
     let col = out.column(col_name).unwrap().str().unwrap();
     let vals: Vec<Option<&str>> = col.into_iter().collect();

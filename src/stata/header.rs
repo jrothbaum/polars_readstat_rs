@@ -27,7 +27,11 @@ fn read_binary_header<R: Read>(reader: &mut R) -> Result<Header> {
         0x00 => Endian::Little, // legacy 102/103 files
         0x01 => Endian::Big,    // DTA_HILO
         0x02 => Endian::Little, // DTA_LOHI
-        _ => return Err(Error::UnsupportedFormat(format!("invalid byteorder: {byteorder}"))),
+        _ => {
+            return Err(Error::UnsupportedFormat(format!(
+                "invalid byteorder: {byteorder}"
+            )))
+        }
     };
 
     let nvars = read_u16_endian(reader, endian)? as u32;
@@ -63,7 +67,9 @@ fn read_xmlish_header<R: Read>(reader: &mut R) -> Result<Header> {
     } else if &byteorder == b"LSF" {
         Endian::Little
     } else {
-        return Err(Error::UnsupportedFormat("invalid byteorder tag".to_string()));
+        return Err(Error::UnsupportedFormat(
+            "invalid byteorder tag".to_string(),
+        ));
     };
 
     let nvars = if ds_format >= 119 {
@@ -112,21 +118,36 @@ fn read_chunk<R: Read>(reader: &mut R, start: &[u8], dst: &mut [u8], end: &[u8])
     Ok(())
 }
 
-fn read_u16_tagged<R: Read>(reader: &mut R, endian: Endian, start: &[u8], end: &[u8]) -> Result<u16> {
+fn read_u16_tagged<R: Read>(
+    reader: &mut R,
+    endian: Endian,
+    start: &[u8],
+    end: &[u8],
+) -> Result<u16> {
     read_tag(reader, start)?;
     let v = read_u16_endian(reader, endian)?;
     read_tag(reader, end)?;
     Ok(v)
 }
 
-fn read_u32_tagged<R: Read>(reader: &mut R, endian: Endian, start: &[u8], end: &[u8]) -> Result<u32> {
+fn read_u32_tagged<R: Read>(
+    reader: &mut R,
+    endian: Endian,
+    start: &[u8],
+    end: &[u8],
+) -> Result<u32> {
     read_tag(reader, start)?;
     let v = read_u32_endian(reader, endian)?;
     read_tag(reader, end)?;
     Ok(v)
 }
 
-fn read_u64_tagged<R: Read>(reader: &mut R, endian: Endian, start: &[u8], end: &[u8]) -> Result<u64> {
+fn read_u64_tagged<R: Read>(
+    reader: &mut R,
+    endian: Endian,
+    start: &[u8],
+    end: &[u8],
+) -> Result<u64> {
     read_tag(reader, start)?;
     let v = read_u64_endian(reader, endian)?;
     read_tag(reader, end)?;

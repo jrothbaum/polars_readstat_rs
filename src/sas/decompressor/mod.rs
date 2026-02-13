@@ -1,9 +1,9 @@
 // Decompressor module
-mod rle;
 mod rdc;
+mod rle;
 
-pub use rle::RleDecompressor;
 pub use rdc::RdcDecompressor;
+pub use rle::RleDecompressor;
 
 use crate::error::Result;
 use crate::types::Compression;
@@ -25,9 +25,7 @@ impl Decompressor {
 
     pub fn decompress(&mut self, input: &[u8], expected_output_size: usize) -> Result<Vec<u8>> {
         match self {
-            Self::None => {
-                Ok(input.to_vec())
-            }
+            Self::None => Ok(input.to_vec()),
             Self::Rle(d) => d.decompress(input, expected_output_size),
             Self::Rdc(d) => d.decompress(input, expected_output_size),
         }

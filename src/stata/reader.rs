@@ -1,7 +1,7 @@
+use crate::stata::data::{build_shared_decode, read_data_frame, read_data_frame_range};
 use crate::stata::error::Result;
 use crate::stata::header::read_header;
 use crate::stata::metadata::read_metadata;
-use crate::stata::data::{read_data_frame, read_data_frame_range, build_shared_decode};
 use crate::stata::polars_output::{apply_stata_time_formats, stata_time_format_kind};
 use crate::stata::types::{Header, Metadata};
 use polars::prelude::*;
@@ -42,7 +42,11 @@ impl StataReader {
         let header = read_header(&mut file)?;
         let metadata = read_metadata(&mut file, &header)?;
 
-        Ok(Self { path, header, metadata })
+        Ok(Self {
+            path,
+            header,
+            metadata,
+        })
     }
 
     pub fn open_with_profile(path: impl AsRef<Path>) -> Result<(Self, OpenProfile)> {
@@ -57,7 +61,17 @@ impl StataReader {
         let metadata = read_metadata(&mut file, &header)?;
         let metadata_ms = metadata_start.elapsed().as_secs_f64() * 1000.0;
 
-        Ok((Self { path, header, metadata }, OpenProfile { header_ms, metadata_ms }))
+        Ok((
+            Self {
+                path,
+                header,
+                metadata,
+            },
+            OpenProfile {
+                header_ms,
+                metadata_ms,
+            },
+        ))
     }
 
     /// Entry point for reading. Returns a builder to configure the operation.
@@ -65,12 +79,18 @@ impl StataReader {
         ReadBuilder::new(self)
     }
 
-    pub fn metadata(&self) -> &Metadata { &self.metadata }
-    pub fn header(&self) -> &Header { &self.header }
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
 
     fn execute_read(&self, _opts: ReadBuilder) -> Result<DataFrame> {
         let col_indices = resolve_column_indices(&self.metadata, _opts.columns.as_deref())?;
-        let limit = _opts.limit.unwrap_or(self.metadata.row_count.saturating_sub(_opts.offset as u64) as usize);
+        let limit = _opts
+            .limit
+            .unwrap_or(self.metadata.row_count.saturating_sub(_opts.offset as u64) as usize);
 
         let mut df = if _opts.parallel && limit > 0 {
             self.read_parallel(
@@ -96,7 +116,7 @@ impl StataReader {
             )?
         };
 
-        if !df.is_empty() {
+        if df.height() > 0 {
             let mut formats = Vec::new();
             for var in &self.metadata.variables {
                 if let Some(kind) = stata_time_format_kind(var.format.as_deref(), &var.var_type) {
@@ -162,15 +182,42 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
-    pub fn with_columns(mut self, cols: Vec<String>) -> Self { self.columns = Some(cols); self }
-    pub fn with_limit(mut self, limit: usize) -> Self { self.limit = Some(limit); self }
-    pub fn with_offset(mut self, offset: usize) -> Self { self.offset = offset; self }
-    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self { self.schema = Some(schema); self }
-    pub fn with_n_threads(mut self, n: usize) -> Self { self.num_threads = Some(n); self }
-    pub fn with_chunk_size(mut self, n: usize) -> Self { self.chunk_size = Some(n); self }
-    pub fn sequential(mut self) -> Self { self.parallel = false; self }
-    pub fn missing_string_as_null(mut self, v: bool) -> Self { self.missing_string_as_null = v; self }
-    pub fn value_labels_as_strings(mut self, v: bool) -> Self { self.value_labels_as_strings = v; self }
+    pub fn with_columns(mut self, cols: Vec<String>) -> Self {
+        self.columns = Some(cols);
+        self
+    }
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+    pub fn with_n_threads(mut self, n: usize) -> Self {
+        self.num_threads = Some(n);
+        self
+    }
+    pub fn with_chunk_size(mut self, n: usize) -> Self {
+        self.chunk_size = Some(n);
+        self
+    }
+    pub fn sequential(mut self) -> Self {
+        self.parallel = false;
+        self
+    }
+    pub fn missing_string_as_null(mut self, v: bool) -> Self {
+        self.missing_string_as_null = v;
+        self
+    }
+    pub fn value_labels_as_strings(mut self, v: bool) -> Self {
+        self.value_labels_as_strings = v;
+        self
+    }
 
     pub fn finish(self) -> Result<DataFrame> {
         self.reader.execute_read(self)
@@ -230,8 +277,12 @@ impl StataReader {
         )?;
         let shared = std::sync::Arc::new(shared);
 
-        let pool = ThreadPoolBuilder::new().num_threads(n_threads).build()
-            .map_err(|e| crate::stata::error::Error::ParseError(format!("thread pool error: {}", e)))?;
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(n_threads)
+            .build()
+            .map_err(|e| {
+                crate::stata::error::Error::ParseError(format!("thread pool error: {}", e))
+            })?;
 
         let mut dfs: Vec<(usize, DataFrame)> = pool.install(|| {
             (0..n_chunks)
@@ -264,7 +315,9 @@ impl StataReader {
 }
 
 fn combine_dataframes(mut dfs: Vec<DataFrame>) -> Result<DataFrame> {
-    if dfs.is_empty() { return Ok(DataFrame::empty()); }
+    if dfs.is_empty() {
+        return Ok(DataFrame::empty());
+    }
     let mut main = dfs.remove(0);
     for df in dfs {
         main.vstack_mut(&df)?;
@@ -272,15 +325,22 @@ fn combine_dataframes(mut dfs: Vec<DataFrame>) -> Result<DataFrame> {
     Ok(main)
 }
 
-fn resolve_column_indices(metadata: &Metadata, cols: Option<&[String]>) -> Result<Option<Vec<usize>>> {
-    let Some(cols) = cols else { return Ok(None); };
+fn resolve_column_indices(
+    metadata: &Metadata,
+    cols: Option<&[String]>,
+) -> Result<Option<Vec<usize>>> {
+    let Some(cols) = cols else {
+        return Ok(None);
+    };
     let mut indices = Vec::with_capacity(cols.len());
     for name in cols {
         let idx = metadata
             .variables
             .iter()
             .position(|v| v.name == *name)
-            .ok_or_else(|| crate::stata::error::Error::ParseError(format!("Unknown column: {}", name)))?;
+            .ok_or_else(|| {
+                crate::stata::error::Error::ParseError(format!("Unknown column: {}", name))
+            })?;
         indices.push(idx);
     }
     Ok(Some(indices))
@@ -289,11 +349,10 @@ fn resolve_column_indices(metadata: &Metadata, cols: Option<&[String]>) -> Resul
 fn cast_dataframe(mut df: DataFrame, schema: &Schema) -> Result<DataFrame> {
     for (name, dtype) in schema.iter() {
         if let Ok(col) = df.column(name) {
-            let casted = col
-                .as_materialized_series()
-                .cast(dtype)
-                .map_err(|e| crate::stata::error::Error::ParseError(format!("Cast failed for {}: {}", name, e)))?;
-            df.replace(name, casted)?;
+            let casted = col.as_materialized_series().cast(dtype).map_err(|e| {
+                crate::stata::error::Error::ParseError(format!("Cast failed for {}: {}", name, e))
+            })?;
+            df.replace(name, casted.into())?;
         }
     }
     Ok(df)

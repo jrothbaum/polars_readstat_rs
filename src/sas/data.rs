@@ -45,7 +45,7 @@ enum PageState {
 pub struct DataSubheader {
     pub offset: usize,
     pub length: usize,
-    pub compression: u8,  // 4 = compressed, 0 = uncompressed
+    pub compression: u8, // 4 = compressed, 0 = uncompressed
 }
 
 impl<R: Read + Seek> DataReader<R> {
@@ -330,8 +330,9 @@ impl<R: Read + Seek> DataReader<R> {
                         let page_buffer = self.page_reader.page_buffer();
                         if offset + 4 <= page_buffer.len() {
                             let pad = &page_buffer[offset..offset + 4];
-                            let vendor_is_stat_transfer =
-                                is_stat_transfer_release(self.page_reader.header().sas_release.as_str());
+                            let vendor_is_stat_transfer = is_stat_transfer_release(
+                                self.page_reader.header().sas_release.as_str(),
+                            );
                             let pad_is_zero_or_space =
                                 pad == [0, 0, 0, 0] || pad == [b' ', b' ', b' ', b' '];
                             if !vendor_is_stat_transfer || pad_is_zero_or_space {
@@ -375,10 +376,7 @@ impl<R: Read + Seek> DataReader<R> {
     /// with the same compression/type flags. We distinguish them by:
     /// 1. Length: compressed data rows have length <= row_length
     /// 2. Signature: known metadata subheaders have recognizable 4-byte signatures
-    fn extract_data_subheaders(
-        &self,
-        subheaders: &[PageSubheader],
-    ) -> Result<Vec<DataSubheader>> {
+    fn extract_data_subheaders(&self, subheaders: &[PageSubheader]) -> Result<Vec<DataSubheader>> {
         let mut data_subheaders = Vec::new();
         let page_buffer = self.page_reader.page_buffer();
         let row_length = self.metadata.row_length;
@@ -410,11 +408,21 @@ impl<R: Read + Seek> DataReader<R> {
                 }
                 // Skip the problematic [00, FC, FF, FF] pattern found in some compressed files
                 // This appears to be metadata/padding, not actual data
-                if sig8.len() >= 4 && sig8[0] == 0x00 && sig8[1] == 0xFC && sig8[2] == 0xFF && sig8[3] == 0xFF {
+                if sig8.len() >= 4
+                    && sig8[0] == 0x00
+                    && sig8[1] == 0xFC
+                    && sig8[2] == 0xFF
+                    && sig8[3] == 0xFF
+                {
                     continue;
                 }
                 // Skip [FF, FF, FC, 00] pattern - another metadata variant seen in test12
-                if sig8.len() >= 4 && sig8[0] == 0xFF && sig8[1] == 0xFF && sig8[2] == 0xFC && sig8[3] == 0x00 {
+                if sig8.len() >= 4
+                    && sig8[0] == 0xFF
+                    && sig8[1] == 0xFF
+                    && sig8[2] == 0xFC
+                    && sig8[3] == 0x00
+                {
                     continue;
                 }
             } else if subheader.length >= 4 && subheader.offset + 4 <= page_buffer.len() {
@@ -423,11 +431,21 @@ impl<R: Read + Seek> DataReader<R> {
                     continue;
                 }
                 // Skip the problematic [00, FC, FF, FF] pattern
-                if sig4.len() >= 4 && sig4[0] == 0x00 && sig4[1] == 0xFC && sig4[2] == 0xFF && sig4[3] == 0xFF {
+                if sig4.len() >= 4
+                    && sig4[0] == 0x00
+                    && sig4[1] == 0xFC
+                    && sig4[2] == 0xFF
+                    && sig4[3] == 0xFF
+                {
                     continue;
                 }
                 // Skip [FF, FF, FC, 00] pattern
-                if sig4.len() >= 4 && sig4[0] == 0xFF && sig4[1] == 0xFF && sig4[2] == 0xFC && sig4[3] == 0x00 {
+                if sig4.len() >= 4
+                    && sig4[0] == 0xFF
+                    && sig4[1] == 0xFF
+                    && sig4[2] == 0xFC
+                    && sig4[3] == 0x00
+                {
                     continue;
                 }
             }
@@ -443,15 +461,17 @@ impl<R: Read + Seek> DataReader<R> {
     }
 
     /// Extract row bytes from page buffer
-    fn extract_row_bytes(&mut self, offset: usize, length: usize, _compression: u8) -> Result<RowBytes> {
+    fn extract_row_bytes(
+        &mut self,
+        offset: usize,
+        length: usize,
+        _compression: u8,
+    ) -> Result<RowBytes> {
         let page_buffer = self.page_reader.page_buffer();
 
         // Validate bounds
         if offset + length > page_buffer.len() {
-            return Err(Error::BufferOutOfBounds {
-                offset,
-                length,
-            });
+            return Err(Error::BufferOutOfBounds { offset, length });
         }
 
         let raw_bytes = &page_buffer[offset..offset + length];
@@ -460,12 +480,12 @@ impl<R: Read + Seek> DataReader<R> {
         // regardless of the compression flag. The compression flag on the
         // subheader isn't a reliable indicator; length comparison is.
         if length < self.metadata.row_length {
-            self.decompressor.decompress(raw_bytes, self.metadata.row_length)
+            self.decompressor
+                .decompress(raw_bytes, self.metadata.row_length)
         } else {
             Ok(raw_bytes.to_vec())
         }
     }
-
 }
 
 fn is_stat_transfer_release(release: &str) -> bool {
@@ -481,8 +501,14 @@ fn is_stat_transfer_release(release: &str) -> bool {
     if bytes[1] != b'.' || bytes[6] != b'M' {
         return false;
     }
-    let minor = std::str::from_utf8(&bytes[2..6]).ok().and_then(|s| s.parse::<u32>().ok());
-    let revision = bytes.get(7).copied().filter(|b| b.is_ascii_digit()).map(|b| (b - b'0') as u32);
+    let minor = std::str::from_utf8(&bytes[2..6])
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+    let revision = bytes
+        .get(7)
+        .copied()
+        .filter(|b| b.is_ascii_digit())
+        .map(|b| (b - b'0') as u32);
     matches!((minor, revision), (Some(0), Some(0)))
 }
 

@@ -1,5 +1,5 @@
 use crate::spss::error::{Error, Result};
-use crate::spss::types::{Endian, Header, Metadata, VarType, Variable, FormatClass};
+use crate::spss::types::{Endian, FormatClass, Header, Metadata, VarType, Variable};
 use std::io::{Read, Seek, SeekFrom};
 
 const REC_TYPE_VARIABLE: u32 = 2;
@@ -28,7 +28,13 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
         let rec_type = read_u32(reader, header.endian)?;
         match rec_type {
             REC_TYPE_VARIABLE => {
-                let variable = read_variable_record(reader, header, last_var_index, &mut metadata, &mut current_offset)?;
+                let variable = read_variable_record(
+                    reader,
+                    header,
+                    last_var_index,
+                    &mut metadata,
+                    &mut current_offset,
+                )?;
                 if let Some(var) = variable {
                     metadata.variables.push(var);
                     last_var_index = Some(metadata.variables.len() - 1);
@@ -60,7 +66,9 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
                     let mut buf = vec![0u8; data_len];
                     reader.read_exact(&mut buf)?;
                     if let Ok(codepage) = std::str::from_utf8(&buf) {
-                        if let Some(enc) = encoding_rs::Encoding::for_label(codepage.trim().as_bytes()) {
+                        if let Some(enc) =
+                            encoding_rs::Encoding::for_label(codepage.trim().as_bytes())
+                        {
                             metadata.encoding = enc;
                         }
                     }
@@ -89,7 +97,12 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
                 metadata.data_offset = Some(reader.stream_position()?);
                 break;
             }
-            _ => return Err(Error::ParseError(format!("unknown SPSS record type {}", rec_type))),
+            _ => {
+                return Err(Error::ParseError(format!(
+                    "unknown SPSS record type {}",
+                    rec_type
+                )))
+            }
         }
     }
 
@@ -147,13 +160,19 @@ fn read_variable_record<R: Read + Seek>(
     let name = read_name(&buf[20..28]);
 
     if typ < 0 {
-        let idx = last_var_index.ok_or_else(|| Error::ParseError("string continuation without base variable".to_string()))?;
+        let idx = last_var_index.ok_or_else(|| {
+            Error::ParseError("string continuation without base variable".to_string())
+        })?;
         metadata.variables[idx].width += 1;
         *current_offset += 1;
         return Ok(None);
     }
 
-    let var_type = if typ == 0 { VarType::Numeric } else { VarType::Str };
+    let var_type = if typ == 0 {
+        VarType::Numeric
+    } else {
+        VarType::Str
+    };
     let string_len = if typ > 0 { typ as usize } else { 0 };
     let width = 1;
     let offset = *current_offset;
@@ -169,7 +188,10 @@ fn read_variable_record<R: Read + Seek>(
         let mut label_buf = vec![0u8; padded];
         reader.read_exact(&mut label_buf)?;
         let raw = &label_buf[..len.min(label_buf.len())];
-        let text = encoding_rs::WINDOWS_1252.decode_without_bom_handling(raw).0.to_string();
+        let text = encoding_rs::WINDOWS_1252
+            .decode_without_bom_handling(raw)
+            .0
+            .to_string();
         let text = text.trim().to_string();
         if !text.is_empty() {
             label = Some(text);
@@ -257,7 +279,9 @@ fn read_value_label_record<R: Read + Seek>(
 
     let rec_type = read_u32(reader, header.endian)?;
     if rec_type != REC_TYPE_VALUE_LABEL_VARIABLES {
-        return Err(Error::ParseError("invalid value label variables record".to_string()));
+        return Err(Error::ParseError(
+            "invalid value label variables record".to_string(),
+        ));
     }
     let var_count = read_u32(reader, header.endian)? as usize;
     let mut var_offsets = Vec::with_capacity(var_count);
@@ -293,7 +317,10 @@ fn read_value_label_record<R: Read + Seek>(
         }
     }
 
-    metadata.value_labels.push(crate::spss::types::ValueLabel { name: name.clone(), mapping });
+    metadata.value_labels.push(crate::spss::types::ValueLabel {
+        name: name.clone(),
+        mapping,
+    });
     for off in var_offsets {
         let target = off.saturating_sub(1) as usize;
         if let Some(var) = metadata.variables.iter_mut().find(|v| v.offset == target) {
@@ -413,7 +440,11 @@ fn encoding_for_code(code: i32) -> Option<&'static encoding_rs::Encoding> {
 fn parse_very_long_string_record(data: &[u8], metadata: &mut Metadata) -> Result<()> {
     let mut pos = 0usize;
     while pos < data.len() {
-        let end = data[pos..].iter().position(|&b| b == b'\t').map(|i| pos + i).unwrap_or(data.len());
+        let end = data[pos..]
+            .iter()
+            .position(|&b| b == b'\t')
+            .map(|i| pos + i)
+            .unwrap_or(data.len());
         let entry: Vec<u8> = data[pos..end].iter().copied().filter(|b| *b != 0).collect();
         pos = if end < data.len() { end + 1 } else { end };
         if entry.is_empty() {
@@ -423,11 +454,9 @@ fn parse_very_long_string_record(data: &[u8], metadata: &mut Metadata) -> Result
             let key = String::from_utf8_lossy(&entry[..eq]).to_string();
             let val = String::from_utf8_lossy(&entry[eq + 1..]).trim().to_string();
             if let Ok(len) = val.parse::<usize>() {
-                if let Some(var) = metadata
-                    .variables
-                    .iter_mut()
-                    .find(|v| v.short_name.eq_ignore_ascii_case(&key) || v.name.eq_ignore_ascii_case(&key))
-                {
+                if let Some(var) = metadata.variables.iter_mut().find(|v| {
+                    v.short_name.eq_ignore_ascii_case(&key) || v.name.eq_ignore_ascii_case(&key)
+                }) {
                     var.string_len = len;
                 }
             }
@@ -487,16 +516,28 @@ fn parse_long_string_value_labels(
             let value_len = read_u32_from(data, pos, header.endian)? as usize;
             pos += 4;
             if pos + value_len > data.len() {
-                return Err(Error::ParseError("invalid long string value label value".to_string()));
+                return Err(Error::ParseError(
+                    "invalid long string value label value".to_string(),
+                ));
             }
-            let value = decode_string(&data[pos..pos + value_len], header.endian, metadata.encoding);
+            let value = decode_string(
+                &data[pos..pos + value_len],
+                header.endian,
+                metadata.encoding,
+            );
             pos += value_len;
             let label_len = read_u32_from(data, pos, header.endian)? as usize;
             pos += 4;
             if pos + label_len > data.len() {
-                return Err(Error::ParseError("invalid long string value label".to_string()));
+                return Err(Error::ParseError(
+                    "invalid long string value label".to_string(),
+                ));
             }
-            let label = decode_string(&data[pos..pos + label_len], header.endian, metadata.encoding);
+            let label = decode_string(
+                &data[pos..pos + label_len],
+                header.endian,
+                metadata.encoding,
+            );
             pos += label_len;
             if !label.is_empty() {
                 mapping.push((crate::spss::types::ValueLabelKey::Str(value), label));
@@ -504,7 +545,10 @@ fn parse_long_string_value_labels(
         }
         let name = format!("labels{}", label_set_index);
         label_set_index += 1;
-        metadata.value_labels.push(crate::spss::types::ValueLabel { name: name.clone(), mapping });
+        metadata.value_labels.push(crate::spss::types::ValueLabel {
+            name: name.clone(),
+            mapping,
+        });
         if let Some(var) = metadata.variables.iter_mut().find(|v| v.name == var_name) {
             var.value_label = Some(name);
         }
@@ -522,22 +566,30 @@ fn parse_long_string_missing_values(
         let (name, next) = read_pascal_string(data, pos, header.endian)?;
         pos = next;
         if pos >= data.len() {
-            return Err(Error::ParseError("unexpected end in long string missing values".to_string()));
+            return Err(Error::ParseError(
+                "unexpected end in long string missing values".to_string(),
+            ));
         }
         let n_missing = data[pos] as usize;
         pos += 1;
         if n_missing == 0 || n_missing > 3 {
-            return Err(Error::ParseError("invalid long string missing count".to_string()));
+            return Err(Error::ParseError(
+                "invalid long string missing count".to_string(),
+            ));
         }
         if pos + 4 > data.len() {
-            return Err(Error::ParseError("invalid long string missing value length".to_string()));
+            return Err(Error::ParseError(
+                "invalid long string missing value length".to_string(),
+            ));
         }
         let len = read_u32_from(data, pos, header.endian)? as usize;
         pos += 4;
         let mut values = Vec::with_capacity(n_missing);
         for _ in 0..n_missing {
             if pos + len > data.len() {
-                return Err(Error::ParseError("invalid long string missing value".to_string()));
+                return Err(Error::ParseError(
+                    "invalid long string missing value".to_string(),
+                ));
             }
             let s = decode_string(&data[pos..pos + len], header.endian, metadata.encoding);
             values.push(s);
@@ -558,7 +610,9 @@ fn read_pascal_string(data: &[u8], pos: usize, endian: Endian) -> Result<(String
     let start = pos + 4;
     let end = start + len;
     if end > data.len() {
-        return Err(Error::ParseError("invalid pascal string length".to_string()));
+        return Err(Error::ParseError(
+            "invalid pascal string length".to_string(),
+        ));
     }
     let s = String::from_utf8_lossy(&data[start..end]).to_string();
     Ok((s, end))

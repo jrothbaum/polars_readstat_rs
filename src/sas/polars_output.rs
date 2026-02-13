@@ -1,3 +1,10 @@
+use crate::constants::{
+    DATETIME_FORMATS, DATE_FORMATS, SAS_EPOCH_OFFSET_DAYS, SECONDS_PER_DAY, TIME_FORMATS,
+};
+use crate::error::{Error, Result};
+use crate::reader::Sas7bdatReader;
+use crate::types::{Column as SasColumn, ColumnType, Metadata};
+use crate::value::Value;
 use polars::prelude::*;
 use std::cmp::min;
 use std::collections::BTreeMap;
@@ -5,11 +12,6 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use crate::constants::{DATETIME_FORMATS, DATE_FORMATS, TIME_FORMATS, SAS_EPOCH_OFFSET_DAYS, SECONDS_PER_DAY};
-use crate::reader::Sas7bdatReader;
-use crate::types::{Column as SasColumn, ColumnType, Metadata};
-use crate::error::{Error, Result};
-use crate::value::Value;
 
 /// Build a Polars DataFrame from rows of parsed values
 pub struct DataFrameBuilder {
@@ -41,10 +43,17 @@ impl DataFrameBuilder {
             .iter()
             .map(|col| ColumnBuffer::with_capacity(kind_for_column(col), &col.name, capacity))
             .collect();
-        Self { columns_meta, buffers }
+        Self {
+            columns_meta,
+            buffers,
+        }
     }
 
-    pub fn new_with_columns(metadata: &Metadata, column_indices: &[usize], capacity: usize) -> Self {
+    pub fn new_with_columns(
+        metadata: &Metadata,
+        column_indices: &[usize],
+        capacity: usize,
+    ) -> Self {
         let columns_meta: Vec<SasColumn> = column_indices
             .iter()
             .map(|&idx| metadata.columns[idx].clone())
@@ -53,7 +62,10 @@ impl DataFrameBuilder {
             .iter()
             .map(|col| ColumnBuffer::with_capacity(kind_for_column(col), &col.name, capacity))
             .collect();
-        Self { columns_meta, buffers }
+        Self {
+            columns_meta,
+            buffers,
+        }
     }
 
     pub fn add_row_ref(&mut self, row: &[Value]) -> Result<()> {
@@ -82,28 +94,44 @@ impl DataFrameBuilder {
         match kind {
             ColumnKind::Numeric => {
                 if let ColumnBuffer::Numeric(builder) = buffer {
-                    if is_missing { builder.append_null(); } else { builder.append_value(value); }
+                    if is_missing {
+                        builder.append_null();
+                    } else {
+                        builder.append_value(value);
+                    }
                 } else {
                     debug_assert!(false, "Expected numeric buffer");
                 }
             }
             ColumnKind::Date => {
                 if let ColumnBuffer::Date(builder) = buffer {
-                    if is_missing { builder.append_null(); } else { builder.append_value(to_date_value(value)); }
+                    if is_missing {
+                        builder.append_null();
+                    } else {
+                        builder.append_value(to_date_value(value));
+                    }
                 } else {
                     debug_assert!(false, "Expected date buffer");
                 }
             }
             ColumnKind::DateTime => {
                 if let ColumnBuffer::DateTime(builder) = buffer {
-                    if is_missing { builder.append_null(); } else { builder.append_value(to_datetime_value(value)); }
+                    if is_missing {
+                        builder.append_null();
+                    } else {
+                        builder.append_value(to_datetime_value(value));
+                    }
                 } else {
                     debug_assert!(false, "Expected datetime buffer");
                 }
             }
             ColumnKind::Time => {
                 if let ColumnBuffer::Time(builder) = buffer {
-                    if is_missing { builder.append_null(); } else { builder.append_value(to_time_value(value)); }
+                    if is_missing {
+                        builder.append_null();
+                    } else {
+                        builder.append_value(to_time_value(value));
+                    }
                 } else {
                     debug_assert!(false, "Expected time buffer");
                 }
@@ -123,32 +151,44 @@ impl DataFrameBuilder {
         for (_column, buffer) in self.columns_meta.iter().zip(self.buffers.into_iter()) {
             let series = match buffer {
                 ColumnBuffer::Numeric(builder) => builder.finish().into_series(),
-                ColumnBuffer::Date(builder) => builder.finish().into_series().cast(&DataType::Date)?,
+                ColumnBuffer::Date(builder) => {
+                    builder.finish().into_series().cast(&DataType::Date)?
+                }
                 ColumnBuffer::DateTime(builder) => builder
                     .finish()
                     .into_series()
                     .cast(&DataType::Datetime(TimeUnit::Microseconds, None))?,
-                ColumnBuffer::Time(builder) => builder.finish().into_series().cast(&DataType::Time)?,
+                ColumnBuffer::Time(builder) => {
+                    builder.finish().into_series().cast(&DataType::Time)?
+                }
                 ColumnBuffer::Character(builder) => builder.finish().into_series(),
             };
             columns.push(series.into());
         }
-        DataFrame::new(columns).map_err(|e| e.into())
+        DataFrame::new_infer_height(columns).map_err(|e| e.into())
     }
 }
 
 impl ColumnBuffer {
     fn with_capacity(kind: ColumnKind, name: &str, capacity: usize) -> Self {
         match kind {
-            ColumnKind::Numeric => {
-                ColumnBuffer::Numeric(PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), capacity))
+            ColumnKind::Numeric => ColumnBuffer::Numeric(
+                PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), capacity),
+            ),
+            ColumnKind::Date => ColumnBuffer::Date(PrimitiveChunkedBuilder::<Int32Type>::new(
+                name.into(),
+                capacity,
+            )),
+            ColumnKind::DateTime => ColumnBuffer::DateTime(
+                PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), capacity),
+            ),
+            ColumnKind::Time => ColumnBuffer::Time(PrimitiveChunkedBuilder::<Int64Type>::new(
+                name.into(),
+                capacity,
+            )),
+            ColumnKind::Character => {
+                ColumnBuffer::Character(StringChunkedBuilder::new(name.into(), capacity))
             }
-            ColumnKind::Date => ColumnBuffer::Date(PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), capacity)),
-            ColumnKind::DateTime => {
-                ColumnBuffer::DateTime(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), capacity))
-            }
-            ColumnKind::Time => ColumnBuffer::Time(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), capacity)),
-            ColumnKind::Character => ColumnBuffer::Character(StringChunkedBuilder::new(name.into(), capacity)),
         }
     }
 }
@@ -173,10 +213,18 @@ pub(crate) fn kind_for_column(column: &SasColumn) -> ColumnKind {
 
 fn push_value_ref(buffer: &mut ColumnBuffer, column: &SasColumn, value: &Value) {
     match (buffer, value, column.col_type) {
-        (ColumnBuffer::Numeric(builder), Value::Numeric(v), ColumnType::Numeric) => builder.append_option(*v),
-        (ColumnBuffer::Date(builder), Value::Numeric(v), ColumnType::Numeric) => builder.append_option(to_date(*v)),
-        (ColumnBuffer::DateTime(builder), Value::Numeric(v), ColumnType::Numeric) => builder.append_option(to_datetime(*v)),
-        (ColumnBuffer::Time(builder), Value::Numeric(v), ColumnType::Numeric) => builder.append_option(to_time(*v)),
+        (ColumnBuffer::Numeric(builder), Value::Numeric(v), ColumnType::Numeric) => {
+            builder.append_option(*v)
+        }
+        (ColumnBuffer::Date(builder), Value::Numeric(v), ColumnType::Numeric) => {
+            builder.append_option(to_date(*v))
+        }
+        (ColumnBuffer::DateTime(builder), Value::Numeric(v), ColumnType::Numeric) => {
+            builder.append_option(to_datetime(*v))
+        }
+        (ColumnBuffer::Time(builder), Value::Numeric(v), ColumnType::Numeric) => {
+            builder.append_option(to_time(*v))
+        }
         (ColumnBuffer::Character(builder), Value::Character(v), ColumnType::Character) => {
             if let Some(s) = v {
                 builder.append_value(s);
@@ -277,7 +325,13 @@ impl SasScan {
         chunk_size: Option<usize>,
         compress_opts: crate::CompressOptionsLite,
     ) -> Self {
-        Self { path, num_threads: threads, missing_string_as_null, chunk_size, compress_opts }
+        Self {
+            path,
+            num_threads: threads,
+            missing_string_as_null,
+            chunk_size,
+            compress_opts,
+        }
     }
 }
 
@@ -344,10 +398,12 @@ pub(crate) fn sas_batch_iter(
     col_indices: Option<Vec<usize>>,
     n_rows: Option<usize>,
 ) -> PolarsResult<SasBatchIter> {
-    let reader = Sas7bdatReader::open(&path)
-        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+    let reader =
+        Sas7bdatReader::open(&path).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
     let total = n_rows.unwrap_or(reader.metadata().row_count as usize);
-    let batch_size = chunk_size.unwrap_or(crate::pipeline::DEFAULT_PIPELINE_CHUNK_SIZE).max(1);
+    let batch_size = chunk_size
+        .unwrap_or(crate::pipeline::DEFAULT_PIPELINE_CHUNK_SIZE)
+        .max(1);
     let total_chunks = total.div_ceil(batch_size);
 
     let col_names: Option<Vec<String>> = col_indices.as_ref().map(|indices| {
@@ -373,7 +429,10 @@ pub(crate) fn sas_batch_iter(
         .map(|n| n.get())
         .unwrap_or(1)
         .max(1);
-    let n_workers = min(threads.unwrap_or(default_threads).max(1), total_chunks.max(1));
+    let n_workers = min(
+        threads.unwrap_or(default_threads).max(1),
+        total_chunks.max(1),
+    );
     let (tx, rx) = mpsc::channel::<ChunkMessage>();
     let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(n_workers);
 
@@ -455,7 +514,9 @@ pub(crate) fn sas_batch_iter(
 }
 
 impl AnonymousScan for SasScan {
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn scan(&self, opts: AnonymousScanArgs) -> PolarsResult<DataFrame> {
         let reader = Sas7bdatReader::open(&self.path)
@@ -465,7 +526,11 @@ impl AnonymousScan for SasScan {
         let col_indices = if let Some(cols) = opts.with_columns {
             let mut indices = Vec::with_capacity(cols.len());
             for name in cols.iter() {
-                let idx = reader.metadata().columns.iter().position(|c| c.name == name.as_str())
+                let idx = reader
+                    .metadata()
+                    .columns
+                    .iter()
+                    .position(|c| c.name == name.as_str())
                     .ok_or_else(|| {
                         // .to_string() creates an owned String, which satisfies the 'static requirement
                         let err_msg = name.as_str().to_string();
@@ -491,7 +556,8 @@ impl AnonymousScan for SasScan {
         while let Some(batch) = iter.next() {
             let df = batch?;
             if let Some(acc) = out.as_mut() {
-                acc.vstack_mut(&df).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+                acc.vstack_mut(&df)
+                    .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
             } else {
                 out = Some(df);
             }
@@ -536,7 +602,6 @@ impl AnonymousScan for SasScan {
         Ok(Arc::new(schema))
     }
 }
-
 
 pub fn scan_sas7bdat(
     path: impl Into<std::path::PathBuf>,
@@ -583,8 +648,8 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let mut iter = sas_batch_iter(path, None, true, Some(10), None, Some(25))
-            .expect("batch iter");
+        let mut iter =
+            sas_batch_iter(path, None, true, Some(10), None, Some(25)).expect("batch iter");
         let mut batches = 0usize;
         let mut rows = 0usize;
         while let Some(batch) = iter.next() {

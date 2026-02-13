@@ -15,8 +15,8 @@ pub enum Format {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Compression {
     None,
-    Rle,  // SASYZCRL
-    Rdc,  // SASYZCR2
+    Rle, // SASYZCRL
+    Rdc, // SASYZCR2
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,12 +28,12 @@ pub enum Platform {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageType {
-    Meta,      // 0
-    Data,      // 256
-    Mix1,      // 512
-    Mix2,      // 640
-    Amd,       // 1024
-    Metc,      // 16384
+    Meta, // 0
+    Data, // 256
+    Mix1, // 512
+    Mix2, // 640
+    Amd,  // 1024
+    Metc, // 16384
     Invalid,
 }
 

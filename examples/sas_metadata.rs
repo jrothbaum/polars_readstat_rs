@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use polars_readstat_rs::sas::metadata_json;
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

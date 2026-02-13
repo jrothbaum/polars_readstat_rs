@@ -30,7 +30,11 @@ pub fn read_header<R: Read>(reader: &mut R) -> Result<Header> {
     let bias = read_f64(&buf[84..92], endian);
 
     let file_label = read_string(&buf[104..168]);
-    let data_label = if file_label.is_empty() { None } else { Some(file_label) };
+    let data_label = if file_label.is_empty() {
+        None
+    } else {
+        Some(file_label)
+    };
 
     let version = if rec_type == b"$FL2" { 2 } else { 3 };
 

@@ -1,5 +1,5 @@
-pub(crate) mod data;
 pub(crate) mod compress;
+pub(crate) mod data;
 pub(crate) mod encoding;
 pub(crate) mod error;
 pub(crate) mod header;
@@ -13,22 +13,15 @@ pub mod arrow_output;
 pub mod reader;
 pub mod writer;
 
-pub use error::{Error, Result};
-pub use reader::StataReader;
 pub use compress::{compress_df, CompressOptions};
-pub use writer::{
-    pandas_make_stata_column_names,
-    pandas_prepare_df_for_stata,
-    pandas_rename_df,
-    StataWriter,
-    ValueLabelMap,
-    ValueLabels,
-    VariableLabels,
-    StataWriteColumn,
-    StataWriteSchema,
-};
+pub use error::{Error, Result};
 pub use polars_output::scan_dta;
+pub use reader::StataReader;
 pub use types::{Endian, Header, Metadata, NumericType, VarType};
+pub use writer::{
+    pandas_make_stata_column_names, pandas_prepare_df_for_stata, pandas_rename_df,
+    StataWriteColumn, StataWriteSchema, StataWriter, ValueLabelMap, ValueLabels, VariableLabels,
+};
 
 use serde_json::json;
 use std::path::Path;
@@ -37,15 +30,19 @@ use std::path::Path;
 pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
     let reader = StataReader::open(path)?;
     let meta = reader.metadata();
-    let variables = meta.variables.iter().map(|v| {
-        json!({
-            "name": v.name,
-            "type": format!("{:?}", v.var_type),
-            "format": v.format,
-            "label": v.label,
-            "value_label_name": v.value_label_name,
+    let variables = meta
+        .variables
+        .iter()
+        .map(|v| {
+            json!({
+                "name": v.name,
+                "type": format!("{:?}", v.var_type),
+                "format": v.format,
+                "label": v.label,
+                "value_label_name": v.value_label_name,
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     let v = json!({
         "byte_order": format!("{:?}", meta.byte_order),
         "row_count": meta.row_count,

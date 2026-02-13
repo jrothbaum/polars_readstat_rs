@@ -17,7 +17,10 @@ fn main() -> PolarsResult<()> {
     let mut opts = ScanOptions::default();
     opts.missing_string_as_null = Some(false);
     opts.user_missing_as_null = Some(false);
-    if std::env::var("READSTAT_VALUE_LABELS_AS_STRINGS").ok().is_some() {
+    if std::env::var("READSTAT_VALUE_LABELS_AS_STRINGS")
+        .ok()
+        .is_some()
+    {
         opts.value_labels_as_strings = Some(true);
     } else {
         opts.value_labels_as_strings = Some(false);

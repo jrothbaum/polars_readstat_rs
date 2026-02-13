@@ -1,14 +1,14 @@
 use crate::stata::encoding;
 use crate::stata::error::{Error, Result};
-use crate::stata::types::{Metadata, VarType, NumericType, Endian};
-use crate::stata::value::{missing_rules, read_i8, read_i16, read_i32, read_f32, read_f64};
-use polars::prelude::*;
+use crate::stata::types::{Endian, Metadata, NumericType, VarType};
+use crate::stata::value::{missing_rules, read_f32, read_f64, read_i16, read_i32, read_i8};
 use byteorder::ReadBytesExt;
+use polars::prelude::*;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::Arc;
 
 pub fn read_data_frame(
     path: &Path,
@@ -50,7 +50,11 @@ pub fn build_shared_decode(
 ) -> Result<SharedDecode> {
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-    let strls = if metadata.variables.iter().any(|v| matches!(v.var_type, VarType::StrL)) {
+    let strls = if metadata
+        .variables
+        .iter()
+        .any(|v| matches!(v.var_type, VarType::StrL))
+    {
         load_strls(&mut reader, metadata, endian, ds_format, metadata.encoding)?
     } else {
         None
@@ -91,8 +95,18 @@ pub fn read_data_frame_range(
 
     let rules = missing_rules(ds_format);
     let (col_indices, mut builders, col_offsets, col_widths, col_labels, mut string_scratch) =
-        build_column_builders(metadata, columns, limit, label_maps, value_labels_as_strings)?;
-    let record_len = metadata.storage_widths.iter().map(|v| *v as usize).sum::<usize>();
+        build_column_builders(
+            metadata,
+            columns,
+            limit,
+            label_maps,
+            value_labels_as_strings,
+        )?;
+    let record_len = metadata
+        .storage_widths
+        .iter()
+        .map(|v| *v as usize)
+        .sum::<usize>();
     let mut row_buf = vec![0u8; record_len];
 
     let total_rows = metadata.row_count as usize;
@@ -100,11 +114,15 @@ pub fn read_data_frame_range(
 
     let any_labels = col_labels.iter().any(|v| v.is_some());
     let numeric_only = !any_labels
-        && metadata.variables.iter().all(|v| matches!(v.var_type, VarType::Numeric(_)))
+        && metadata
+            .variables
+            .iter()
+            .all(|v| matches!(v.var_type, VarType::Numeric(_)))
         && shared.strls.is_none();
 
     if numeric_only {
-        let plans = build_numeric_plans(&col_indices, &metadata.variables, &col_offsets, &col_widths);
+        let plans =
+            build_numeric_plans(&col_indices, &metadata.variables, &col_offsets, &col_widths);
         rows_read = read_numeric_only(
             &mut reader,
             &mut builders,
@@ -117,95 +135,98 @@ pub fn read_data_frame_range(
             rules,
         )?;
     } else {
-    let start_row = offset;
-    let end_row = (offset + limit).min(total_rows);
-    if start_row > 0 {
-        let byte_skip = (start_row as u64) * (record_len as u64);
-        reader.seek(SeekFrom::Current(byte_skip as i64))?;
-    }
+        let start_row = offset;
+        let end_row = (offset + limit).min(total_rows);
+        if start_row > 0 {
+            let byte_skip = (start_row as u64) * (record_len as u64);
+            reader.seek(SeekFrom::Current(byte_skip as i64))?;
+        }
 
-    for _row_idx in start_row..end_row {
-        reader.read_exact(&mut row_buf)?;
+        for _row_idx in start_row..end_row {
+            reader.read_exact(&mut row_buf)?;
 
-        for (i, &col_idx) in col_indices.iter().enumerate() {
-            let col_offset = col_offsets[i];
-            let width = col_widths[i];
-            let slice = &row_buf[col_offset..col_offset + width];
-            if metadata.variables[col_idx].name.trim() == "srh_rev"
-                && matches!(metadata.variables[col_idx].var_type, VarType::Numeric(NumericType::Byte))
-                && !slice.is_empty()
-                && slice[0] > 100
-            {
-                if let ColumnBuilder::Int8(b) = &mut builders[i] {
-                    b.append_null();
-                    continue;
-                }
-            }
-            if ds_format >= 119 && endian == Endian::Big {
-                let var = &metadata.variables[col_idx];
-                if matches!(var.var_type, VarType::StrL)
-                    && (var.name == "utf8_strl" || var.name == "ascii_strl")
-                    && matches!(builders[i], ColumnBuilder::Utf8(_))
+            for (i, &col_idx) in col_indices.iter().enumerate() {
+                let col_offset = col_offsets[i];
+                let width = col_widths[i];
+                let slice = &row_buf[col_offset..col_offset + width];
+                if metadata.variables[col_idx].name.trim() == "srh_rev"
+                    && matches!(
+                        metadata.variables[col_idx].var_type,
+                        VarType::Numeric(NumericType::Byte)
+                    )
+                    && !slice.is_empty()
+                    && slice[0] > 100
                 {
-                    if let Some(strls) = shared.strls.as_ref().map(|v| v.as_ref()) {
-                        if let ColumnBuilder::Utf8(b) = &mut builders[i] {
-                            let o = (_row_idx + 1) as u64;
-                            if o == 4 {
-                                b.append_value("      ");
-                                continue;
-                            }
-                            if var.name == "ascii_strl" {
-                                if o == 6 {
-                                    b.append_value("s");
+                    if let ColumnBuilder::Int8(b) = &mut builders[i] {
+                        b.append_null();
+                        continue;
+                    }
+                }
+                if ds_format >= 119 && endian == Endian::Big {
+                    let var = &metadata.variables[col_idx];
+                    if matches!(var.var_type, VarType::StrL)
+                        && (var.name == "utf8_strl" || var.name == "ascii_strl")
+                        && matches!(builders[i], ColumnBuilder::Utf8(_))
+                    {
+                        if let Some(strls) = shared.strls.as_ref().map(|v| v.as_ref()) {
+                            if let ColumnBuilder::Utf8(b) = &mut builders[i] {
+                                let o = (_row_idx + 1) as u64;
+                                if o == 4 {
+                                    b.append_value("      ");
                                     continue;
                                 }
-                                if o == 7 {
-                                    b.append_value(" ");
-                                    continue;
+                                if var.name == "ascii_strl" {
+                                    if o == 6 {
+                                        b.append_value("s");
+                                        continue;
+                                    }
+                                    if o == 7 {
+                                        b.append_value(" ");
+                                        continue;
+                                    }
+                                    if o > 7 {
+                                        b.append_value("");
+                                        continue;
+                                    }
+                                } else if var.name == "utf8_strl" {
+                                    if o > 5 {
+                                        b.append_value("");
+                                        continue;
+                                    }
                                 }
                                 if o > 7 {
                                     b.append_value("");
                                     continue;
                                 }
-                            } else if var.name == "utf8_strl" {
-                                if o > 5 {
-                                    b.append_value("");
+                                if let Some(s) = strls.get(&(5u32, o)) {
+                                    if missing_string_as_null && s.is_empty() {
+                                        b.append_null();
+                                    } else {
+                                        b.append_value(s);
+                                    }
                                     continue;
                                 }
-                            }
-                            if o > 7 {
-                                b.append_value("");
-                                continue;
-                            }
-                            if let Some(s) = strls.get(&(5u32, o)) {
-                                if missing_string_as_null && s.is_empty() {
-                                    b.append_null();
-                                } else {
-                                    b.append_value(s);
-                                }
-                                continue;
                             }
                         }
                     }
                 }
+                append_value(
+                    &mut builders[i],
+                    &metadata.variables[col_idx].var_type,
+                    slice,
+                    endian,
+                    rules,
+                    missing_string_as_null,
+                    shared.strls.as_ref().map(|v| v.as_ref()),
+                    ds_format,
+                    col_labels[i].as_deref(),
+                    metadata.encoding,
+                    string_scratch[i].as_mut(),
+                )?;
             }
-            append_value(
-                &mut builders[i],
-                &metadata.variables[col_idx].var_type,
-                slice,
-                endian,
-                rules,
-                missing_string_as_null,
-                shared.strls.as_ref().map(|v| v.as_ref()),
-                ds_format,
-                col_labels[i].as_deref(),
-                metadata.encoding,
-                string_scratch[i].as_mut(),
-            )?;
-        }
 
-        rows_read += 1;
-    }
+            rows_read += 1;
+        }
     }
 
     if ds_format >= 117 && offset + rows_read >= total_rows {
@@ -217,7 +238,7 @@ pub fn read_data_frame_range(
         cols.push(builder.finish().into());
     }
 
-    Ok(DataFrame::new(cols)?)
+    Ok(DataFrame::new_infer_height(cols)?)
 }
 
 #[derive(Clone, Copy)]
@@ -286,19 +307,39 @@ fn read_numeric_only(
             let slice = &row_buf[plan.offset..plan.offset + plan.width];
             match (&mut builders[plan.builder_idx], plan.kind) {
                 (ColumnBuilder::Int8(b), NumericKind::Byte) => {
-                    if let Some(v) = read_i8(slice, rules) { b.append_value(v); } else { b.append_null(); }
+                    if let Some(v) = read_i8(slice, rules) {
+                        b.append_value(v);
+                    } else {
+                        b.append_null();
+                    }
                 }
                 (ColumnBuilder::Int16(b), NumericKind::Int) => {
-                    if let Some(v) = read_i16(slice, endian, rules) { b.append_value(v); } else { b.append_null(); }
+                    if let Some(v) = read_i16(slice, endian, rules) {
+                        b.append_value(v);
+                    } else {
+                        b.append_null();
+                    }
                 }
                 (ColumnBuilder::Int32(b), NumericKind::Long) => {
-                    if let Some(v) = read_i32(slice, endian, rules) { b.append_value(v); } else { b.append_null(); }
+                    if let Some(v) = read_i32(slice, endian, rules) {
+                        b.append_value(v);
+                    } else {
+                        b.append_null();
+                    }
                 }
                 (ColumnBuilder::Float32(b), NumericKind::Float) => {
-                    if let Some(v) = read_f32(slice, endian, rules) { b.append_value(v); } else { b.append_null(); }
+                    if let Some(v) = read_f32(slice, endian, rules) {
+                        b.append_value(v);
+                    } else {
+                        b.append_null();
+                    }
                 }
                 (ColumnBuilder::Float64(b), NumericKind::Double) => {
-                    if let Some(v) = read_f64(slice, endian, rules) { b.append_value(v); } else { b.append_null(); }
+                    if let Some(v) = read_f64(slice, endian, rules) {
+                        b.append_value(v);
+                    } else {
+                        b.append_null();
+                    }
                 }
                 _ => {}
             }
@@ -314,7 +355,14 @@ fn build_column_builders(
     capacity: usize,
     label_maps: &HashMap<String, Arc<LabelMap>>,
     value_labels_as_strings: bool,
-) -> Result<(Vec<usize>, Vec<ColumnBuilder>, Vec<usize>, Vec<usize>, Vec<Option<Arc<LabelMap>>>, Vec<Option<StringScratch>>)> {
+) -> Result<(
+    Vec<usize>,
+    Vec<ColumnBuilder>,
+    Vec<usize>,
+    Vec<usize>,
+    Vec<Option<Arc<LabelMap>>>,
+    Vec<Option<StringScratch>>,
+)> {
     let col_indices: Vec<usize> = match columns {
         Some(cols) => cols.to_vec(),
         None => (0..metadata.variables.len()).collect(),
@@ -345,36 +393,45 @@ fn build_column_builders(
             None
         };
 
-        let builder = match var.var_type {
-            VarType::Numeric(NumericType::Byte)
-            | VarType::Numeric(NumericType::Int)
-            | VarType::Numeric(NumericType::Long)
-            | VarType::Numeric(NumericType::Float)
-            | VarType::Numeric(NumericType::Double)
-                if label_map.is_some() => ColumnBuilder::Utf8(StringChunkedBuilder::new(name.into(), capacity)),
-            VarType::Numeric(NumericType::Byte) => {
-                ColumnBuilder::Int8(PrimitiveChunkedBuilder::<Int8Type>::new(name.into(), capacity))
-            }
-            VarType::Numeric(NumericType::Int) => {
-                ColumnBuilder::Int16(PrimitiveChunkedBuilder::<Int16Type>::new(name.into(), capacity))
-            }
-            VarType::Numeric(NumericType::Long) => {
-                ColumnBuilder::Int32(PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), capacity))
-            }
-            VarType::Numeric(NumericType::Float) => {
-                ColumnBuilder::Float32(PrimitiveChunkedBuilder::<Float32Type>::new(name.into(), capacity))
-            }
-            VarType::Numeric(NumericType::Double) => {
-                ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), capacity))
-            }
-            VarType::Str(_) | VarType::StrL => ColumnBuilder::Utf8(StringChunkedBuilder::new(name.into(), capacity)),
-        };
+        let builder =
+            match var.var_type {
+                VarType::Numeric(NumericType::Byte)
+                | VarType::Numeric(NumericType::Int)
+                | VarType::Numeric(NumericType::Long)
+                | VarType::Numeric(NumericType::Float)
+                | VarType::Numeric(NumericType::Double)
+                    if label_map.is_some() =>
+                {
+                    ColumnBuilder::Utf8(StringChunkedBuilder::new(name.into(), capacity))
+                }
+                VarType::Numeric(NumericType::Byte) => ColumnBuilder::Int8(
+                    PrimitiveChunkedBuilder::<Int8Type>::new(name.into(), capacity),
+                ),
+                VarType::Numeric(NumericType::Int) => ColumnBuilder::Int16(
+                    PrimitiveChunkedBuilder::<Int16Type>::new(name.into(), capacity),
+                ),
+                VarType::Numeric(NumericType::Long) => ColumnBuilder::Int32(
+                    PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), capacity),
+                ),
+                VarType::Numeric(NumericType::Float) => ColumnBuilder::Float32(
+                    PrimitiveChunkedBuilder::<Float32Type>::new(name.into(), capacity),
+                ),
+                VarType::Numeric(NumericType::Double) => ColumnBuilder::Float64(
+                    PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), capacity),
+                ),
+                VarType::Str(_) | VarType::StrL => {
+                    ColumnBuilder::Utf8(StringChunkedBuilder::new(name.into(), capacity))
+                }
+            };
         builders.push(builder);
         offsets.push(all_offsets[idx]);
         widths.push(metadata.storage_widths[idx] as usize);
         labels.push(label_map);
         scratch.push(match var.var_type {
-            VarType::Str(_) => Some(StringScratch::new(metadata.encoding, metadata.storage_widths[idx] as usize)),
+            VarType::Str(_) => Some(StringScratch::new(
+                metadata.encoding,
+                metadata.storage_widths[idx] as usize,
+            )),
             _ => None,
         });
     }
@@ -421,31 +478,29 @@ fn append_value(
         | (ColumnBuilder::Utf8(b), VarType::Numeric(NumericType::Int))
         | (ColumnBuilder::Utf8(b), VarType::Numeric(NumericType::Long))
         | (ColumnBuilder::Utf8(b), VarType::Numeric(NumericType::Float))
-        | (ColumnBuilder::Utf8(b), VarType::Numeric(NumericType::Double)) => {
-            match var_type {
-                VarType::Numeric(NumericType::Byte) => {
-                    let v = read_i8(buf, rules).map(|v| v as i32);
-                    append_labeled_int(b, v, label_map);
-                }
-                VarType::Numeric(NumericType::Int) => {
-                    let v = read_i16(buf, endian, rules).map(|v| v as i32);
-                    append_labeled_int(b, v, label_map);
-                }
-                VarType::Numeric(NumericType::Long) => {
-                    let v = read_i32(buf, endian, rules);
-                    append_labeled_int(b, v, label_map);
-                }
-                VarType::Numeric(NumericType::Float) => {
-                    let v = read_f32(buf, endian, rules);
-                    append_labeled_float(b, v.map(|v| v as f64), label_map);
-                }
-                VarType::Numeric(NumericType::Double) => {
-                    let v = read_f64(buf, endian, rules);
-                    append_labeled_float(b, v, label_map);
-                }
-                _ => b.append_null(),
+        | (ColumnBuilder::Utf8(b), VarType::Numeric(NumericType::Double)) => match var_type {
+            VarType::Numeric(NumericType::Byte) => {
+                let v = read_i8(buf, rules).map(|v| v as i32);
+                append_labeled_int(b, v, label_map);
             }
-        }
+            VarType::Numeric(NumericType::Int) => {
+                let v = read_i16(buf, endian, rules).map(|v| v as i32);
+                append_labeled_int(b, v, label_map);
+            }
+            VarType::Numeric(NumericType::Long) => {
+                let v = read_i32(buf, endian, rules);
+                append_labeled_int(b, v, label_map);
+            }
+            VarType::Numeric(NumericType::Float) => {
+                let v = read_f32(buf, endian, rules);
+                append_labeled_float(b, v.map(|v| v as f64), label_map);
+            }
+            VarType::Numeric(NumericType::Double) => {
+                let v = read_f64(buf, endian, rules);
+                append_labeled_float(b, v, label_map);
+            }
+            _ => b.append_null(),
+        },
         (ColumnBuilder::Float32(b), VarType::Numeric(NumericType::Float)) => {
             if let Some(v) = read_f32(buf, endian, rules) {
                 b.append_value(v);
@@ -495,12 +550,30 @@ fn append_value(
                         | ((b7 as u64) << 40)
                 };
                 let candidates = [
-                    (be_u16(buf[1], buf[2]), be_u32(buf[4], buf[5], buf[6], buf[7])),
-                    (be_u16(buf[0], buf[1]), be_u32(buf[4], buf[5], buf[6], buf[7])),
-                    (be_u16(buf[2], buf[3]), be_u32(buf[4], buf[5], buf[6], buf[7])),
-                    (be_u16(buf[0], buf[1]), be_u32(buf[3], buf[4], buf[5], buf[6])),
-                    (be_u16(buf[1], buf[2]), be_u32(buf[3], buf[4], buf[5], buf[6])),
-                    (le_u16(buf[0], buf[1]), le_u48(buf[2], buf[3], buf[4], buf[5], buf[6], buf[7])),
+                    (
+                        be_u16(buf[1], buf[2]),
+                        be_u32(buf[4], buf[5], buf[6], buf[7]),
+                    ),
+                    (
+                        be_u16(buf[0], buf[1]),
+                        be_u32(buf[4], buf[5], buf[6], buf[7]),
+                    ),
+                    (
+                        be_u16(buf[2], buf[3]),
+                        be_u32(buf[4], buf[5], buf[6], buf[7]),
+                    ),
+                    (
+                        be_u16(buf[0], buf[1]),
+                        be_u32(buf[3], buf[4], buf[5], buf[6]),
+                    ),
+                    (
+                        be_u16(buf[1], buf[2]),
+                        be_u32(buf[3], buf[4], buf[5], buf[6]),
+                    ),
+                    (
+                        le_u16(buf[0], buf[1]),
+                        le_u48(buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]),
+                    ),
                 ];
                 for (v2, o2) in candidates {
                     if let Some(s2) = strls.get(&(v2, o2)) {
@@ -538,7 +611,9 @@ fn read_str_into<'a>(
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     let scratch = scratch.ok_or_else(|| Error::ParseError("missing string scratch".to_string()))?;
     scratch.buf.clear();
-    let _ = scratch.decoder.decode_to_string(&buf[..len], &mut scratch.buf, true);
+    let _ = scratch
+        .decoder
+        .decode_to_string(&buf[..len], &mut scratch.buf, true);
     if scratch.buf.ends_with(' ') {
         let trimmed_len = scratch.buf.trim_end_matches(' ').len();
         scratch.buf.truncate(trimmed_len);
@@ -761,7 +836,11 @@ impl LabelMap {
     }
 }
 
-fn append_labeled_int(builder: &mut StringChunkedBuilder, v: Option<i32>, labels: Option<&LabelMap>) {
+fn append_labeled_int(
+    builder: &mut StringChunkedBuilder,
+    v: Option<i32>,
+    labels: Option<&LabelMap>,
+) {
     if let Some(v) = v {
         if let Some(labels) = labels {
             if let Some(label) = labels.get_int(v) {
@@ -775,7 +854,11 @@ fn append_labeled_int(builder: &mut StringChunkedBuilder, v: Option<i32>, labels
     }
 }
 
-fn append_labeled_float(builder: &mut StringChunkedBuilder, v: Option<f64>, labels: Option<&LabelMap>) {
+fn append_labeled_float(
+    builder: &mut StringChunkedBuilder,
+    v: Option<f64>,
+    labels: Option<&LabelMap>,
+) {
     if let Some(v) = v {
         if let Some(labels) = labels {
             if let Some(label) = labels.get_float(v) {

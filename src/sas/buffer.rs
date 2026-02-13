@@ -19,11 +19,16 @@ impl Buffer {
     }
 
     pub fn get_bytes(&self, offset: usize, length: usize) -> Result<&[u8]> {
-        self.data.get(offset..offset + length).ok_or(Error::BufferOutOfBounds { offset, length })
+        self.data
+            .get(offset..offset + length)
+            .ok_or(Error::BufferOutOfBounds { offset, length })
     }
 
     pub fn get_u8(&self, offset: usize) -> Result<u8> {
-        self.data.get(offset).copied().ok_or(Error::BufferOutOfBounds { offset, length: 1 })
+        self.data
+            .get(offset)
+            .copied()
+            .ok_or(Error::BufferOutOfBounds { offset, length: 1 })
     }
 
     pub fn get_u16(&self, offset: usize) -> Result<u16> {
@@ -78,9 +83,9 @@ impl Buffer {
     pub fn get_string(&self, offset: usize, length: usize) -> Result<String> {
         let bytes = self.get_bytes(offset, length)?;
         let trimmed = trim_sas_string(bytes);
-        String::from_utf8(trimmed.to_vec()).map_err(|_| Error::Encoding("Invalid UTF-8".to_string()))
+        String::from_utf8(trimmed.to_vec())
+            .map_err(|_| Error::Encoding("Invalid UTF-8".to_string()))
     }
-
 }
 
 /// Trim SAS string (remove leading/trailing whitespace and trailing nulls)

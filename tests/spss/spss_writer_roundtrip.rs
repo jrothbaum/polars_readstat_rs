@@ -19,10 +19,11 @@ fn temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
 
 #[test]
 fn test_spss_roundtrip_basic() {
-    let df = DataFrame::new(vec![
+    let df = DataFrame::new_infer_height(vec![
         Series::new("id".into(), &[1i32, 2, 3]).into_column(),
         Series::new("name".into(), &["alice", "bob", "carol"]).into_column(),
-    ]).unwrap();
+    ])
+    .unwrap();
 
     let path = temp_path("spss_roundtrip", "sav");
     SpssWriter::new(&path).write_df(&df).unwrap();
@@ -38,7 +39,9 @@ fn assert_df_equal(left: &DataFrame, right: &DataFrame) -> PolarsResult<()> {
         return Err(PolarsError::ComputeError("dataframe shape mismatch".into()));
     }
     if left.schema() != right.schema() {
-        return Err(PolarsError::ComputeError("dataframe schema mismatch".into()));
+        return Err(PolarsError::ComputeError(
+            "dataframe schema mismatch".into(),
+        ));
     }
     let cols = left.get_column_names_owned();
     for i in 0..left.height() {
@@ -135,8 +138,14 @@ fn test_spss_roundtrip_all_files() {
             }
         };
         for name in df_base.get_column_names() {
-            let base_dtype = df_base.column(name).map(|s| s.dtype()).unwrap_or(&DataType::String);
-            let label_dtype = df_labels.column(name).map(|s| s.dtype()).unwrap_or(&DataType::String);
+            let base_dtype = df_base
+                .column(name)
+                .map(|s| s.dtype())
+                .unwrap_or(&DataType::String);
+            let label_dtype = df_labels
+                .column(name)
+                .map(|s| s.dtype())
+                .unwrap_or(&DataType::String);
             if base_dtype != label_dtype && label_dtype != &DataType::String {
                 panic!(
                     "unexpected dtype change for {}: base={:?} labels={:?}",
@@ -164,6 +173,5 @@ fn test_spss_roundtrip_all_files() {
             }
         }
         let _ = fs::remove_file(&out_path);
-
     }
 }

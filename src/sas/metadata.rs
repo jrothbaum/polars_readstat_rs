@@ -235,11 +235,16 @@ impl MetadataBuilder {
             let text_offset = offset + integer_size;
             let text_bytes = buf.get_bytes(text_offset, text_block_size)?;
 
-
             // Check for compression signatures (these are ASCII so no encoding needed)
-            if text_bytes.windows(COMPRESSION_SIGNATURE_RLE.len()).any(|w| w == COMPRESSION_SIGNATURE_RLE.as_bytes()) {
+            if text_bytes
+                .windows(COMPRESSION_SIGNATURE_RLE.len())
+                .any(|w| w == COMPRESSION_SIGNATURE_RLE.as_bytes())
+            {
                 self.compression = Compression::Rle;
-            } else if text_bytes.windows(COMPRESSION_SIGNATURE_RDC.len()).any(|w| w == COMPRESSION_SIGNATURE_RDC.as_bytes()) {
+            } else if text_bytes
+                .windows(COMPRESSION_SIGNATURE_RDC.len())
+                .any(|w| w == COMPRESSION_SIGNATURE_RDC.as_bytes())
+            {
                 self.compression = Compression::Rdc;
             }
 
@@ -356,8 +361,10 @@ impl MetadataBuilder {
         let label_length = buf.get_u16(base_offset + 32)? as usize;
 
         // Extract format and label strings from text blocks
-        let column_format = self.extract_text_from_text_block(format_idx, format_offset, format_length)?;
-        let column_label = self.extract_text_from_text_block(label_idx, label_offset, label_length)?;
+        let column_format =
+            self.extract_text_from_text_block(format_idx, format_offset, format_length)?;
+        let column_label =
+            self.extract_text_from_text_block(label_idx, label_offset, label_length)?;
 
         // Assign to the next column sequentially
         if self.next_format_label_position < self.columns.len() {
@@ -369,7 +376,12 @@ impl MetadataBuilder {
         Ok(())
     }
 
-    fn extract_text_from_text_block(&self, text_idx: usize, offset: usize, length: usize) -> Result<String> {
+    fn extract_text_from_text_block(
+        &self,
+        text_idx: usize,
+        offset: usize,
+        length: usize,
+    ) -> Result<String> {
         // C++ code: get_column_text_substr uses text_idx to index into column_texts
         if text_idx < self.column_texts.len() {
             let text_bytes = &self.column_texts[text_idx];
@@ -386,7 +398,8 @@ impl MetadataBuilder {
             let extracted_bytes = &text_bytes[offset..offset + length];
 
             // Decode using the file's encoding
-            let decoded = encoding::decode_string(extracted_bytes, self.encoding_byte, self.encoding);
+            let decoded =
+                encoding::decode_string(extracted_bytes, self.encoding_byte, self.encoding);
 
             // Trim whitespace and unprintable characters
             Ok(decoded.trim().to_string())
@@ -407,7 +420,8 @@ impl MetadataBuilder {
             return Err(Error::ParseError(format!(
                 "Failed to parse column names: {} of {} columns have empty names. \
                  This indicates missing or incorrectly parsed COLUMN_NAME subheaders.",
-                empty_count, self.columns.len()
+                empty_count,
+                self.columns.len()
             )));
         }
 

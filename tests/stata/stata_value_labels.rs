@@ -17,10 +17,11 @@ fn temp_path(prefix: &str, ext: &str) -> std::path::PathBuf {
 
 #[test]
 fn test_stata_value_labels_roundtrip() {
-    let df = DataFrame::new(vec![
+    let df = DataFrame::new_infer_height(vec![
         Series::new("status".into(), &[1i32, 2, 3]).into_column(),
         Series::new("other".into(), &[10i32, 20, 30]).into_column(),
-    ]).unwrap();
+    ])
+    .unwrap();
 
     let mut mapping: ValueLabelMap = BTreeMap::new();
     mapping.insert(1, "one".to_string());
@@ -33,7 +34,10 @@ fn test_stata_value_labels_roundtrip() {
     let path = temp_path("stata_value_labels", "dta");
     StataWriter::new(&path)
         .with_value_labels(labels.clone())
-        .with_variable_labels(VariableLabels::from([("status".to_string(), "Status Label".to_string())]))
+        .with_variable_labels(VariableLabels::from([(
+            "status".to_string(),
+            "Status Label".to_string(),
+        )]))
         .write_df(&df)
         .unwrap();
 
@@ -44,10 +48,18 @@ fn test_stata_value_labels_roundtrip() {
     assert_eq!(var.value_label_name.as_deref(), Some("status"));
     assert_eq!(var.label.as_deref(), Some("Status Label"));
 
-    let label = meta.value_labels.iter().find(|v| v.name == "status").unwrap();
+    let label = meta
+        .value_labels
+        .iter()
+        .find(|v| v.name == "status")
+        .unwrap();
     assert_eq!(label.mapping.len(), 6);
 
-    let df_labeled = reader.read().value_labels_as_strings(true).finish().unwrap();
+    let df_labeled = reader
+        .read()
+        .value_labels_as_strings(true)
+        .finish()
+        .unwrap();
     let status = df_labeled.column("status").unwrap().str().unwrap();
     let values: Vec<Option<&str>> = status.into_iter().collect();
     assert_eq!(values, vec![Some("one"), Some("two"), Some("three")]);

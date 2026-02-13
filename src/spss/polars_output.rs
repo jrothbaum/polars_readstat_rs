@@ -7,13 +7,10 @@ use rayon::ThreadPoolBuilder;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
-use std::thread::JoinHandle;
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
-pub fn scan_sav(
-    path: impl Into<PathBuf>,
-    opts: crate::ScanOptions,
-) -> PolarsResult<LazyFrame> {
+pub fn scan_sav(path: impl Into<PathBuf>, opts: crate::ScanOptions) -> PolarsResult<LazyFrame> {
     let path = path.into();
     let missing_string_as_null = opts.missing_string_as_null.unwrap_or(true);
     let user_missing_as_null = opts.user_missing_as_null.unwrap_or(true);
@@ -60,8 +57,18 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let mut iter = spss_batch_iter(path, None, true, true, true, Some(10), false, None, Some(25))
-            .expect("batch iter");
+        let mut iter = spss_batch_iter(
+            path,
+            None,
+            true,
+            true,
+            true,
+            Some(10),
+            false,
+            None,
+            Some(25),
+        )
+        .expect("batch iter");
         let mut batches = 0usize;
         let mut rows = 0usize;
         while let Some(batch) = iter.next() {
@@ -164,7 +171,9 @@ impl Iterator for SerialSpssBatchIter {
         if let Some(cols) = &self.cols {
             builder = builder.with_columns(cols.clone());
         }
-        let out = builder.finish().map_err(|e| PolarsError::ComputeError(e.to_string().into()));
+        let out = builder
+            .finish()
+            .map_err(|e| PolarsError::ComputeError(e.to_string().into()));
         self.offset += take;
         self.remaining -= take;
         Some(out)
@@ -182,8 +191,8 @@ pub(crate) fn spss_batch_iter(
     cols: Option<Vec<String>>,
     n_rows: Option<usize>,
 ) -> PolarsResult<SpssBatchIter> {
-    let reader = SpssReader::open(&path)
-        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+    let reader =
+        SpssReader::open(&path).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
     let schema = Arc::new(build_schema(reader.metadata(), value_labels_as_strings));
     let total = n_rows.unwrap_or(reader.metadata().row_count as usize);
     let batch_size = chunk_size.unwrap_or(100_000).max(1);
@@ -198,18 +207,21 @@ pub(crate) fn spss_batch_iter(
         let path = Arc::new(path);
         let metadata = Arc::new(reader.metadata().clone());
         let endian = reader.endian();
-        let cols_idx = cols.as_ref().map(|names| {
-            names
-                .iter()
-                .map(|name| {
-                    metadata
-                        .variables
-                        .iter()
-                        .position(|v| v.name == *name)
-                        .ok_or_else(|| PolarsError::ColumnNotFound(name.clone().into()))
-                })
-                .collect::<Result<Vec<_>, _>>()
-        }).transpose()?;
+        let cols_idx = cols
+            .as_ref()
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| {
+                        metadata
+                            .variables
+                            .iter()
+                            .position(|v| v.name == *name)
+                            .ok_or_else(|| PolarsError::ColumnNotFound(name.clone().into()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
         let missing_null = missing_string_as_null;
         let user_missing = user_missing_as_null;
         let labels_as_strings = value_labels_as_strings;
@@ -218,28 +230,30 @@ pub(crate) fn spss_batch_iter(
             let pool = ThreadPoolBuilder::new().num_threads(n_threads).build();
             if let Ok(pool) = pool {
                 pool.install(|| {
-                    (0..n_chunks).into_par_iter().for_each_with(tx, |sender, i| {
-                        let start = i * batch_size;
-                        if start >= total {
-                            return;
-                        }
-                        let end = (total).min(start + batch_size);
-                        let cnt = end - start;
-                        let result = read_data_columns_uncompressed(
-                            &path,
-                            &metadata,
-                            endian,
-                            cols_idx.as_deref(),
-                            start,
-                            cnt,
-                            missing_null,
-                            user_missing,
-                            labels_as_strings,
-                        )
-                        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
-                        .and_then(columns_to_df);
-                        let _ = sender.send((i, result));
-                    });
+                    (0..n_chunks)
+                        .into_par_iter()
+                        .for_each_with(tx, |sender, i| {
+                            let start = i * batch_size;
+                            if start >= total {
+                                return;
+                            }
+                            let end = (total).min(start + batch_size);
+                            let cnt = end - start;
+                            let result = read_data_columns_uncompressed(
+                                &path,
+                                &metadata,
+                                endian,
+                                cols_idx.as_deref(),
+                                start,
+                                cnt,
+                                missing_null,
+                                user_missing,
+                                labels_as_strings,
+                            )
+                            .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
+                            .and_then(columns_to_df);
+                            let _ = sender.send((i, result));
+                        });
                 });
             }
         });
@@ -272,7 +286,7 @@ pub(crate) fn spss_batch_iter(
 
 fn columns_to_df(cols: Vec<Series>) -> PolarsResult<DataFrame> {
     let columns = cols.into_iter().map(Column::from).collect::<Vec<_>>();
-    DataFrame::new(columns)
+    DataFrame::new_infer_height(columns)
 }
 
 pub struct SpssScan {
@@ -311,10 +325,14 @@ impl SpssScan {
 }
 
 impl AnonymousScan for SpssScan {
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn scan(&self, opts: AnonymousScanArgs) -> PolarsResult<DataFrame> {
-        let cols = opts.with_columns.map(|c| c.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let cols = opts
+            .with_columns
+            .map(|c| c.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         let iter = spss_batch_iter(
             self.path.clone(),
             self.threads,
@@ -331,7 +349,8 @@ impl AnonymousScan for SpssScan {
         let mut out: Option<DataFrame> = None;
         while let Some(df) = prefetch.next()? {
             if let Some(acc) = out.as_mut() {
-                acc.vstack_mut(&df).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+                acc.vstack_mut(&df)
+                    .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
             } else {
                 out = Some(df);
             }
@@ -357,10 +376,7 @@ impl AnonymousScan for SpssScan {
     }
 }
 
-fn build_schema(
-    metadata: &crate::spss::types::Metadata,
-    value_labels_as_strings: bool,
-) -> Schema {
+fn build_schema(metadata: &crate::spss::types::Metadata, value_labels_as_strings: bool) -> Schema {
     let mut schema = Schema::with_capacity(metadata.variables.len());
     for var in &metadata.variables {
         let dtype = if value_labels_as_strings && var.value_label.is_some() {

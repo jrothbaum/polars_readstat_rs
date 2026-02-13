@@ -55,12 +55,24 @@ impl RleDecompressor {
                     src_pos += 1;
 
                     let count = 64 + (end_of_first_byte as usize * 256) + next_byte + 4096;
-                    self.copy_bytes(input, &mut src_pos, &mut output, count, expected_output_size)?;
+                    self.copy_bytes(
+                        input,
+                        &mut src_pos,
+                        &mut output,
+                        count,
+                        expected_output_size,
+                    )?;
                 }
                 COPY96 => {
                     // Copy end_of_first_byte + 96 bytes
                     let count = end_of_first_byte as usize + 96;
-                    self.copy_bytes(input, &mut src_pos, &mut output, count, expected_output_size)?;
+                    self.copy_bytes(
+                        input,
+                        &mut src_pos,
+                        &mut output,
+                        count,
+                        expected_output_size,
+                    )?;
                 }
                 COPY64 => {
                     // Copy (end_of_first_byte << 8) + next_byte + 64 bytes
@@ -71,7 +83,13 @@ impl RleDecompressor {
                     src_pos += 1;
 
                     let count = ((end_of_first_byte as usize) << 8) + next_byte + 64;
-                    self.copy_bytes(input, &mut src_pos, &mut output, count, expected_output_size)?;
+                    self.copy_bytes(
+                        input,
+                        &mut src_pos,
+                        &mut output,
+                        count,
+                        expected_output_size,
+                    )?;
                 }
                 INSERT_BYTE18 => {
                     // Insert (end_of_first_byte << 4) + next_byte + 18 copies of byte_to_insert
@@ -126,22 +144,46 @@ impl RleDecompressor {
                 COPY1 => {
                     // Copy end_of_first_byte + 1 bytes
                     let count = end_of_first_byte as usize + 1;
-                    self.copy_bytes(input, &mut src_pos, &mut output, count, expected_output_size)?;
+                    self.copy_bytes(
+                        input,
+                        &mut src_pos,
+                        &mut output,
+                        count,
+                        expected_output_size,
+                    )?;
                 }
                 COPY17 => {
                     // Copy end_of_first_byte + 17 bytes
                     let count = end_of_first_byte as usize + 17;
-                    self.copy_bytes(input, &mut src_pos, &mut output, count, expected_output_size)?;
+                    self.copy_bytes(
+                        input,
+                        &mut src_pos,
+                        &mut output,
+                        count,
+                        expected_output_size,
+                    )?;
                 }
                 COPY33 => {
                     // Copy end_of_first_byte + 33 bytes
                     let count = end_of_first_byte as usize + 33;
-                    self.copy_bytes(input, &mut src_pos, &mut output, count, expected_output_size)?;
+                    self.copy_bytes(
+                        input,
+                        &mut src_pos,
+                        &mut output,
+                        count,
+                        expected_output_size,
+                    )?;
                 }
                 COPY49 => {
                     // Copy end_of_first_byte + 49 bytes
                     let count = end_of_first_byte as usize + 49;
-                    self.copy_bytes(input, &mut src_pos, &mut output, count, expected_output_size)?;
+                    self.copy_bytes(
+                        input,
+                        &mut src_pos,
+                        &mut output,
+                        count,
+                        expected_output_size,
+                    )?;
                 }
                 INSERT_BYTE3 => {
                     // Insert end_of_first_byte + 3 copies of next byte
@@ -256,4 +298,3 @@ mod tests {
         assert_eq!(output, b"AAAAA");
     }
 }
-

@@ -1,6 +1,8 @@
-use polars_readstat_rs::{pandas_prepare_df_for_stata, StataReader, StataWriter};
-use polars::prelude::*;
 use polars::frame::row::Row;
+use polars::prelude::*;
+use polars_readstat_rs::{
+    pandas_prepare_df_for_stata, StataReader, StataWriteColumn, StataWriteSchema, StataWriter,
+};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -28,11 +30,51 @@ fn temp_dta_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    std::env::temp_dir().join(format!("polars_readstat_rs_roundtrip_{}_{}.dta", pid, nanos))
+    std::env::temp_dir().join(format!(
+        "polars_readstat_rs_roundtrip_{}_{}.dta",
+        pid, nanos
+    ))
+}
+
+fn schema_from_df(df: &DataFrame) -> StataWriteSchema {
+    let columns = df
+        .columns()
+        .iter()
+        .map(|col| {
+            let s = col.as_materialized_series();
+            let string_width_bytes = if matches!(s.dtype(), DataType::String) {
+                let mut max_len = 1usize;
+                if let Ok(utf8) = s.str() {
+                    for opt in utf8.into_iter() {
+                        if let Some(v) = opt {
+                            max_len = max_len.max(v.len());
+                        }
+                    }
+                }
+                Some(max_len)
+            } else {
+                None
+            };
+            StataWriteColumn {
+                name: s.name().to_string(),
+                dtype: s.dtype().clone(),
+                string_width_bytes,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    StataWriteSchema {
+        columns,
+        row_count: None,
+        value_labels: None,
+        variable_labels: None,
+    }
 }
 
 fn is_small_file(path: &PathBuf, max_bytes: u64) -> bool {
-    std::fs::metadata(path).map(|m| m.len() <= max_bytes).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.len() <= max_bytes)
+        .unwrap_or(false)
 }
 
 fn collect_small_dta_files(max_bytes: u64) -> Vec<PathBuf> {
@@ -62,7 +104,9 @@ fn assert_df_equal(left: &DataFrame, right: &DataFrame) -> PolarsResult<()> {
         return Err(PolarsError::ComputeError("dataframe shape mismatch".into()));
     }
     if left.schema() != right.schema() {
-        return Err(PolarsError::ComputeError("dataframe schema mismatch".into()));
+        return Err(PolarsError::ComputeError(
+            "dataframe schema mismatch".into(),
+        ));
     }
     let cols = left.get_column_names_owned();
     for i in 0..left.height() {
@@ -139,7 +183,11 @@ fn test_stata_roundtrip_write_read() {
     let out_path = temp_dta_path();
     StataWriter::new(&out_path).write_df(&original).unwrap();
 
-    let roundtrip = StataReader::open(&out_path).unwrap().read().finish().unwrap();
+    let roundtrip = StataReader::open(&out_path)
+        .unwrap()
+        .read()
+        .finish()
+        .unwrap();
     assert_df_equal(&original, &roundtrip).unwrap();
     let _ = std::fs::remove_file(&out_path);
 }
@@ -159,7 +207,11 @@ fn test_stata_roundtrip_small_files() {
             report_out_of_range(&original);
             panic!("write failed");
         }
-        let roundtrip = StataReader::open(&out_path).unwrap().read().finish().unwrap();
+        let roundtrip = StataReader::open(&out_path)
+            .unwrap()
+            .read()
+            .finish()
+            .unwrap();
         if let Err(e) = assert_df_equal(&original, &roundtrip) {
             panic!("roundtrip mismatch for {:?}: {}", path, e);
         }
@@ -167,17 +219,71 @@ fn test_stata_roundtrip_small_files() {
     }
 }
 
+#[test]
+fn test_stata_streaming_batches_patch_header_and_map() {
+    let original = DataFrame::new_infer_height(vec![
+        Series::new("id".into(), &[1i64, 2, 3, 4, 5, 6]).into_column(),
+        Series::new("grp".into(), &["a", "bb", "ccc", "d", "ee", "fff"]).into_column(),
+    ])
+    .unwrap();
+    let original = pandas_prepare_df_for_stata(&original).unwrap();
+    let schema = schema_from_df(&original);
+    let batches = vec![
+        original.slice(0, 2),
+        original.slice(2, 2),
+        original.slice(4, 2),
+    ];
+
+    let out_path = temp_dta_path();
+    StataWriter::new(&out_path)
+        .write_batches_streaming(batches, schema)
+        .unwrap();
+
+    let reader = StataReader::open(&out_path).unwrap();
+    assert_eq!(reader.metadata().row_count as usize, original.height());
+    let roundtrip = reader.read().finish().unwrap();
+    assert_df_equal(&original, &roundtrip).unwrap();
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn test_stata_streaming_batches_rejects_strl_without_prepass() {
+    let original = DataFrame::new_infer_height(vec![
+        Series::new("id".into(), &[1i64, 2]).into_column(),
+        Series::new("txt".into(), &["a", "b"]).into_column(),
+    ])
+    .unwrap();
+    let mut schema = schema_from_df(&original);
+    for col in &mut schema.columns {
+        if col.name == "txt" {
+            col.string_width_bytes = Some(3_000);
+        }
+    }
+
+    let out_path = temp_dta_path();
+    let err = StataWriter::new(&out_path)
+        .write_batches_streaming(vec![original], schema)
+        .unwrap_err();
+    assert!(err.to_string().contains("strL"), "unexpected error: {err}");
+    let _ = std::fs::remove_file(&out_path);
+}
+
 fn report_out_of_range(df: &DataFrame) {
     use polars::prelude::DataType::*;
     let max_f32 = f32::from_bits(0x7effffff) as f64;
     let max_f64 = f64::from_bits(0x7fdfffffffffffff);
-    for col in df.get_columns() {
+    for col in df.columns() {
         let series = col.as_materialized_series();
         match series.dtype() {
             Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => {
                 if let Some((min, max)) = min_max_i64(series) {
                     if min < -0x7fffffff || max > 0x7fffffe4 {
-                        eprintln!("out-of-range int column {}: min={} max={}", series.name(), min, max);
+                        eprintln!(
+                            "out-of-range int column {}: min={} max={}",
+                            series.name(),
+                            min,
+                            max
+                        );
                     }
                 }
             }
@@ -252,5 +358,9 @@ fn max_abs_f64(series: &Series) -> Option<f64> {
             max = av;
         }
     }
-    if any { Some(max) } else { None }
+    if any {
+        Some(max)
+    } else {
+        None
+    }
 }

@@ -5,16 +5,11 @@
 //! all compression types (None, RLE, RDC).
 
 pub mod sas;
+pub(crate) mod scan_prefetch;
 pub mod spss;
 pub mod stata;
-pub(crate) mod scan_prefetch;
 
 pub use sas::arrow_output as sas_arrow_output;
-pub use sas::polars_output as sas_polars_output;
-pub use spss::arrow_output as spss_arrow_output;
-pub use spss::polars_output as spss_polars_output;
-pub use stata::arrow_output as stata_arrow_output;
-pub use stata::polars_output as stata_polars_output;
 pub(crate) use sas::buffer;
 pub(crate) use sas::constants;
 pub(crate) use sas::data;
@@ -23,56 +18,38 @@ pub(crate) use sas::encoding;
 pub(crate) use sas::error;
 pub(crate) use sas::page;
 pub(crate) use sas::pipeline;
+pub use sas::polars_output as sas_polars_output;
 pub(crate) use sas::polars_output;
 pub(crate) use sas::types;
 pub(crate) use sas::value;
+pub use spss::arrow_output as spss_arrow_output;
+pub use spss::polars_output as spss_polars_output;
+pub use stata::arrow_output as stata_arrow_output;
+pub use stata::polars_output as stata_polars_output;
 
 pub use sas::header;
 pub use sas::metadata;
 pub use sas::reader;
 
-pub use sas::{Error, Result, Sas7bdatReader};
 pub use sas::{Compression, Endian, Format, Platform};
-pub use sas::{
-    SasValueLabelKey,
-    SasValueLabelMap,
-    SasValueLabels,
-    SasVariableLabels,
-    SasWriter,
-};
+pub use sas::{Error, Result, Sas7bdatReader};
+pub use sas::{SasValueLabelKey, SasValueLabelMap, SasValueLabels, SasVariableLabels, SasWriter};
 
 pub use sas::scan_sas7bdat;
 
-pub use spss::{Error as SpssError, Result as SpssResult, SpssReader, scan_sav};
+pub use spss::{scan_sav, Error as SpssError, Result as SpssResult, SpssReader};
 pub use spss::{
-    SpssValueLabelKey,
-    SpssValueLabelMap,
-    SpssValueLabels,
-    SpssVariableLabels,
-    SpssWriteColumn,
-    SpssWriteSchema,
-    SpssWriter,
+    SpssValueLabelKey, SpssValueLabelMap, SpssValueLabels, SpssVariableLabels, SpssWriteColumn,
+    SpssWriteSchema, SpssWriter,
 };
 pub use stata::{
-    Error as StataError,
-    Result as StataResult,
-    StataReader,
-    StataWriteColumn,
-    StataWriteSchema,
-    StataWriter,
-    ValueLabelMap,
-    ValueLabels,
-    VariableLabels,
-    compress_df,
-    CompressOptions,
-    pandas_make_stata_column_names,
-    pandas_prepare_df_for_stata,
-    pandas_rename_df,
-    scan_dta,
+    compress_df, pandas_make_stata_column_names, pandas_prepare_df_for_stata, pandas_rename_df,
+    scan_dta, CompressOptions, Error as StataError, Result as StataResult, StataReader,
+    StataWriteColumn, StataWriteSchema, StataWriter, ValueLabelMap, ValueLabels, VariableLabels,
 };
 
-use std::path::Path;
 use polars::prelude::DataFrame;
+use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
@@ -147,7 +124,10 @@ pub enum ReadStatFormat {
 }
 
 fn detect_format(path: &Path) -> Option<ReadStatFormat> {
-    let ext = path.extension().and_then(|s| s.to_str())?.to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())?
+        .to_ascii_lowercase();
     match ext.as_str() {
         "sas7bdat" | "sas7bcat" => Some(ReadStatFormat::Sas),
         "dta" => Some(ReadStatFormat::Stata),
@@ -164,22 +144,14 @@ pub fn readstat_scan(
 ) -> polars::prelude::PolarsResult<polars::prelude::LazyFrame> {
     let path = path.as_ref();
     let opts = opts.unwrap_or_default();
-    let format = format.or_else(|| detect_format(path))
-        .ok_or_else(|| polars::prelude::PolarsError::ComputeError("unknown file extension".into()))?;
+    let format = format.or_else(|| detect_format(path)).ok_or_else(|| {
+        polars::prelude::PolarsError::ComputeError("unknown file extension".into())
+    })?;
 
     match format {
-        ReadStatFormat::Sas => sas::scan_sas7bdat(
-            path,
-            opts,
-        ),
-        ReadStatFormat::Stata => stata::scan_dta(
-            path,
-            opts,
-        ),
-        ReadStatFormat::Spss => spss::scan_sav(
-            path,
-            opts,
-        ),
+        ReadStatFormat::Sas => sas::scan_sas7bdat(path, opts),
+        ReadStatFormat::Stata => stata::scan_dta(path, opts),
+        ReadStatFormat::Spss => spss::scan_sav(path, opts),
     }
 }
 
@@ -198,7 +170,9 @@ pub fn readstat_metadata_json(
     format: Option<ReadStatFormat>,
 ) -> std::result::Result<String, String> {
     let path = path.as_ref();
-    let format = format.or_else(|| detect_format(path)).ok_or("unknown file extension".to_string())?;
+    let format = format
+        .or_else(|| detect_format(path))
+        .ok_or("unknown file extension".to_string())?;
     match format {
         ReadStatFormat::Sas => sas::metadata_json(path).map_err(|e| e.to_string()),
         ReadStatFormat::Stata => stata::metadata_json(path).map_err(|e| e.to_string()),

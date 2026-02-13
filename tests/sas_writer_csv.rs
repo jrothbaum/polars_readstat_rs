@@ -1,10 +1,6 @@
 use polars::prelude::*;
 use polars_readstat_rs::{
-    SasValueLabelKey,
-    SasValueLabelMap,
-    SasValueLabels,
-    SasVariableLabels,
-    SasWriter,
+    SasValueLabelKey, SasValueLabelMap, SasValueLabels, SasVariableLabels, SasWriter,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -23,7 +19,7 @@ fn temp_dir(prefix: &str) -> std::path::PathBuf {
 
 #[test]
 fn test_sas_writer_csv_bundle() {
-    let df = DataFrame::new(vec![
+    let df = DataFrame::new_infer_height(vec![
         Series::new("num".into(), &[1i32, 2, 3]).into_column(),
         Series::new("str".into(), &["a", "b", "c"]).into_column(),
         Series::new("date".into(), &[0i32, 1, 2])
@@ -38,7 +34,8 @@ fn test_sas_writer_csv_bundle() {
             .cast(&DataType::Time)
             .unwrap()
             .into_column(),
-    ]).unwrap();
+    ])
+    .unwrap();
 
     let mut vmap: SasValueLabelMap = HashMap::new();
     vmap.insert(SasValueLabelKey::from(1.0), "one".to_string());

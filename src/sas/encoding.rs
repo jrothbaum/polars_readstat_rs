@@ -59,7 +59,7 @@ pub fn get_encoding_name(encoding_byte: u8) -> &'static str {
         119 => "EUC-TW",
         123 => "BIG5-HKSCS",
         125 => "GB18030", // Simplified Chinese
-        126 => "CP936",  // Simplified Chinese
+        126 => "CP936",   // Simplified Chinese
         128 => "CP1381",
         134 => "EUC-JP", // Japanese
         136 => "CP949",
@@ -117,11 +117,11 @@ pub fn get_encoding(encoding_byte: u8) -> &'static Encoding {
         "WINDOWS-1257" => encoding_rs::WINDOWS_1257,
         "WINDOWS-1258" => encoding_rs::WINDOWS_1258,
         // Asian encodings
-        "CP950" => encoding_rs::BIG5, // Traditional Chinese
+        "CP950" => encoding_rs::BIG5,      // Traditional Chinese
         "BIG5-HKSCS" => encoding_rs::BIG5, // No direct support; use BIG5
-        "EUC-TW" => encoding_rs::BIG5, // No direct support; use BIG5
+        "EUC-TW" => encoding_rs::BIG5,     // No direct support; use BIG5
         "GB18030" => encoding_rs::GB18030,
-        "CP936" => encoding_rs::GBK, // Simplified Chinese
+        "CP936" => encoding_rs::GBK,      // Simplified Chinese
         "CP1381" => encoding_rs::GB18030, // Closest available
         "EUC-JP" => encoding_rs::EUC_JP,
         "CP932" => encoding_rs::SHIFT_JIS,

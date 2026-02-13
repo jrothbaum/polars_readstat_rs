@@ -39,7 +39,7 @@ pub struct Variable {
     pub name: String,
     pub short_name: String,
     pub var_type: VarType,
-    pub width: usize,     // number of 8-byte segments
+    pub width: usize,      // number of 8-byte segments
     pub string_len: usize, // declared string length in bytes (0 for numeric)
     pub format_type: u8,
     pub format_class: Option<FormatClass>,

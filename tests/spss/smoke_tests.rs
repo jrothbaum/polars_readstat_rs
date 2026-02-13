@@ -1,7 +1,7 @@
-use std::path::PathBuf;
-use polars_readstat_rs::SpssReader;
-use polars_readstat_rs::spss::arrow_output::{read_to_arrow_ffi, read_to_arrow_stream_ffi};
 use polars_arrow::ffi::ArrowArrayStreamReader;
+use polars_readstat_rs::spss::arrow_output::{read_to_arrow_ffi, read_to_arrow_stream_ffi};
+use polars_readstat_rs::SpssReader;
+use std::path::PathBuf;
 
 fn test_data_path(filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -42,7 +42,12 @@ fn test_read_zsav_file() {
 fn test_read_value_labels_as_strings() {
     let path = test_data_path("ordered_category.sav");
     let reader = SpssReader::open(&path).expect("open");
-    let df = reader.read().value_labels_as_strings(true).with_limit(5).finish().expect("read");
+    let df = reader
+        .read()
+        .value_labels_as_strings(true)
+        .with_limit(5)
+        .finish()
+        .expect("read");
     assert!(df.height() > 0);
     assert!(df.width() > 0);
 }
@@ -55,10 +60,18 @@ fn test_very_long_string_metadata() {
         .metadata()
         .variables
         .iter()
-        .find(|v| v.short_name.eq_ignore_ascii_case("STARTDAT") || v.name.eq_ignore_ascii_case("STARTDAT"))
+        .find(|v| {
+            v.short_name.eq_ignore_ascii_case("STARTDAT") || v.name.eq_ignore_ascii_case("STARTDAT")
+        })
         .expect("STARTDAT variable");
-    assert!(var.string_len >= 1024, "expected STARTDAT string_len >= 1024");
-    assert!(var.width * 8 >= var.string_len, "expected width bytes to cover string_len");
+    assert!(
+        var.string_len >= 1024,
+        "expected STARTDAT string_len >= 1024"
+    );
+    assert!(
+        var.width * 8 >= var.string_len,
+        "expected width bytes to cover string_len"
+    );
 }
 
 #[test]
@@ -69,10 +82,15 @@ fn test_long_string_metadata() {
         .metadata()
         .variables
         .iter()
-        .find(|v| v.short_name.eq_ignore_ascii_case("Q16BR9OE") || v.name.eq_ignore_ascii_case("Q16BR9OE"))
+        .find(|v| {
+            v.short_name.eq_ignore_ascii_case("Q16BR9OE") || v.name.eq_ignore_ascii_case("Q16BR9OE")
+        })
         .expect("Q16BR9OE variable");
     assert!(var.string_len >= 512, "expected Q16BR9OE string_len >= 512");
-    assert!(var.width * 8 >= var.string_len, "expected width bytes to cover string_len");
+    assert!(
+        var.width * 8 >= var.string_len,
+        "expected width bytes to cover string_len"
+    );
 }
 
 #[test]
@@ -88,10 +106,10 @@ fn test_arrow_export() {
 #[test]
 fn test_arrow_stream_export() {
     let path = test_data_path("sample.sav");
-    let stream = read_to_arrow_stream_ffi(&path, None, true, Some(true), None, 2)
-        .expect("arrow stream");
-    let mut reader = unsafe { ArrowArrayStreamReader::try_new(Box::from_raw(stream)) }
-        .expect("stream reader");
+    let stream =
+        read_to_arrow_stream_ffi(&path, None, true, Some(true), None, 2).expect("arrow stream");
+    let mut reader =
+        unsafe { ArrowArrayStreamReader::try_new(Box::from_raw(stream)) }.expect("stream reader");
     let mut count = 0usize;
     unsafe {
         while let Some(batch) = reader.next() {

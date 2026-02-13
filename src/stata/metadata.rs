@@ -1,6 +1,8 @@
-use crate::stata::error::{Error, Result};
 use crate::stata::encoding;
-use crate::stata::types::{Endian, Header, Metadata, NumericType, VarType, Variable, ValueLabel, ValueLabelKey};
+use crate::stata::error::{Error, Result};
+use crate::stata::types::{
+    Endian, Header, Metadata, NumericType, ValueLabel, ValueLabelKey, VarType, Variable,
+};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -23,11 +25,49 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
     }
 
     let typlist = read_typlist(reader, header.endian, header.nvars as usize, &layout)?;
-    let varnames = read_string_table(reader, header.nvars as usize, layout.variable_name_len, layout.file_is_xmlish, b"<varnames>", b"</varnames>", metadata.encoding)?;
-    let sort_order = read_sortlist(reader, header.endian, header.nvars as usize, layout.file_is_xmlish, layout.srtlist_entry_len)?;
-    let formats = read_string_table(reader, header.nvars as usize, layout.fmtlist_entry_len, layout.file_is_xmlish, b"<formats>", b"</formats>", metadata.encoding)?;
-    let value_label_names = read_string_table(reader, header.nvars as usize, layout.lbllist_entry_len, layout.file_is_xmlish, b"<value_label_names>", b"</value_label_names>", metadata.encoding)?;
-    let variable_labels = read_string_table(reader, header.nvars as usize, layout.variable_labels_entry_len, layout.file_is_xmlish, b"<variable_labels>", b"</variable_labels>", metadata.encoding)?;
+    let varnames = read_string_table(
+        reader,
+        header.nvars as usize,
+        layout.variable_name_len,
+        layout.file_is_xmlish,
+        b"<varnames>",
+        b"</varnames>",
+        metadata.encoding,
+    )?;
+    let sort_order = read_sortlist(
+        reader,
+        header.endian,
+        header.nvars as usize,
+        layout.file_is_xmlish,
+        layout.srtlist_entry_len,
+    )?;
+    let formats = read_string_table(
+        reader,
+        header.nvars as usize,
+        layout.fmtlist_entry_len,
+        layout.file_is_xmlish,
+        b"<formats>",
+        b"</formats>",
+        metadata.encoding,
+    )?;
+    let value_label_names = read_string_table(
+        reader,
+        header.nvars as usize,
+        layout.lbllist_entry_len,
+        layout.file_is_xmlish,
+        b"<value_label_names>",
+        b"</value_label_names>",
+        metadata.encoding,
+    )?;
+    let variable_labels = read_string_table(
+        reader,
+        header.nvars as usize,
+        layout.variable_labels_entry_len,
+        layout.file_is_xmlish,
+        b"<variable_labels>",
+        b"</variable_labels>",
+        metadata.encoding,
+    )?;
 
     metadata.sort_order = sort_order;
     metadata.formats = formats.clone();
@@ -43,7 +83,13 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
         let format = formats.get(i).cloned().filter(|s| !s.is_empty());
         let label = variable_labels.get(i).cloned().filter(|s| !s.is_empty());
         let value_label_name = value_label_names.get(i).cloned().filter(|s| !s.is_empty());
-        variables.push(Variable { name, var_type, format, label, value_label_name });
+        variables.push(Variable {
+            name,
+            var_type,
+            format,
+            label,
+            value_label_name,
+        });
     }
 
     metadata.variables = variables;
@@ -237,9 +283,20 @@ fn read_map<R: Read>(reader: &mut R, endian: Endian) -> Result<(u64, u64, u64)> 
     Ok((map[9], map[10], map[11]))
 }
 
-fn read_typlist<R: Read>(reader: &mut R, endian: Endian, nvar: usize, layout: &Layout) -> Result<Vec<u16>> {
+fn read_typlist<R: Read>(
+    reader: &mut R,
+    endian: Endian,
+    nvar: usize,
+    layout: &Layout,
+) -> Result<Vec<u16>> {
     let mut buf = vec![0u8; nvar * layout.typlist_entry_len];
-    read_chunk(reader, layout.file_is_xmlish, b"<variable_types>", &mut buf, b"</variable_types>")?;
+    read_chunk(
+        reader,
+        layout.file_is_xmlish,
+        b"<variable_types>",
+        &mut buf,
+        b"</variable_types>",
+    )?;
     let mut typlist = vec![0u16; nvar];
     if layout.typlist_entry_len == 1 {
         for i in 0..nvar {
@@ -355,7 +412,13 @@ fn read_string(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> String
     encoding::decode_string(&bytes[..len], encoding)
 }
 
-fn read_chunk<R: Read>(reader: &mut R, xmlish: bool, start: &[u8], dst: &mut [u8], end: &[u8]) -> Result<()> {
+fn read_chunk<R: Read>(
+    reader: &mut R,
+    xmlish: bool,
+    start: &[u8],
+    dst: &mut [u8],
+    end: &[u8],
+) -> Result<()> {
     if xmlish {
         read_tag(reader, start)?;
     }
@@ -446,7 +509,9 @@ fn read_value_labels<R: Read + Seek>(
         }
         let labname = read_string(&labname_buf, metadata.encoding);
 
-        reader.seek(SeekFrom::Current(layout.value_label_table_padding_len as i64))?;
+        reader.seek(SeekFrom::Current(
+            layout.value_label_table_padding_len as i64,
+        ))?;
 
         let mut table = vec![0u8; len];
         if reader.read(&mut table)? < table.len() {
@@ -464,7 +529,10 @@ fn read_value_labels<R: Read + Seek>(
                     mapping.push((ValueLabelKey::Integer(i as i32), label));
                 }
             }
-            labels.push(ValueLabel { name: labname, mapping: std::sync::Arc::new(mapping) });
+            labels.push(ValueLabel {
+                name: labname,
+                mapping: std::sync::Arc::new(mapping),
+            });
         } else if len >= 8 {
             if layout.file_is_xmlish {
                 read_tag(reader, b"</lbl>")?;
@@ -505,7 +573,10 @@ fn read_value_labels<R: Read + Seek>(
                     mapping.push((ValueLabelKey::Double(v as f64), label));
                 }
             }
-            labels.push(ValueLabel { name: labname, mapping: std::sync::Arc::new(mapping) });
+            labels.push(ValueLabel {
+                name: labname,
+                mapping: std::sync::Arc::new(mapping),
+            });
         } else if layout.file_is_xmlish {
             read_tag(reader, b"</lbl>")?;
         }

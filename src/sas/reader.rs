@@ -3,11 +3,11 @@ use crate::error::Result;
 use crate::header::{check_header, read_header};
 use crate::metadata::read_metadata;
 use crate::page::PageReader;
-use crate::polars_output::DataFrameBuilder;
 use crate::pipeline::DEFAULT_PIPELINE_CHUNK_SIZE;
-use crate::types::{Compression, Endian, Format, Header, Metadata, ColumnType};
+use crate::polars_output::DataFrameBuilder;
+use crate::polars_output::{kind_for_column, ColumnKind};
+use crate::types::{ColumnType, Compression, Endian, Format, Header, Metadata};
 use crate::value::{decode_numeric_bytes_mask, parse_row_values_into, ValueParser};
-use crate::polars_output::{ColumnKind, kind_for_column};
 use polars::prelude::*;
 use rayon::prelude::*;
 use std::fs::File;
@@ -53,7 +53,14 @@ impl Sas7bdatReader {
         file.seek(SeekFrom::Start(header.header_length as u64))?;
         let (metadata, initial_data_subheaders) = read_metadata(file, &header, endian, format)?;
 
-        Ok(Self { path, header, metadata, endian, format, initial_data_subheaders })
+        Ok(Self {
+            path,
+            header,
+            metadata,
+            endian,
+            format,
+            initial_data_subheaders,
+        })
     }
 
     pub fn open_with_profile(path: impl AsRef<Path>) -> Result<(Self, OpenProfile)> {
@@ -72,8 +79,18 @@ impl Sas7bdatReader {
         let metadata_ms = metadata_start.elapsed().as_secs_f64() * 1000.0;
 
         Ok((
-            Self { path, header, metadata, endian, format, initial_data_subheaders },
-            OpenProfile { header_ms, metadata_ms },
+            Self {
+                path,
+                header,
+                metadata,
+                endian,
+                format,
+                initial_data_subheaders,
+            },
+            OpenProfile {
+                header_ms,
+                metadata_ms,
+            },
         ))
     }
 
@@ -82,16 +99,28 @@ impl Sas7bdatReader {
         ReadBuilder::new(self)
     }
 
-    pub fn metadata(&self) -> &Metadata { &self.metadata }
-    pub fn header(&self) -> &Header { &self.header }
-    pub fn endian(&self) -> Endian { self.endian }
-    pub fn format(&self) -> Format { self.format }
-    pub fn initial_data_subheaders(&self) -> &[DataSubheader] { &self.initial_data_subheaders }
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+    pub fn endian(&self) -> Endian {
+        self.endian
+    }
+    pub fn format(&self) -> Format {
+        self.format
+    }
+    pub fn initial_data_subheaders(&self) -> &[DataSubheader] {
+        &self.initial_data_subheaders
+    }
 
     /// The single internal execution path for all read operations
     fn execute_read(&self, opts: ReadBuilder) -> Result<DataFrame> {
         let col_indices = resolve_column_indices(&self.metadata, opts.columns.as_deref())?;
-        let limit = opts.limit.unwrap_or(self.metadata.row_count.saturating_sub(opts.offset));
+        let limit = opts
+            .limit
+            .unwrap_or(self.metadata.row_count.saturating_sub(opts.offset));
 
         let missing_null = opts.missing_string_as_null;
 
@@ -104,7 +133,8 @@ impl Sas7bdatReader {
                 self.endian,
                 self.format,
                 opts.num_threads.unwrap_or_else(rayon::current_num_threads),
-                opts.pipeline_chunk_size.unwrap_or(DEFAULT_PIPELINE_CHUNK_SIZE),
+                opts.pipeline_chunk_size
+                    .unwrap_or(DEFAULT_PIPELINE_CHUNK_SIZE),
                 opts.limit,
                 col_indices.as_deref(),
                 missing_null,
@@ -121,8 +151,15 @@ impl Sas7bdatReader {
             )?
         } else {
             read_batch_selected(
-                &self.path, &self.header, &self.metadata, self.endian, self.format,
-                opts.offset, limit, col_indices.as_deref(), missing_null,
+                &self.path,
+                &self.header,
+                &self.metadata,
+                self.endian,
+                self.format,
+                opts.offset,
+                limit,
+                col_indices.as_deref(),
+                missing_null,
                 &self.initial_data_subheaders,
             )?
         };
@@ -137,7 +174,9 @@ impl Sas7bdatReader {
     /// Profiled read path (forces sequential, non-pipeline execution)
     fn execute_read_profiled(&self, opts: ReadBuilder) -> Result<(DataFrame, ReadProfile)> {
         let col_indices = resolve_column_indices(&self.metadata, opts.columns.as_deref())?;
-        let limit = opts.limit.unwrap_or(self.metadata.row_count.saturating_sub(opts.offset));
+        let limit = opts
+            .limit
+            .unwrap_or(self.metadata.row_count.saturating_sub(opts.offset));
         let missing_null = opts.missing_string_as_null;
 
         let (mut df, mut profile) = read_batch_selected_profiled(
@@ -194,8 +233,14 @@ impl Sas7bdatReader {
                 let start = offset + (i * chunk_size);
                 let chunk_count = chunk_size.min(offset + count - start);
                 read_batch_selected(
-                    &path, &header, &metadata, self.endian, self.format,
-                    start, chunk_count, cols_arc.as_deref().map(|v| v.as_slice()),
+                    &path,
+                    &header,
+                    &metadata,
+                    self.endian,
+                    self.format,
+                    start,
+                    chunk_count,
+                    cols_arc.as_deref().map(|v| v.as_slice()),
                     missing_string_as_null,
                     &initial_data_subheaders,
                 )
@@ -238,19 +283,46 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
-    pub fn with_columns(mut self, cols: Vec<String>) -> Self { self.columns = Some(cols); self }
-    pub fn with_limit(mut self, limit: usize) -> Self { self.limit = Some(limit); self }
-    pub fn with_offset(mut self, offset: usize) -> Self { self.offset = offset; self }
-    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self { self.schema = Some(schema); self }
-    pub fn with_n_threads(mut self, n: usize) -> Self { self.num_threads = Some(n); self }
-    pub fn with_chunk_size(mut self, n: usize) -> Self { self.chunk_size = Some(n); self }
-    pub fn sequential(mut self) -> Self { self.parallel = false; self }
-    pub fn pipeline(mut self) -> Self { self.use_pipeline = true; self }
+    pub fn with_columns(mut self, cols: Vec<String>) -> Self {
+        self.columns = Some(cols);
+        self
+    }
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+    pub fn with_n_threads(mut self, n: usize) -> Self {
+        self.num_threads = Some(n);
+        self
+    }
+    pub fn with_chunk_size(mut self, n: usize) -> Self {
+        self.chunk_size = Some(n);
+        self
+    }
+    pub fn sequential(mut self) -> Self {
+        self.parallel = false;
+        self
+    }
+    pub fn pipeline(mut self) -> Self {
+        self.use_pipeline = true;
+        self
+    }
     pub fn pipeline_chunk_size(mut self, chunk_size: usize) -> Self {
         self.pipeline_chunk_size = Some(chunk_size);
         self
     }
-    pub fn missing_string_as_null(mut self, v: bool) -> Self { self.missing_string_as_null = v; self }
+    pub fn missing_string_as_null(mut self, v: bool) -> Self {
+        self.missing_string_as_null = v;
+        self
+    }
 
     pub fn finish(self) -> Result<DataFrame> {
         self.reader.execute_read(self)
@@ -264,15 +336,28 @@ impl<'a> ReadBuilder<'a> {
 // --- Internal Helpers (Reduced to single implementations) ---
 
 fn read_batch_selected(
-    path: &Path, header: &Header, metadata: &Metadata, endian: Endian, format: Format,
-    skip: usize, count: usize, col_indices: Option<&[usize]>, missing_string_as_null: bool,
+    path: &Path,
+    header: &Header,
+    metadata: &Metadata,
+    endian: Endian,
+    format: Format,
+    skip: usize,
+    count: usize,
+    col_indices: Option<&[usize]>,
+    missing_string_as_null: bool,
     initial_data_subheaders: &[DataSubheader],
 ) -> Result<DataFrame> {
     let mut file = BufReader::new(File::open(path)?);
     file.seek(SeekFrom::Start(header.header_length as u64))?;
 
     let page_reader = PageReader::new(file, header.clone(), endian, format);
-    let mut data_reader = DataReader::new(page_reader, metadata.clone(), endian, format, initial_data_subheaders.to_vec())?;
+    let mut data_reader = DataReader::new(
+        page_reader,
+        metadata.clone(),
+        endian,
+        format,
+        initial_data_subheaders.to_vec(),
+    )?;
 
     data_reader.skip_rows(skip)?;
 
@@ -282,7 +367,9 @@ fn read_batch_selected(
     };
 
     let numeric_only = match col_indices {
-        Some(indices) => indices.iter().all(|&idx| metadata.columns[idx].col_type == ColumnType::Numeric),
+        Some(indices) => indices
+            .iter()
+            .all(|&idx| metadata.columns[idx].col_type == ColumnType::Numeric),
         None => false,
     };
     let numeric_plan: Option<Vec<NumericColumnPlan>> = if numeric_only {
@@ -304,12 +391,14 @@ fn read_batch_selected(
     } else {
         None
     };
-    let numeric_max_end = numeric_plan.as_ref().map(|plan| {
-        plan.iter().map(|p| p.end).max().unwrap_or(0)
-    });
+    let numeric_max_end = numeric_plan
+        .as_ref()
+        .map(|plan| plan.iter().map(|p| p.end).max().unwrap_or(0));
     let parser = ValueParser::new(endian, metadata.encoding_byte, missing_string_as_null);
     let mut row_values: Vec<crate::value::Value> = Vec::with_capacity(
-        col_indices.map(|v| v.len()).unwrap_or(metadata.columns.len()),
+        col_indices
+            .map(|v| v.len())
+            .unwrap_or(metadata.columns.len()),
     );
 
     for _ in 0..count {
@@ -325,7 +414,8 @@ fn read_batch_selected(
                         }
                     }
                     for plan in plans {
-                        let (value, is_missing) = decode_numeric_bytes_mask(endian, &row_bytes[plan.start..plan.end]);
+                        let (value, is_missing) =
+                            decode_numeric_bytes_mask(endian, &row_bytes[plan.start..plan.end]);
                         builder.add_numeric_value_mask_kind(plan.pos, plan.kind, value, is_missing);
                     }
                 }
@@ -333,14 +423,23 @@ fn read_batch_selected(
                 parse_row_values_into(&parser, &row_bytes, metadata, col_indices, &mut row_values)?;
                 builder.add_row_ref(&row_values)?;
             }
-        } else { break; }
+        } else {
+            break;
+        }
     }
     builder.build()
 }
 
 fn read_batch_selected_profiled(
-    path: &Path, header: &Header, metadata: &Metadata, endian: Endian, format: Format,
-    skip: usize, count: usize, col_indices: Option<&[usize]>, missing_string_as_null: bool,
+    path: &Path,
+    header: &Header,
+    metadata: &Metadata,
+    endian: Endian,
+    format: Format,
+    skip: usize,
+    count: usize,
+    col_indices: Option<&[usize]>,
+    missing_string_as_null: bool,
     initial_data_subheaders: &[DataSubheader],
 ) -> Result<(DataFrame, ReadProfile)> {
     let total_start = Instant::now();
@@ -348,7 +447,13 @@ fn read_batch_selected_profiled(
     file.seek(SeekFrom::Start(header.header_length as u64))?;
 
     let page_reader = PageReader::new(file, header.clone(), endian, format);
-    let mut data_reader = DataReader::new(page_reader, metadata.clone(), endian, format, initial_data_subheaders.to_vec())?;
+    let mut data_reader = DataReader::new(
+        page_reader,
+        metadata.clone(),
+        endian,
+        format,
+        initial_data_subheaders.to_vec(),
+    )?;
 
     data_reader.skip_rows(skip)?;
 
@@ -358,7 +463,9 @@ fn read_batch_selected_profiled(
     };
 
     let numeric_only = match col_indices {
-        Some(indices) => indices.iter().all(|&idx| metadata.columns[idx].col_type == ColumnType::Numeric),
+        Some(indices) => indices
+            .iter()
+            .all(|&idx| metadata.columns[idx].col_type == ColumnType::Numeric),
         None => false,
     };
     let numeric_plan: Option<Vec<NumericColumnPlan>> = if numeric_only {
@@ -380,12 +487,14 @@ fn read_batch_selected_profiled(
     } else {
         None
     };
-    let numeric_max_end = numeric_plan.as_ref().map(|plan| {
-        plan.iter().map(|p| p.end).max().unwrap_or(0)
-    });
+    let numeric_max_end = numeric_plan
+        .as_ref()
+        .map(|plan| plan.iter().map(|p| p.end).max().unwrap_or(0));
     let parser = ValueParser::new(endian, metadata.encoding_byte, missing_string_as_null);
     let mut row_values: Vec<crate::value::Value> = Vec::with_capacity(
-        col_indices.map(|v| v.len()).unwrap_or(metadata.columns.len()),
+        col_indices
+            .map(|v| v.len())
+            .unwrap_or(metadata.columns.len()),
     );
 
     let parse_start = Instant::now();
@@ -405,7 +514,8 @@ fn read_batch_selected_profiled(
                     }
                     for plan in plans {
                         let values_start = Instant::now();
-                        let (value, is_missing) = decode_numeric_bytes_mask(endian, &row_bytes[plan.start..plan.end]);
+                        let (value, is_missing) =
+                            decode_numeric_bytes_mask(endian, &row_bytes[plan.start..plan.end]);
                         parse_values_ms += values_start.elapsed().as_secs_f64() * 1000.0;
 
                         let add_start = Instant::now();
@@ -422,7 +532,9 @@ fn read_batch_selected_profiled(
                 builder.add_row_ref(&row_values)?;
                 add_row_ms += add_start.elapsed().as_secs_f64() * 1000.0;
             }
-        } else { break; }
+        } else {
+            break;
+        }
     }
     let parse_rows_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -431,31 +543,58 @@ fn read_batch_selected_profiled(
     let build_df_ms = build_start.elapsed().as_secs_f64() * 1000.0;
 
     let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-    Ok((df, ReadProfile { parse_rows_ms, parse_values_ms, add_row_ms, build_df_ms, total_ms }))
+    Ok((
+        df,
+        ReadProfile {
+            parse_rows_ms,
+            parse_values_ms,
+            add_row_ms,
+            build_df_ms,
+            total_ms,
+        },
+    ))
 }
 
-fn resolve_column_indices(metadata: &Metadata, columns: Option<&[String]>) -> Result<Option<Vec<usize>>> {
-    columns.map(|names| {
-        names.iter().map(|name| {
-            metadata.columns.iter().position(|c| c.name == *name)
-                .ok_or_else(|| crate::error::Error::ParseError(format!("Column '{}' not found", name)))
-        }).collect()
-    }).transpose()
+fn resolve_column_indices(
+    metadata: &Metadata,
+    columns: Option<&[String]>,
+) -> Result<Option<Vec<usize>>> {
+    columns
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| {
+                    metadata
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *name)
+                        .ok_or_else(|| {
+                            crate::error::Error::ParseError(format!("Column '{}' not found", name))
+                        })
+                })
+                .collect()
+        })
+        .transpose()
 }
 
 fn combine_dataframes(mut dfs: Vec<DataFrame>) -> Result<DataFrame> {
-    if dfs.is_empty() { return Ok(DataFrame::empty()); }
+    if dfs.is_empty() {
+        return Ok(DataFrame::empty());
+    }
     let mut main_df = dfs.remove(0);
-    for df in dfs { main_df.vstack_mut(&df)?; }
+    for df in dfs {
+        main_df.vstack_mut(&df)?;
+    }
     Ok(main_df)
 }
 
 fn cast_dataframe(mut df: DataFrame, schema: &Schema) -> Result<DataFrame> {
     for (name, dtype) in schema.iter() {
         if let Ok(col) = df.column(name) {
-            let casted = col.as_materialized_series().cast(dtype)
-                .map_err(|e| crate::error::Error::ParseError(format!("Cast failed for {}: {}", name, e)))?;
-            df.replace(name, casted)?;
+            let casted = col.as_materialized_series().cast(dtype).map_err(|e| {
+                crate::error::Error::ParseError(format!("Cast failed for {}: {}", name, e))
+            })?;
+            df.replace(name, casted.into())?;
         }
     }
     Ok(df)

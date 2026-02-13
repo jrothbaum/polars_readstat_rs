@@ -1,6 +1,6 @@
 use polars::prelude::*;
-use std::path::PathBuf;
 use polars_readstat_rs::{readstat_scan, ReadStatFormat, ScanOptions};
+use std::path::PathBuf;
 
 /// Usage:
 ///   readstat_scan_options <file>
@@ -65,7 +65,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opts.chunk_size = Some(v.parse()?);
             }
             "--missing-string-as-null" => {
-                let v = args.next().ok_or("missing --missing-string-as-null value")?;
+                let v = args
+                    .next()
+                    .ok_or("missing --missing-string-as-null value")?;
                 opts.missing_string_as_null = Some(parse_bool(&v)?);
             }
             "--user-missing-as-null" => {
@@ -73,7 +75,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opts.user_missing_as_null = Some(parse_bool(&v)?);
             }
             "--value-labels-as-strings" => {
-                let v = args.next().ok_or("missing --value-labels-as-strings value")?;
+                let v = args
+                    .next()
+                    .ok_or("missing --value-labels-as-strings value")?;
                 opts.value_labels_as_strings = Some(parse_bool(&v)?);
             }
             "--compress" => {
@@ -96,11 +100,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 opts.compress_opts.compress_numeric = parse_bool(&v)?;
             }
             "--compress-datetime-to-date" => {
-                let v = args.next().ok_or("missing --compress-datetime-to-date value")?;
+                let v = args
+                    .next()
+                    .ok_or("missing --compress-datetime-to-date value")?;
                 opts.compress_opts.datetime_to_date = parse_bool(&v)?;
             }
             "--compress-string-to-numeric" => {
-                let v = args.next().ok_or("missing --compress-string-to-numeric value")?;
+                let v = args
+                    .next()
+                    .ok_or("missing --compress-string-to-numeric value")?;
                 opts.compress_opts.string_to_numeric = parse_bool(&v)?;
             }
             _ => return Err(format!("unknown arg: {}", arg).into()),
@@ -115,10 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if offset > 0 || limit.is_some() {
-        let len: u32 = limit
-            .unwrap_or(usize::MAX)
-            .try_into()
-            .unwrap_or(u32::MAX);
+        let len: u32 = limit.unwrap_or(usize::MAX).try_into().unwrap_or(u32::MAX);
         lf = lf.slice(offset as i64, len);
     }
 

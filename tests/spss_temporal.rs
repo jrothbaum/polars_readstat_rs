@@ -55,11 +55,7 @@ fn spss_simple_alltypes_temporal_types() -> PolarsResult<()> {
     let df = scan_file(data_path("simple_alltypes.sav"))?;
     let schema = df.schema();
 
-    assert_eq!(
-        schema.get("y"),
-        Some(&DataType::Date),
-        "y should be Date"
-    );
+    assert_eq!(schema.get("y"), Some(&DataType::Date), "y should be Date");
 
     assert_eq!(
         schema.get("date"),

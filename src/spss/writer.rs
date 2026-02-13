@@ -2,10 +2,10 @@ use crate::spss::error::{Error, Result};
 use crate::spss::types::VarType;
 use polars::prelude::*;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
 
 const SAV_HEADER_LEN: usize = 176;
 const SAV_RECORD_VARIABLE: u32 = 2;
@@ -91,13 +91,28 @@ impl SpssWriter {
 
     pub fn write_df(&self, df: &DataFrame) -> Result<()> {
         let schema = self.schema.as_ref();
-        let value_labels = merge_value_labels(schema.and_then(|s| s.value_labels.clone()), self.value_labels.clone());
-        let variable_labels = merge_variable_labels(schema.and_then(|s| s.variable_labels.clone()), self.variable_labels.clone());
+        let value_labels = merge_value_labels(
+            schema.and_then(|s| s.value_labels.clone()),
+            self.value_labels.clone(),
+        );
+        let variable_labels = merge_variable_labels(
+            schema.and_then(|s| s.variable_labels.clone()),
+            self.variable_labels.clone(),
+        );
         let columns = infer_columns(df, schema, variable_labels.as_ref())?;
-        let encoding = choose_encoding(df, &columns, value_labels.as_ref(), variable_labels.as_ref())?;
+        let encoding = choose_encoding(
+            df,
+            &columns,
+            value_labels.as_ref(),
+            variable_labels.as_ref(),
+        )?;
         let file = File::create(&self.path)?;
         let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
-        write_header(&mut writer, df.height() as i32, columns.iter().map(|c| c.width).sum())?;
+        write_header(
+            &mut writer,
+            df.height() as i32,
+            columns.iter().map(|c| c.width).sum(),
+        )?;
         write_variable_records(&mut writer, &columns, encoding)?;
         write_long_var_names_record(&mut writer, &columns, encoding)?;
         write_encoding_record(&mut writer, encoding)?;
@@ -152,13 +167,14 @@ fn infer_columns(
     }
 
     let mut cols = Vec::with_capacity(df.width());
-    let names: Vec<String> = df.get_columns()
+    let names: Vec<String> = df
+        .columns()
         .iter()
         .map(|c| c.as_materialized_series().name().to_string())
         .collect();
     let short_names = build_short_names(&names)?;
     let mut offset = 0usize;
-    for (idx, column) in df.get_columns().iter().enumerate() {
+    for (idx, column) in df.columns().iter().enumerate() {
         let series = column.as_materialized_series();
         let name = series.name().to_string();
         validate_long_name(&name)?;
@@ -179,7 +195,10 @@ fn infer_columns(
     Ok(cols)
 }
 
-fn dtype_to_spss(col: &SpssWriteColumn, df: &DataFrame) -> Result<(VarType, usize, usize, Option<u8>)> {
+fn dtype_to_spss(
+    col: &SpssWriteColumn,
+    df: &DataFrame,
+) -> Result<(VarType, usize, usize, Option<u8>)> {
     match col.dtype {
         DataType::String => {
             let width = if let Some(w) = col.string_width_bytes {
@@ -217,7 +236,9 @@ fn infer_series(series: &Series) -> Result<(VarType, usize, usize, Option<u8>)> 
 
 fn string_layout(len: usize) -> Result<(VarType, usize, usize)> {
     if len > 255 {
-        return Err(Error::ParseError("SPSS writer does not support strings > 255 bytes".to_string()));
+        return Err(Error::ParseError(
+            "SPSS writer does not support strings > 255 bytes".to_string(),
+        ));
     }
     let width = (len.max(1) + 7) / 8;
     Ok((VarType::Str, len.max(1), width))
@@ -240,10 +261,14 @@ fn max_string_width(series: &Series) -> Result<usize> {
 
 fn validate_long_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        return Err(Error::ParseError("invalid SPSS variable name: empty".to_string()));
+        return Err(Error::ParseError(
+            "invalid SPSS variable name: empty".to_string(),
+        ));
     }
     if name.as_bytes().len() > 64 {
-        return Err(Error::ParseError(format!("invalid SPSS variable name (too long): {name}")));
+        return Err(Error::ParseError(format!(
+            "invalid SPSS variable name (too long): {name}"
+        )));
     }
     Ok(())
 }
@@ -327,7 +352,10 @@ fn sanitize_long_name_for_record(name: &str) -> String {
         .collect()
 }
 
-fn merge_value_labels(base: Option<SpssValueLabels>, extra: Option<SpssValueLabels>) -> Option<SpssValueLabels> {
+fn merge_value_labels(
+    base: Option<SpssValueLabels>,
+    extra: Option<SpssValueLabels>,
+) -> Option<SpssValueLabels> {
     match (base, extra) {
         (None, None) => None,
         (Some(mut base), Some(extra)) => {
@@ -341,7 +369,10 @@ fn merge_value_labels(base: Option<SpssValueLabels>, extra: Option<SpssValueLabe
     }
 }
 
-fn merge_variable_labels(base: Option<SpssVariableLabels>, extra: Option<SpssVariableLabels>) -> Option<SpssVariableLabels> {
+fn merge_variable_labels(
+    base: Option<SpssVariableLabels>,
+    extra: Option<SpssVariableLabels>,
+) -> Option<SpssVariableLabels> {
     match (base, extra) {
         (None, None) => None,
         (Some(mut base), Some(extra)) => {
@@ -421,7 +452,11 @@ fn choose_encoding(
         }
     }
 
-    Ok(if needs_utf8 { encoding_rs::UTF_8 } else { enc_1252 })
+    Ok(if needs_utf8 {
+        encoding_rs::UTF_8
+    } else {
+        enc_1252
+    })
 }
 
 fn write_header<W: Write>(writer: &mut W, row_count: i32, nominal_case_size: usize) -> Result<()> {
@@ -458,7 +493,11 @@ fn write_variable_record<W: Write>(
     encoding: &'static encoding_rs::Encoding,
 ) -> Result<()> {
     write_u32(writer, SAV_RECORD_VARIABLE)?;
-    let typ = if col.var_type == VarType::Numeric { 0 } else { col.string_len as i32 };
+    let typ = if col.var_type == VarType::Numeric {
+        0
+    } else {
+        col.string_len as i32
+    };
     write_i32(writer, typ)?;
     let has_label = if col.label.is_some() { 1 } else { 0 };
     write_i32(writer, has_label)?;
@@ -491,7 +530,9 @@ fn write_variable_label<W: Write>(
 ) -> Result<()> {
     let (bytes, _, had_errors) = encoding.encode(label);
     if had_errors {
-        return Err(Error::ParseError("variable label not representable in target encoding".to_string()));
+        return Err(Error::ParseError(
+            "variable label not representable in target encoding".to_string(),
+        ));
     }
     let len = bytes.len().min(255);
     write_u32(writer, len as u32)?;
@@ -509,9 +550,13 @@ fn write_value_labels<W: Write>(
     encoding: &'static encoding_rs::Encoding,
 ) -> Result<()> {
     for col in columns {
-        let Some(map) = labels.get(&col.name) else { continue };
+        let Some(map) = labels.get(&col.name) else {
+            continue;
+        };
         if col.var_type == VarType::Str {
-            return Err(Error::ParseError("string value labels not supported in SPSS writer".to_string()));
+            return Err(Error::ParseError(
+                "string value labels not supported in SPSS writer".to_string(),
+            ));
         }
         if map.is_empty() {
             continue;
@@ -522,7 +567,9 @@ fn write_value_labels<W: Write>(
             writer.write_all(&value.to_f64().to_le_bytes())?;
             let (bytes, _, had_errors) = encoding.encode(label);
             if had_errors {
-                return Err(Error::ParseError("value label not representable in target encoding".to_string()));
+                return Err(Error::ParseError(
+                    "value label not representable in target encoding".to_string(),
+                ));
             }
             let len = bytes.len().min(255);
             writer.write_all(&[len as u8])?;
@@ -556,7 +603,9 @@ fn write_long_var_names_record<W: Write>(
         entries.push(b'=');
         let (bytes, _, had_errors) = encoding.encode(&long);
         if had_errors {
-            return Err(Error::ParseError("long variable name not representable in target encoding".to_string()));
+            return Err(Error::ParseError(
+                "long variable name not representable in target encoding".to_string(),
+            ));
         }
         entries.extend_from_slice(&bytes);
         entries.push(b'\t');
@@ -605,13 +654,13 @@ fn write_data<W: Write>(
     let mut str_cols: Vec<Option<&StringChunked>> = Vec::with_capacity(columns.len());
     let mut str_bufs: Vec<Option<Vec<u8>>> = Vec::with_capacity(columns.len());
     for col in columns {
-        let series = df.column(&col.name).map_err(|e| Error::ParseError(e.to_string()))?;
+        let series = df
+            .column(&col.name)
+            .map_err(|e| Error::ParseError(e.to_string()))?;
         let series = series.as_materialized_series();
         cols.push(series);
         if col.var_type == VarType::Str {
-            let ca = series
-                .str()
-                .map_err(|e| Error::ParseError(e.to_string()))?;
+            let ca = series.str().map_err(|e| Error::ParseError(e.to_string()))?;
             str_cols.push(Some(ca));
             str_bufs.push(Some(vec![b' '; col.width * 8]));
         } else {
@@ -625,12 +674,15 @@ fn write_data<W: Write>(
             let series = cols[col_idx];
             match col.var_type {
                 VarType::Numeric => {
-                    let value = series.get(row_idx).map_err(|e| Error::ParseError(e.to_string()))?;
+                    let value = series
+                        .get(row_idx)
+                        .map_err(|e| Error::ParseError(e.to_string()))?;
                     if value.is_null() {
                         let bytes = SAV_MISSING_DOUBLE.to_le_bytes();
                         writer.write_all(&bytes)?;
                     } else {
-                        let v = anyvalue_to_f64(value).ok_or(Error::ParseError("unsupported numeric type".to_string()))?;
+                        let v = anyvalue_to_f64(value)
+                            .ok_or(Error::ParseError("unsupported numeric type".to_string()))?;
                         writer.write_all(&v.to_le_bytes())?;
                     }
                 }
@@ -645,7 +697,9 @@ fn write_data<W: Write>(
                     if let Some(s) = ca.get(row_idx) {
                         let (bytes, _, had_errors) = encoding.encode(s);
                         if had_errors {
-                            return Err(Error::ParseError("string not representable in target encoding".to_string()));
+                            return Err(Error::ParseError(
+                                "string not representable in target encoding".to_string(),
+                            ));
                         }
                         let copy_len = bytes.len().min(col.string_len);
                         buf[..copy_len].copy_from_slice(&bytes[..copy_len]);
@@ -680,7 +734,11 @@ mod tests {
                     out.extend(collect_files(&path, exts));
                     continue;
                 }
-                let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 if exts.iter().any(|e| e.eq_ignore_ascii_case(&ext)) {
                     out.push(path);
                 }
@@ -714,7 +772,9 @@ mod tests {
             return Err(PolarsError::ComputeError("dataframe shape mismatch".into()));
         }
         if left.schema() != right.schema() {
-            return Err(PolarsError::ComputeError("dataframe schema mismatch".into()));
+            return Err(PolarsError::ComputeError(
+                "dataframe schema mismatch".into(),
+            ));
         }
         let cols = left.get_column_names_owned();
         for i in 0..left.height() {
@@ -789,8 +849,11 @@ mod tests {
             if let Some(label) = var.label.clone() {
                 variable_labels.insert(var.name.clone(), label);
             }
-            let Some(label_name) = var.value_label.as_ref() else { continue };
-            let Some(label_def) = metadata.value_labels.iter().find(|v| v.name == *label_name) else {
+            let Some(label_name) = var.value_label.as_ref() else {
+                continue;
+            };
+            let Some(label_def) = metadata.value_labels.iter().find(|v| v.name == *label_name)
+            else {
                 continue;
             };
             if var.var_type == VarType::Str {
@@ -883,7 +946,10 @@ mod tests {
                 .finish()
                 .unwrap();
             for col in value_labels.keys() {
-                let dtype = df_labels.column(col).map(|s| s.dtype()).unwrap_or(&DataType::String);
+                let dtype = df_labels
+                    .column(col)
+                    .map(|s| s.dtype())
+                    .unwrap_or(&DataType::String);
                 assert_eq!(
                     dtype,
                     &DataType::String,

@@ -1,14 +1,14 @@
 use crate::stata::data::{build_shared_decode, read_data_frame_range};
 use crate::stata::reader::StataReader;
-use crate::stata::types::{VarType, NumericType};
+use crate::stata::types::{NumericType, VarType};
 use polars::prelude::*;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::mpsc::{self, Receiver};
-use std::thread::JoinHandle;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 pub fn scan_dta(
     path: impl Into<std::path::PathBuf>,
@@ -93,7 +93,15 @@ impl StataScan {
         preserve_order: bool,
         compress_opts: crate::CompressOptionsLite,
     ) -> Self {
-        Self { path, threads, missing_string_as_null, value_labels_as_strings, chunk_size, preserve_order, compress_opts }
+        Self {
+            path,
+            threads,
+            missing_string_as_null,
+            value_labels_as_strings,
+            chunk_size,
+            preserve_order,
+            compress_opts,
+        }
     }
 }
 
@@ -207,28 +215,37 @@ pub(crate) fn stata_batch_iter(
     cols: Option<Vec<String>>,
     n_rows: Option<usize>,
 ) -> PolarsResult<StataBatchIter> {
-    let reader = StataReader::open(&path)
-        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+    let reader =
+        StataReader::open(&path).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
     let total = n_rows.unwrap_or(reader.metadata().row_count as usize);
     let batch_size = chunk_size.unwrap_or(100_000).max(1);
-    let selected = cols.as_ref().map(|c| c.iter().cloned().collect::<HashSet<_>>());
-    let col_indices = cols.as_ref().map(|names| {
-        names
-            .iter()
-            .map(|name| {
-                reader
-                    .metadata()
-                    .variables
-                    .iter()
-                    .position(|v| v.name == *name)
-                    .ok_or_else(|| PolarsError::ColumnNotFound(name.clone().into()))
-            })
-            .collect::<Result<Vec<_>, _>>()
-    }).transpose()?;
+    let selected = cols
+        .as_ref()
+        .map(|c| c.iter().cloned().collect::<HashSet<_>>());
+    let col_indices = cols
+        .as_ref()
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| {
+                    reader
+                        .metadata()
+                        .variables
+                        .iter()
+                        .position(|v| v.name == *name)
+                        .ok_or_else(|| PolarsError::ColumnNotFound(name.clone().into()))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
     let mut time_formats = Vec::new();
     for var in &reader.metadata().variables {
         if let Some(kind) = stata_time_format_kind(var.format.as_deref(), &var.var_type) {
-            if selected.as_ref().map(|s| s.contains(&var.name)).unwrap_or(true) {
+            if selected
+                .as_ref()
+                .map(|s| s.contains(&var.name))
+                .unwrap_or(true)
+            {
                 time_formats.push((var.name.clone(), kind));
             }
         }
@@ -249,46 +266,42 @@ pub(crate) fn stata_batch_iter(
         let formats = Arc::new(time_formats);
         let missing_null = missing_string_as_null;
         let labels_as_strings = value_labels_as_strings;
-        let shared = build_shared_decode(
-            &path,
-            &metadata,
-            endian,
-            version,
-            labels_as_strings,
-        )
-        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+        let shared = build_shared_decode(&path, &metadata, endian, version, labels_as_strings)
+            .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
         let shared = Arc::new(shared);
 
         let handle = std::thread::spawn(move || {
             let pool = ThreadPoolBuilder::new().num_threads(n_threads).build();
             if let Ok(pool) = pool {
                 pool.install(|| {
-                    (0..n_chunks).into_par_iter().for_each_with(tx, |sender, i| {
-                        let start = i * batch_size;
-                        if start >= total {
-                            return;
-                        }
-                        let end = (total).min(start + batch_size);
-                        let cnt = end - start;
-                        let result = read_data_frame_range(
-                            &path,
-                            &metadata,
-                            endian,
-                            version,
-                            cols_idx.as_deref(),
-                            start,
-                            cnt,
-                            missing_null,
-                            labels_as_strings,
-                            &shared,
-                        )
-                        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
-                        .and_then(|mut df| {
-                            apply_stata_time_formats(&mut df, &formats)?;
-                            Ok(df)
+                    (0..n_chunks)
+                        .into_par_iter()
+                        .for_each_with(tx, |sender, i| {
+                            let start = i * batch_size;
+                            if start >= total {
+                                return;
+                            }
+                            let end = (total).min(start + batch_size);
+                            let cnt = end - start;
+                            let result = read_data_frame_range(
+                                &path,
+                                &metadata,
+                                endian,
+                                version,
+                                cols_idx.as_deref(),
+                                start,
+                                cnt,
+                                missing_null,
+                                labels_as_strings,
+                                &shared,
+                            )
+                            .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
+                            .and_then(|mut df| {
+                                apply_stata_time_formats(&mut df, &formats)?;
+                                Ok(df)
+                            });
+                            let _ = sender.send((i, result));
                         });
-                        let _ = sender.send((i, result));
-                    });
                 });
             }
         });
@@ -319,10 +332,14 @@ pub(crate) fn stata_batch_iter(
 }
 
 impl AnonymousScan for StataScan {
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
     fn scan(&self, opts: AnonymousScanArgs) -> PolarsResult<DataFrame> {
-        let cols = opts.with_columns.map(|c| c.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let cols = opts
+            .with_columns
+            .map(|c| c.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         let iter = stata_batch_iter(
             self.path.clone(),
             self.threads,
@@ -338,7 +355,8 @@ impl AnonymousScan for StataScan {
         let mut out: Option<DataFrame> = None;
         while let Some(df) = prefetch.next()? {
             if let Some(acc) = out.as_mut() {
-                acc.vstack_mut(&df).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+                acc.vstack_mut(&df)
+                    .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
             } else {
                 out = Some(df);
             }
@@ -366,7 +384,9 @@ impl AnonymousScan for StataScan {
                 if let Some(kind) = stata_time_format_kind(var.format.as_deref(), &var.var_type) {
                     match kind {
                         StataTimeFormatKind::Date => DataType::Date,
-                        StataTimeFormatKind::DateTime => DataType::Datetime(TimeUnit::Milliseconds, None),
+                        StataTimeFormatKind::DateTime => {
+                            DataType::Datetime(TimeUnit::Milliseconds, None)
+                        }
                         StataTimeFormatKind::Time { .. } => DataType::Time,
                     }
                 } else {
@@ -435,8 +455,12 @@ pub(crate) fn stata_time_format_kind(
                     }
                 } else {
                     if allow_datetime(var_type) {
-                        let has_date_tokens = rest.chars().any(|c| matches!(c, 'C' | 'c' | 'Y' | 'y' | 'N' | 'n' | 'D' | 'd'));
-                        Some(StataTimeFormatKind::Time { null_on_datetime: has_date_tokens })
+                        let has_date_tokens = rest
+                            .chars()
+                            .any(|c| matches!(c, 'C' | 'c' | 'Y' | 'y' | 'N' | 'n' | 'D' | 'd'));
+                        Some(StataTimeFormatKind::Time {
+                            null_on_datetime: has_date_tokens,
+                        })
                     } else {
                         None
                     }
@@ -491,28 +515,28 @@ pub(crate) fn apply_stata_time_formats(
     let day_ms: i64 = 86_400_000;
     let mut exprs = Vec::with_capacity(formats.len());
     for (name, kind) in formats {
-        let dtype_ok = df.column(name).map(|s| s.dtype().is_numeric()).unwrap_or(false);
+        let dtype_ok = df
+            .column(name)
+            .map(|s| s.dtype().is_numeric())
+            .unwrap_or(false);
         if !dtype_ok {
             continue;
         }
         let expr = match kind {
-            StataTimeFormatKind::Date => {
-                (col(name).cast(DataType::Int64) - lit(offset_days))
-                    .cast(DataType::Date)
-                    .alias(name)
-            }
-            StataTimeFormatKind::DateTime => {
-                (col(name).cast(DataType::Int64) - lit(offset_ms))
-                    .cast(DataType::Datetime(TimeUnit::Milliseconds, None))
-                    .alias(name)
-            }
+            StataTimeFormatKind::Date => (col(name).cast(DataType::Int64) - lit(offset_days))
+                .cast(DataType::Date)
+                .alias(name),
+            StataTimeFormatKind::DateTime => (col(name).cast(DataType::Int64) - lit(offset_ms))
+                .cast(DataType::Datetime(TimeUnit::Milliseconds, None))
+                .alias(name),
             StataTimeFormatKind::Time { null_on_datetime } => {
                 if *null_on_datetime {
                     lit(NULL).cast(DataType::Time).alias(name)
                 } else {
-                    ((col(name).cast(DataType::Int64) % lit(day_ms) + lit(day_ms)) % lit(day_ms) * lit(1_000_000i64))
-                        .cast(DataType::Time)
-                        .alias(name)
+                    ((col(name).cast(DataType::Int64) % lit(day_ms) + lit(day_ms)) % lit(day_ms)
+                        * lit(1_000_000i64))
+                    .cast(DataType::Time)
+                    .alias(name)
                 }
             }
         };

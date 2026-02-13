@@ -109,7 +109,13 @@ impl RdcDecompressor {
                         let offset = cnt as usize + 3 + (extra << 4);
                         let count = count_byte + 16;
 
-                        output_pos = self.copy_pattern(&mut output, output_pos, offset, count, expected_output_size)?;
+                        output_pos = self.copy_pattern(
+                            &mut output,
+                            output_pos,
+                            offset,
+                            count,
+                            expected_output_size,
+                        )?;
                     }
                     _ if cmd >= 3 && cmd <= 15 => {
                         // Short pattern: copy cmd bytes from history
@@ -122,7 +128,13 @@ impl RdcDecompressor {
                         let offset = cnt as usize + 3 + (extra << 4);
                         let count = cmd as usize;
 
-                        output_pos = self.copy_pattern(&mut output, output_pos, offset, count, expected_output_size)?;
+                        output_pos = self.copy_pattern(
+                            &mut output,
+                            output_pos,
+                            offset,
+                            count,
+                            expected_output_size,
+                        )?;
                     }
                     _ => {
                         return Err(Error::InvalidRdcCommand(cmd));
@@ -215,9 +227,9 @@ mod tests {
         // Command 1 (bit 0 = 1): 0x02 (SHORT_RLE with cnt=2) -> repeat 5 times, byte='A'
         // Command 2 (bit 1 = 1): 0x02 (SHORT_RLE with cnt=2) -> repeat 5 times, byte='B'
         let input = vec![
-            0xC0, 0x00,  // Control word
-            0x02, b'A',  // Command 1: repeat 'A' 5 times
-            0x02, b'B',  // Command 2: repeat 'B' 5 times
+            0xC0, 0x00, // Control word
+            0x02, b'A', // Command 1: repeat 'A' 5 times
+            0x02, b'B', // Command 2: repeat 'B' 5 times
         ];
         let output = decompressor.decompress(&input, 8192).unwrap();
         assert_eq!(&output[..10], b"AAAAABBBBB");

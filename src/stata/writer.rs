@@ -3,7 +3,7 @@ use crate::stata::error::{Error, Result};
 use polars::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const DTA_VERSION: u16 = 119;
@@ -88,17 +88,21 @@ pub fn pandas_make_stata_column_names(names: &[String]) -> Vec<String> {
 }
 
 pub fn pandas_rename_df(df: &DataFrame) -> Result<DataFrame> {
-    let names = df.get_column_names_str().iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let names = df
+        .get_column_names()
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
     let new_names = pandas_make_stata_column_names(&names);
     let mut out = df.clone();
-    out.set_column_names(new_names).map_err(Error::Polars)?;
+    out.set_column_names(&new_names).map_err(Error::Polars)?;
     Ok(out)
 }
 
 pub fn pandas_prepare_df_for_stata(df: &DataFrame) -> Result<DataFrame> {
     let df = pandas_rename_df(df)?;
     let mut cols = Vec::with_capacity(df.width());
-    for col in df.get_columns() {
+    for col in df.columns() {
         let series = col.as_materialized_series();
         let target = target_dtype_for_series(series)?;
         let out = if &target != series.dtype() {
@@ -108,11 +112,15 @@ pub fn pandas_prepare_df_for_stata(df: &DataFrame) -> Result<DataFrame> {
         };
         cols.push(out.into_column());
     }
-    DataFrame::new(cols).map_err(Error::Polars)
+    DataFrame::new_infer_height(cols).map_err(Error::Polars)
 }
 
 fn pandas_rename_schema(schema: &StataWriteSchema) -> StataWriteSchema {
-    let names = schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+    let names = schema
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .collect::<Vec<_>>();
     let new_names = pandas_make_stata_column_names(&names);
     let mut columns = schema.columns.clone();
     for (col, new) in columns.iter_mut().zip(new_names.iter()) {
@@ -164,7 +172,11 @@ impl StataWriter {
     }
 
     pub fn with_compress(mut self, compress: bool) -> Self {
-        self.compress = if compress { Some(CompressOptions::default()) } else { None };
+        self.compress = if compress {
+            Some(CompressOptions::default())
+        } else {
+            None
+        };
         self
     }
 
@@ -189,7 +201,11 @@ impl StataWriter {
     }
 
     pub fn write_df(&self, df: &DataFrame) -> Result<()> {
-        let original_names = df.get_column_names_str().iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let original_names = df
+            .get_column_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
         let new_names = pandas_make_stata_column_names(&original_names);
         let name_map = build_name_map(&original_names, &new_names);
         let df = match &self.compress {
@@ -209,8 +225,14 @@ impl StataWriter {
             schema.as_ref().and_then(|s| s.variable_labels.clone()),
             self.variable_labels.clone(),
         );
-        let variable_labels = variable_labels.map(|labels| rename_variable_labels(&labels, &name_map));
-        let prepared = PreparedWrite::from_df(&df, schema.as_ref(), value_labels.as_ref(), variable_labels.as_ref())?;
+        let variable_labels =
+            variable_labels.map(|labels| rename_variable_labels(&labels, &name_map));
+        let prepared = PreparedWrite::from_df(
+            &df,
+            schema.as_ref(),
+            value_labels.as_ref(),
+            variable_labels.as_ref(),
+        )?;
         let file = File::create(&self.path)?;
         let writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
         write_dta(writer, &prepared, Some(&df), self.n_threads)?;
@@ -221,17 +243,27 @@ impl StataWriter {
     where
         I: IntoIterator<Item = DataFrame>,
     {
-        let original_names = schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        let original_names = schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>();
         let new_names = pandas_make_stata_column_names(&original_names);
         let name_map = build_name_map(&original_names, &new_names);
         let schema = pandas_rename_schema(&schema);
-        let value_labels = merge_value_labels(schema.value_labels.clone(), self.value_labels.clone());
+        let value_labels =
+            merge_value_labels(schema.value_labels.clone(), self.value_labels.clone());
         let value_labels = value_labels.map(|labels| rename_value_labels(&labels, &name_map));
-        let variable_labels = merge_variable_labels(schema.variable_labels.clone(), self.variable_labels.clone());
-        let variable_labels = variable_labels.map(|labels| rename_variable_labels(&labels, &name_map));
-        let prepared = PreparedWrite::from_schema(&schema, value_labels.as_ref(), variable_labels.as_ref())?;
+        let variable_labels =
+            merge_variable_labels(schema.variable_labels.clone(), self.variable_labels.clone());
+        let variable_labels =
+            variable_labels.map(|labels| rename_variable_labels(&labels, &name_map));
+        let prepared =
+            PreparedWrite::from_schema(&schema, value_labels.as_ref(), variable_labels.as_ref())?;
         if prepared.row_count.is_none() {
-            return Err(Error::ParseError("row_count must be provided for batch writing".to_string()));
+            return Err(Error::ParseError(
+                "row_count must be provided for batch writing".to_string(),
+            ));
         }
         if prepared.has_strl {
             return Err(Error::ParseError(
@@ -244,10 +276,52 @@ impl StataWriter {
         write_dta_descriptors(&mut writer, &prepared)?;
         write_dta_variable_labels(&mut writer, &prepared)?;
         write_dta_characteristics(&mut writer)?;
-        write_dta_data_batches(&mut writer, &prepared, batches)?;
+        let _ = write_dta_data_batches(&mut writer, &prepared, batches)?;
         write_dta_strls(&mut writer, &prepared)?;
         write_dta_value_labels(&mut writer, &prepared)?;
         write_dta_footer(&mut writer)?;
+        Ok(())
+    }
+
+    pub fn write_batches_streaming<I>(&self, batches: I, schema: StataWriteSchema) -> Result<()>
+    where
+        I: IntoIterator<Item = DataFrame>,
+    {
+        let original_names = schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>();
+        let new_names = pandas_make_stata_column_names(&original_names);
+        let name_map = build_name_map(&original_names, &new_names);
+        let schema = pandas_rename_schema(&schema);
+        let value_labels =
+            merge_value_labels(schema.value_labels.clone(), self.value_labels.clone());
+        let value_labels = value_labels.map(|labels| rename_value_labels(&labels, &name_map));
+        let variable_labels =
+            merge_variable_labels(schema.variable_labels.clone(), self.variable_labels.clone());
+        let variable_labels =
+            variable_labels.map(|labels| rename_variable_labels(&labels, &name_map));
+        let prepared =
+            PreparedWrite::from_schema(&schema, value_labels.as_ref(), variable_labels.as_ref())?;
+        if prepared.has_strl {
+            return Err(Error::ParseError(
+                "streaming batch writing with strL is not supported without a pre-pass".to_string(),
+            ));
+        }
+
+        let file = File::create(&self.path)?;
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        let patch_offsets = write_dta_header_with_placeholders(&mut writer, &prepared)?;
+        write_dta_descriptors(&mut writer, &prepared)?;
+        write_dta_variable_labels(&mut writer, &prepared)?;
+        write_dta_characteristics(&mut writer)?;
+        let rows_written = write_dta_data_batches(&mut writer, &prepared, batches)?;
+        write_dta_strls(&mut writer, &prepared)?;
+        write_dta_value_labels(&mut writer, &prepared)?;
+        write_dta_footer(&mut writer)?;
+        patch_header_and_map(&mut writer, &prepared, rows_written, patch_offsets)?;
+        writer.flush()?;
         Ok(())
     }
 }
@@ -308,7 +382,13 @@ impl PreparedWrite {
         variable_labels: Option<&VariableLabels>,
     ) -> Result<Self> {
         let columns = infer_columns(None, Some(schema))?;
-        Self::build(columns, schema.row_count, vec![], value_labels, variable_labels)
+        Self::build(
+            columns,
+            schema.row_count,
+            vec![],
+            value_labels,
+            variable_labels,
+        )
     }
 
     fn from_df(
@@ -336,7 +416,10 @@ impl PreparedWrite {
         }
 
         validate_column_names_unique(&columns)?;
-        let typlist = columns.iter().map(type_code_for_column).collect::<Result<Vec<_>>>()?;
+        let typlist = columns
+            .iter()
+            .map(type_code_for_column)
+            .collect::<Result<Vec<_>>>()?;
         let record_len = columns.iter().map(storage_width_for_column).sum::<usize>();
 
         let varlist_len = DTA_VAR_NAME_LEN * nvar;
@@ -383,11 +466,15 @@ impl PreparedWrite {
     }
 }
 
-fn infer_columns(df: Option<&DataFrame>, schema: Option<&StataWriteSchema>) -> Result<Vec<ColumnSpec>> {
+fn infer_columns(
+    df: Option<&DataFrame>,
+    schema: Option<&StataWriteSchema>,
+) -> Result<Vec<ColumnSpec>> {
     let mut columns = Vec::new();
     if let Some(schema) = schema {
         for col in &schema.columns {
-            let width = if matches!(col.dtype, DataType::String) && col.string_width_bytes.is_none() {
+            let width = if matches!(col.dtype, DataType::String) && col.string_width_bytes.is_none()
+            {
                 if let Some(df) = df {
                     let column = df.column(&col.name).map_err(|e| Error::Polars(e))?;
                     Some(max_string_width(column)?)
@@ -415,8 +502,9 @@ fn infer_columns(df: Option<&DataFrame>, schema: Option<&StataWriteSchema>) -> R
         return Ok(columns);
     }
 
-    let df = df.ok_or_else(|| Error::ParseError("DataFrame required to infer schema".to_string()))?;
-    for column in df.get_columns() {
+    let df =
+        df.ok_or_else(|| Error::ParseError("DataFrame required to infer schema".to_string()))?;
+    for column in df.columns() {
         let series = column.as_materialized_series();
         let dtype = series.dtype().clone();
         let width = if matches!(dtype, DataType::String) {
@@ -465,7 +553,10 @@ fn rename_value_labels(labels: &ValueLabels, name_map: &HashMap<String, String>)
     out
 }
 
-fn rename_variable_labels(labels: &VariableLabels, name_map: &HashMap<String, String>) -> VariableLabels {
+fn rename_variable_labels(
+    labels: &VariableLabels,
+    name_map: &HashMap<String, String>,
+) -> VariableLabels {
     let mut out = HashMap::new();
     for (name, label) in labels {
         let key = name_map.get(name).cloned().unwrap_or_else(|| name.clone());
@@ -474,7 +565,10 @@ fn rename_variable_labels(labels: &VariableLabels, name_map: &HashMap<String, St
     out
 }
 
-fn merge_value_labels(base: Option<ValueLabels>, extra: Option<ValueLabels>) -> Option<ValueLabels> {
+fn merge_value_labels(
+    base: Option<ValueLabels>,
+    extra: Option<ValueLabels>,
+) -> Option<ValueLabels> {
     match (base, extra) {
         (None, None) => None,
         (Some(mut base), Some(extra)) => {
@@ -488,7 +582,10 @@ fn merge_value_labels(base: Option<ValueLabels>, extra: Option<ValueLabels>) -> 
     }
 }
 
-fn merge_variable_labels(base: Option<VariableLabels>, extra: Option<VariableLabels>) -> Option<VariableLabels> {
+fn merge_variable_labels(
+    base: Option<VariableLabels>,
+    extra: Option<VariableLabels>,
+) -> Option<VariableLabels> {
     match (base, extra) {
         (None, None) => None,
         (Some(mut base), Some(extra)) => {
@@ -509,9 +606,11 @@ fn kind_from_dtype(dtype: DataType, width: Option<usize>) -> Result<ColumnKind> 
         DataType::Int32 | DataType::Date => ColumnKind::Int32,
         DataType::Float32 => ColumnKind::Float32,
         DataType::Float64 | DataType::Datetime(_, _) | DataType::Time => ColumnKind::Float64,
-        DataType::Int64 | DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-            ColumnKind::Float64
-        }
+        DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => ColumnKind::Float64,
         DataType::String => {
             let width = width.unwrap_or(1).max(1);
             if width > DTA_MAX_STR {
@@ -552,7 +651,10 @@ fn build_value_labels(
         slot[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
         let table = build_value_label_table(mapping)?;
-        tables.push(ValueLabelTable { name: label_name, table });
+        tables.push(ValueLabelTable {
+            name: label_name,
+            table,
+        });
     }
 
     Ok((lbllist, tables))
@@ -680,7 +782,9 @@ fn format_for_column(col: &ColumnSpec) -> String {
         return fmt.clone();
     }
     match col.kind {
-        ColumnKind::Str { .. } | ColumnKind::StrL => format!("%-{}s", DTA_DEFAULT_DISPLAY_WIDTH_STRING),
+        ColumnKind::Str { .. } | ColumnKind::StrL => {
+            format!("%-{}s", DTA_DEFAULT_DISPLAY_WIDTH_STRING)
+        }
         ColumnKind::Int8 => format!("%{}.0g", DTA_DEFAULT_DISPLAY_WIDTH_BYTE),
         ColumnKind::Int16 => format!("%{}.0g", DTA_DEFAULT_DISPLAY_WIDTH_INT16),
         ColumnKind::Int32 => format!("%{}.0g", DTA_DEFAULT_DISPLAY_WIDTH_INT32),
@@ -733,12 +837,21 @@ fn valid_name(name: &str) -> bool {
 }
 
 fn starts_with_number(name: &str) -> bool {
-    name.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+    name.chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
 }
 
 fn replace_invalid_chars(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -847,6 +960,13 @@ fn build_strls(df: &DataFrame, columns: &[ColumnSpec]) -> Result<Vec<StrlEntry>>
     Ok(entries)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HeaderPatchOffsets {
+    nobs_offset: u64,
+    map_values_offset: u64,
+    map_offset: u64,
+}
+
 fn write_dta<W: Write>(
     mut writer: W,
     prepared: &PreparedWrite,
@@ -895,6 +1015,71 @@ fn write_dta_header_and_map<W: Write>(writer: &mut W, prepared: &PreparedWrite) 
         write_u64(writer, v)?;
     }
     write_tag(writer, "</map>")?;
+    Ok(())
+}
+
+fn write_dta_header_with_placeholders<W: Write + Seek>(
+    writer: &mut W,
+    prepared: &PreparedWrite,
+) -> Result<HeaderPatchOffsets> {
+    write_tag(writer, "<stata_dta>")?;
+    write_tag(writer, "<header>")?;
+    write_string(writer, &format!("<release>{}</release>", DTA_VERSION))?;
+    write_tag(writer, "<byteorder>")?;
+    write_string(writer, "LSF")?;
+    write_tag(writer, "</byteorder>")?;
+    write_tag(writer, "<K>")?;
+    write_u32(writer, prepared.columns.len() as u32)?;
+    write_tag(writer, "</K>")?;
+    write_tag(writer, "<N>")?;
+    let nobs_offset = writer.stream_position()?;
+    write_u64(writer, 0)?;
+    write_tag(writer, "</N>")?;
+    write_tag(writer, "<label>")?;
+    write_u16(writer, 0)?;
+    write_tag(writer, "</label>")?;
+    write_tag(writer, "<timestamp>")?;
+    write_u8(writer, 0)?;
+    write_tag(writer, "</timestamp>")?;
+    write_tag(writer, "</header>")?;
+
+    let map_offset = writer.stream_position()?;
+    write_tag(writer, "<map>")?;
+    let map_values_offset = writer.stream_position()?;
+    for _ in 0..14 {
+        write_u64(writer, 0)?;
+    }
+    write_tag(writer, "</map>")?;
+
+    Ok(HeaderPatchOffsets {
+        nobs_offset,
+        map_values_offset,
+        map_offset,
+    })
+}
+
+fn patch_header_and_map<W: Write + Seek>(
+    writer: &mut W,
+    prepared: &PreparedWrite,
+    rows_written: usize,
+    offsets: HeaderPatchOffsets,
+) -> Result<()> {
+    let rows_written_u64 = u64::try_from(rows_written)
+        .map_err(|_| Error::ParseError("row_count exceeds u64".to_string()))?;
+    let end_pos = writer.stream_position()?;
+
+    writer.seek(SeekFrom::Start(offsets.nobs_offset))?;
+    write_u64(writer, rows_written_u64)?;
+
+    let mut patched = prepared.clone();
+    patched.row_count = Some(rows_written);
+    let map = build_map(&patched, offsets.map_offset);
+    writer.seek(SeekFrom::Start(offsets.map_values_offset))?;
+    for v in map {
+        write_u64(writer, v)?;
+    }
+
+    writer.seek(SeekFrom::Start(end_pos))?;
     Ok(())
 }
 
@@ -985,9 +1170,7 @@ fn measure_characteristics() -> u64 {
 
 fn measure_data(prepared: &PreparedWrite) -> u64 {
     let rows = prepared.row_count.unwrap_or(0) as u64;
-    ("<data>".len() as u64)
-        + (prepared.record_len as u64) * rows
-        + "</data>".len() as u64
+    ("<data>".len() as u64) + (prepared.record_len as u64) * rows + "</data>".len() as u64
 }
 
 fn measure_strls(prepared: &PreparedWrite) -> u64 {
@@ -1070,7 +1253,11 @@ fn write_dta_data_df_parallel<W: Write>(
     let record_len = prepared.record_len;
     let chunk_rows = DTA_PARALLEL_CHUNK_ROWS.max(1);
     let n_chunks = (nrows + chunk_rows - 1) / chunk_rows;
-    let col_widths: Vec<usize> = prepared.columns.iter().map(storage_width_for_column).collect();
+    let col_widths: Vec<usize> = prepared
+        .columns
+        .iter()
+        .map(storage_width_for_column)
+        .collect();
     let mut col_offsets = Vec::with_capacity(prepared.columns.len());
     let mut acc = 0usize;
     for w in &col_widths {
@@ -1124,7 +1311,11 @@ fn write_dta_data_df_parallel<W: Write>(
     Ok(())
 }
 
-fn write_dta_data_batches<W: Write, I>(writer: &mut W, prepared: &PreparedWrite, batches: I) -> Result<()>
+fn write_dta_data_batches<W: Write, I>(
+    writer: &mut W,
+    prepared: &PreparedWrite,
+    batches: I,
+) -> Result<usize>
 where
     I: IntoIterator<Item = DataFrame>,
 {
@@ -1154,10 +1345,12 @@ where
     write_tag(writer, "</data>")?;
     if let Some(expected) = prepared.row_count {
         if expected != rows_written {
-            return Err(Error::ParseError("row_count mismatch for batch writing".to_string()));
+            return Err(Error::ParseError(
+                "row_count mismatch for batch writing".to_string(),
+            ));
         }
     }
-    Ok(())
+    Ok(rows_written)
 }
 
 fn write_cell(buf: &mut [u8], series: &Series, spec: &ColumnSpec, row_idx: usize) -> Result<()> {
@@ -1276,7 +1469,12 @@ fn write_str(buf: &mut [u8], series: &Series, row_idx: usize, width: usize) -> R
     Ok(())
 }
 
-fn write_strl_ref(buf: &mut [u8], series: &Series, row_idx: usize, spec: &ColumnSpec) -> Result<()> {
+fn write_strl_ref(
+    buf: &mut [u8],
+    series: &Series,
+    row_idx: usize,
+    spec: &ColumnSpec,
+) -> Result<()> {
     let value = series.get(row_idx)?;
     if anyvalue_is_null(&value) {
         buf.fill(0);

@@ -20,9 +20,11 @@ fn test_sas_all_files() {
             limit = 0;
         }
         if limit == 0 {
-            let schema = readstat_schema(&path, None, Some(ReadStatFormat::Sas)).expect("schema sas");
+            let schema =
+                readstat_schema(&path, None, Some(ReadStatFormat::Sas)).expect("schema sas");
             assert_eq!(schema.len(), reader.metadata().column_count);
-            let meta = readstat_metadata_json(&path, Some(ReadStatFormat::Sas)).expect("metadata sas");
+            let meta =
+                readstat_metadata_json(&path, Some(ReadStatFormat::Sas)).expect("metadata sas");
             assert!(!meta.trim().is_empty());
             continue;
         }
@@ -43,7 +45,12 @@ fn test_sas_all_files() {
         let mut offset = 0usize;
         while offset < limit {
             let take = usize::min(STREAM_BATCH, limit - offset);
-            let df = reader.read().with_offset(offset).with_limit(take).finish().expect("sas batch");
+            let df = reader
+                .read()
+                .with_offset(offset)
+                .with_limit(take)
+                .finish()
+                .expect("sas batch");
             rows += df.height();
             offset += take;
         }
@@ -57,13 +64,19 @@ fn test_stata_all_files() {
         let reader = StataReader::open(&path).expect("open stata");
         let row_count = reader.metadata().row_count as usize;
         let limit = usize::min(MAX_ROWS, row_count);
-        let df = reader.read().with_limit(limit).finish().expect("read stata");
+        let df = reader
+            .read()
+            .with_limit(limit)
+            .finish()
+            .expect("read stata");
         assert_eq!(df.height(), limit);
 
-        let schema = readstat_schema(&path, None, Some(ReadStatFormat::Stata)).expect("schema stata");
+        let schema =
+            readstat_schema(&path, None, Some(ReadStatFormat::Stata)).expect("schema stata");
         assert_eq!(schema.len(), reader.metadata().variables.len());
 
-        let meta = readstat_metadata_json(&path, Some(ReadStatFormat::Stata)).expect("metadata stata");
+        let meta =
+            readstat_metadata_json(&path, Some(ReadStatFormat::Stata)).expect("metadata stata");
         assert!(!meta.trim().is_empty());
 
         let mut rows = 0usize;
@@ -95,7 +108,8 @@ fn test_spss_all_files() {
         let schema = readstat_schema(&path, None, Some(ReadStatFormat::Spss)).expect("schema spss");
         assert_eq!(schema.len(), reader.metadata().variables.len());
 
-        let meta = readstat_metadata_json(&path, Some(ReadStatFormat::Spss)).expect("metadata spss");
+        let meta =
+            readstat_metadata_json(&path, Some(ReadStatFormat::Spss)).expect("metadata spss");
         assert!(!meta.trim().is_empty());
 
         let mut rows = 0usize;

@@ -19,16 +19,12 @@ pub mod reader;
 pub use error::{Error, Result};
 pub use polars_output::scan_sas7bdat;
 pub use reader::Sas7bdatReader;
-pub use writer::{
-    SasValueLabelKey,
-    SasValueLabelMap,
-    SasValueLabels,
-    SasVariableLabels,
-    SasWriter,
-};
-pub use types::{Compression, Endian, Format, Platform};
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
+pub use types::{Compression, Endian, Format, Platform};
+pub use writer::{
+    SasValueLabelKey, SasValueLabelMap, SasValueLabels, SasVariableLabels, SasWriter,
+};
 
 use serde_json::json;
 use std::path::Path;
@@ -37,16 +33,20 @@ use std::path::Path;
 pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
     let reader = Sas7bdatReader::open(path)?;
     let meta = reader.metadata();
-    let columns = meta.columns.iter().map(|c| {
-        json!({
-            "name": c.name,
-            "label": c.label,
-            "format": c.format,
-            "type": format!("{:?}", c.col_type),
-            "offset": c.offset,
-            "length": c.length,
+    let columns = meta
+        .columns
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c.name,
+                "label": c.label,
+                "format": c.format,
+                "type": format!("{:?}", c.col_type),
+                "offset": c.offset,
+                "length": c.length,
+            })
         })
-    }).collect::<Vec<_>>();
+        .collect::<Vec<_>>();
     let v = json!({
         "compression": format!("{:?}", meta.compression),
         "row_count": meta.row_count,

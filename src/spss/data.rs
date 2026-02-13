@@ -1,14 +1,14 @@
 use crate::spss::error::{Error, Result};
-use crate::spss::types::{Endian, Metadata, VarType, Variable, FormatClass};
+use crate::spss::types::{Endian, FormatClass, Metadata, VarType, Variable};
 use flate2::read::ZlibDecoder;
 use polars::prelude::*;
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const SAV_MISSING_DOUBLE: u64 = 0xFFEFFFFFFFFFFFFF;
@@ -115,8 +115,14 @@ pub fn read_data_frame_with_reader(
     user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<DataFrame> {
-    let data_offset = metadata.data_offset.ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
-    let record_len = metadata.variables.iter().map(|v| v.width * 8).sum::<usize>();
+    let data_offset = metadata
+        .data_offset
+        .ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
+    let record_len = metadata
+        .variables
+        .iter()
+        .map(|v| v.width * 8)
+        .sum::<usize>();
 
     reader.seek(SeekFrom::Start(data_offset))?;
 
@@ -164,10 +170,21 @@ pub fn read_data_frame_with_reader(
                 num_cache: Some(NumericStringCache::new()),
             },
             (VarType::Numeric, false) => match var.format_class {
-                Some(FormatClass::Date) => ColumnBuilder::Date(PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), limit)),
-                Some(FormatClass::DateTime) => ColumnBuilder::DateTime(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit)),
-                Some(FormatClass::Time) => ColumnBuilder::Time(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit)),
-                None => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), limit)),
+                Some(FormatClass::Date) => ColumnBuilder::Date(
+                    PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), limit),
+                ),
+                Some(FormatClass::DateTime) => ColumnBuilder::DateTime(PrimitiveChunkedBuilder::<
+                    Int64Type,
+                >::new(
+                    name.into(), limit
+                )),
+                Some(FormatClass::Time) => ColumnBuilder::Time(
+                    PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit),
+                ),
+                None => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(
+                    name.into(),
+                    limit,
+                )),
             },
             (VarType::Str, _) => ColumnBuilder::Utf8 {
                 builder: StringChunkedBuilder::new(name.into(), limit),
@@ -203,21 +220,9 @@ pub fn read_data_frame_with_reader(
         for _row_idx in start_row..end_row {
             reader.read_exact(&mut row_buf)?;
             if let Some(numeric_plans) = numeric_plans.as_deref() {
-                append_numeric_row(
-                    &mut builders,
-                    &plans,
-                    numeric_plans,
-                    &row_buf,
-                    endian,
-                )?;
+                append_numeric_row(&mut builders, &plans, numeric_plans, &row_buf, endian)?;
             } else {
-                append_row(
-                    &mut builders,
-                    &plans,
-                    &row_buf,
-                    endian,
-                    metadata.encoding,
-                )?;
+                append_row(&mut builders, &plans, &row_buf, endian, metadata.encoding)?;
             }
         }
     } else if compression == 1 {
@@ -231,21 +236,9 @@ pub fn read_data_frame_with_reader(
             }
             if row_idx >= start_row {
                 if let Some(numeric_plans) = numeric_plans.as_deref() {
-                    append_numeric_row(
-                        &mut builders,
-                        &plans,
-                        numeric_plans,
-                        &row_buf,
-                        endian,
-                    )?;
+                    append_numeric_row(&mut builders, &plans, numeric_plans, &row_buf, endian)?;
                 } else {
-                    append_row(
-                        &mut builders,
-                        &plans,
-                        &row_buf,
-                        endian,
-                        metadata.encoding,
-                    )?;
+                    append_row(&mut builders, &plans, &row_buf, endian, metadata.encoding)?;
                 }
             }
             row_idx += 1;
@@ -266,14 +259,17 @@ pub fn read_data_frame_with_reader(
             metadata.encoding,
         )?;
     } else {
-        return Err(Error::Unsupported(format!("SPSS compression {} not supported", compression)));
+        return Err(Error::Unsupported(format!(
+            "SPSS compression {} not supported",
+            compression
+        )));
     }
 
     let mut cols = Vec::with_capacity(builders.len());
     for b in builders {
         cols.push(b.finish().into());
     }
-    DataFrame::new(cols).map_err(|e| Error::ParseError(e.to_string()))
+    DataFrame::new_infer_height(cols).map_err(|e| Error::ParseError(e.to_string()))
 }
 
 pub fn read_data_columns_uncompressed(
@@ -287,8 +283,14 @@ pub fn read_data_columns_uncompressed(
     user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<Vec<Series>> {
-    let data_offset = metadata.data_offset.ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
-    let record_len = metadata.variables.iter().map(|v| v.width * 8).sum::<usize>();
+    let data_offset = metadata
+        .data_offset
+        .ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
+    let record_len = metadata
+        .variables
+        .iter()
+        .map(|v| v.width * 8)
+        .sum::<usize>();
 
     let file = File::open(path)?;
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
@@ -338,10 +340,21 @@ pub fn read_data_columns_uncompressed(
                 num_cache: Some(NumericStringCache::new()),
             },
             (VarType::Numeric, false) => match var.format_class {
-                Some(FormatClass::Date) => ColumnBuilder::Date(PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), limit)),
-                Some(FormatClass::DateTime) => ColumnBuilder::DateTime(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit)),
-                Some(FormatClass::Time) => ColumnBuilder::Time(PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit)),
-                None => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), limit)),
+                Some(FormatClass::Date) => ColumnBuilder::Date(
+                    PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), limit),
+                ),
+                Some(FormatClass::DateTime) => ColumnBuilder::DateTime(PrimitiveChunkedBuilder::<
+                    Int64Type,
+                >::new(
+                    name.into(), limit
+                )),
+                Some(FormatClass::Time) => ColumnBuilder::Time(
+                    PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit),
+                ),
+                None => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(
+                    name.into(),
+                    limit,
+                )),
             },
             (VarType::Str, _) => ColumnBuilder::Utf8 {
                 builder: StringChunkedBuilder::new(name.into(), limit),
@@ -373,13 +386,7 @@ pub fn read_data_columns_uncompressed(
     let mut row_buf = vec![0u8; record_len];
     for _row_idx in start_row..end_row {
         reader.read_exact(&mut row_buf)?;
-        append_row(
-            &mut builders,
-            &plans,
-            &row_buf,
-            endian,
-            metadata.encoding,
-        )?;
+        append_row(&mut builders, &plans, &row_buf, endian, metadata.encoding)?;
     }
 
     let mut cols = Vec::with_capacity(builders.len());
@@ -398,13 +405,7 @@ fn append_row(
 ) -> Result<()> {
     for (i, plan) in plans.iter().enumerate() {
         let slice = &row_buf[plan.offset..plan.offset + plan.width];
-        append_value(
-            &mut builders[i],
-            plan,
-            slice,
-            endian,
-            encoding,
-        )?;
+        append_value(&mut builders[i], plan, slice, endian, encoding)?;
     }
     Ok(())
 }
@@ -414,7 +415,10 @@ struct NumericPlan {
     plan_idx: usize,
 }
 
-fn build_numeric_plans(plans: &[ColumnPlan], builders: &[ColumnBuilder]) -> Option<Vec<NumericPlan>> {
+fn build_numeric_plans(
+    plans: &[ColumnPlan],
+    builders: &[ColumnBuilder],
+) -> Option<Vec<NumericPlan>> {
     if plans.is_empty() {
         return None;
     }
@@ -446,7 +450,8 @@ fn append_numeric_row(
         let slice = &row_buf[col_plan.offset..col_plan.offset + col_plan.width];
         match &mut builders[plan.builder_idx] {
             ColumnBuilder::Float64(b) => {
-                let bytes: [u8; 8] = slice[..8].try_into()
+                let bytes: [u8; 8] = slice[..8]
+                    .try_into()
                     .map_err(|_| Error::ParseError("short numeric value".to_string()))?;
                 let v = match endian {
                     Endian::Little => f64::from_le_bytes(bytes),
@@ -474,8 +479,14 @@ fn append_value(
 ) -> Result<()> {
     match (builder, plan.var_type) {
         (ColumnBuilder::Float64(b), VarType::Numeric) => {
-            let t0 = if profile_enabled() { Some(Instant::now()) } else { None };
-            let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| Error::ParseError("short numeric value".to_string()))?;
+            let t0 = if profile_enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let bytes: [u8; 8] = buf[..8]
+                .try_into()
+                .map_err(|_| Error::ParseError("short numeric value".to_string()))?;
             let v = match endian {
                 Endian::Little => f64::from_le_bytes(bytes),
                 Endian::Big => f64::from_be_bytes(bytes),
@@ -492,7 +503,9 @@ fn append_value(
             }
         }
         (ColumnBuilder::Date(b), VarType::Numeric) => {
-            let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| Error::ParseError("short numeric value".to_string()))?;
+            let bytes: [u8; 8] = buf[..8]
+                .try_into()
+                .map_err(|_| Error::ParseError("short numeric value".to_string()))?;
             let v = match endian {
                 Endian::Little => f64::from_le_bytes(bytes),
                 Endian::Big => f64::from_be_bytes(bytes),
@@ -505,7 +518,9 @@ fn append_value(
             }
         }
         (ColumnBuilder::DateTime(b), VarType::Numeric) => {
-            let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| Error::ParseError("short numeric value".to_string()))?;
+            let bytes: [u8; 8] = buf[..8]
+                .try_into()
+                .map_err(|_| Error::ParseError("short numeric value".to_string()))?;
             let v = match endian {
                 Endian::Little => f64::from_le_bytes(bytes),
                 Endian::Big => f64::from_be_bytes(bytes),
@@ -518,7 +533,9 @@ fn append_value(
             }
         }
         (ColumnBuilder::Time(b), VarType::Numeric) => {
-            let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| Error::ParseError("short numeric value".to_string()))?;
+            let bytes: [u8; 8] = buf[..8]
+                .try_into()
+                .map_err(|_| Error::ParseError("short numeric value".to_string()))?;
             let v = match endian {
                 Endian::Little => f64::from_le_bytes(bytes),
                 Endian::Big => f64::from_be_bytes(bytes),
@@ -531,8 +548,14 @@ fn append_value(
             }
         }
         (ColumnBuilder::Utf8 { builder, num_cache }, VarType::Numeric) => {
-            let t0 = if profile_enabled() { Some(Instant::now()) } else { None };
-            let bytes: [u8; 8] = buf[..8].try_into().map_err(|_| Error::ParseError("short numeric value".to_string()))?;
+            let t0 = if profile_enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let bytes: [u8; 8] = buf[..8]
+                .try_into()
+                .map_err(|_| Error::ParseError("short numeric value".to_string()))?;
             let v = match endian {
                 Endian::Little => f64::from_le_bytes(bytes),
                 Endian::Big => f64::from_be_bytes(bytes),
@@ -541,7 +564,11 @@ fn append_value(
             if is_missing_numeric(plan, v, bits) {
                 builder.append_null();
             } else if let Some(labels) = plan.label_map.as_deref() {
-                let t_label = if profile_enabled() { Some(Instant::now()) } else { None };
+                let t_label = if profile_enabled() {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let label = labels.get_float_bits(bits);
                 if let Some(t_label) = t_label {
                     add_ns(&PROFILE_LABEL_NS, t_label.elapsed());
@@ -582,7 +609,11 @@ fn append_value(
             }
         }
         (ColumnBuilder::Utf8 { builder, .. }, VarType::Str) => {
-            let t0 = if profile_enabled() { Some(Instant::now()) } else { None };
+            let t0 = if profile_enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
             if plan.missing_string_as_null && buf.iter().all(|b| *b == b' ' || *b == 0) {
                 builder.append_null();
                 return Ok(());
@@ -616,7 +647,11 @@ fn append_value(
             while end > 0 && (raw[end - 1] == b' ' || raw[end - 1] == 0) {
                 end -= 1;
             }
-            let t_decode = if profile_enabled() { Some(Instant::now()) } else { None };
+            let t_decode = if profile_enabled() {
+                Some(Instant::now())
+            } else {
+                None
+            };
             let s_owned;
             let s = if encoding == encoding_rs::UTF_8 {
                 let slice = &raw[..end];
@@ -643,11 +678,18 @@ fn append_value(
 
             let is_missing = (plan.missing_string_as_null && s.is_empty())
                 || (plan.user_missing_as_null
-                    && plan.missing_set.as_ref().map_or(false, |set| set.contains(s)));
+                    && plan
+                        .missing_set
+                        .as_ref()
+                        .map_or(false, |set| set.contains(s)));
             if is_missing {
                 builder.append_null();
             } else if let Some(labels) = plan.label_map.as_deref() {
-                let t_label = if profile_enabled() { Some(Instant::now()) } else { None };
+                let t_label = if profile_enabled() {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
                 let label = labels.get_str(s);
                 if let Some(t_label) = t_label {
                     add_ns(&PROFILE_LABEL_NS, t_label.elapsed());
@@ -671,7 +713,11 @@ fn append_value(
 }
 
 fn is_missing_numeric(plan: &ColumnPlan, v: f64, bits: u64) -> bool {
-    if bits == SAV_MISSING_DOUBLE || bits == SAV_LOWEST_DOUBLE || bits == SAV_HIGHEST_DOUBLE || v.is_nan() {
+    if bits == SAV_MISSING_DOUBLE
+        || bits == SAV_LOWEST_DOUBLE
+        || bits == SAV_HIGHEST_DOUBLE
+        || v.is_nan()
+    {
         return true;
     }
     if !plan.user_missing_as_null {
@@ -790,7 +836,10 @@ impl ColumnBuilder {
         match self {
             ColumnBuilder::Float64(b) => b.finish().into_series(),
             ColumnBuilder::Date(b) => b.finish().into_date().into_series(),
-            ColumnBuilder::DateTime(b) => b.finish().into_datetime(TimeUnit::Milliseconds, None).into_series(),
+            ColumnBuilder::DateTime(b) => b
+                .finish()
+                .into_datetime(TimeUnit::Milliseconds, None)
+                .into_series(),
             ColumnBuilder::Time(b) => b.finish().into_time().into_series(),
             ColumnBuilder::Utf8 { builder, .. } => builder.finish().into_series(),
         }
@@ -987,7 +1036,8 @@ impl SavRowStream {
                 if *input_offset + 8 > input.len() {
                     return Ok(StreamStatus::NeedData);
                 }
-                self.control_chunk.copy_from_slice(&input[*input_offset..*input_offset + 8]);
+                self.control_chunk
+                    .copy_from_slice(&input[*input_offset..*input_offset + 8]);
                 *input_offset += 8;
                 self.control_i = 0;
             }
@@ -1093,21 +1143,9 @@ fn read_zsav_data<R: Read + Seek>(
                 StreamStatus::FinishedRow => {
                     if row_idx >= start_row && row_idx < end_row {
                         if let Some(numeric_plans) = numeric_plans {
-                            append_numeric_row(
-                                builders,
-                                plans,
-                                numeric_plans,
-                                row_buf,
-                                endian,
-                            )?;
+                            append_numeric_row(builders, plans, numeric_plans, row_buf, endian)?;
                         } else {
-                            append_row(
-                                builders,
-                                plans,
-                                row_buf,
-                                endian,
-                                encoding,
-                            )?;
+                            append_row(builders, plans, row_buf, endian, encoding)?;
                         }
                     }
                     row_idx += 1;

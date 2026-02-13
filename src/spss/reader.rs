@@ -1,15 +1,15 @@
+use crate::spss::data::{read_data_columns_uncompressed, read_data_frame};
 use crate::spss::error::{Error, Result};
-use crate::spss::types::{Header, Metadata};
 use crate::spss::header::read_header;
 use crate::spss::metadata::read_metadata;
-use crate::spss::data::{read_data_frame, read_data_columns_uncompressed};
+use crate::spss::types::{Header, Metadata};
 use polars::prelude::*;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::fs::File;
 use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct SpssReader {
     path: PathBuf,
@@ -24,7 +24,11 @@ impl SpssReader {
         let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
         let header = read_header(&mut reader)?;
         let metadata = read_metadata(&mut reader, &header)?;
-        Ok(Self { path, header, metadata })
+        Ok(Self {
+            path,
+            header,
+            metadata,
+        })
     }
 
     pub fn metadata(&self) -> &Metadata {
@@ -75,19 +79,51 @@ impl<'a> ReadBuilder<'a> {
         }
     }
 
-    pub fn with_columns(mut self, cols: Vec<String>) -> Self { self.columns = Some(cols); self }
-    pub fn with_limit(mut self, limit: usize) -> Self { self.limit = Some(limit); self }
-    pub fn with_offset(mut self, offset: usize) -> Self { self.offset = offset; self }
-    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self { self.schema = Some(schema); self }
-    pub fn with_n_threads(mut self, n: usize) -> Self { self.num_threads = Some(n); self }
-    pub fn with_chunk_size(mut self, n: usize) -> Self { self.chunk_size = Some(n); self }
-    pub fn sequential(mut self) -> Self { self.parallel = false; self }
-    pub fn missing_string_as_null(mut self, v: bool) -> Self { self.missing_string_as_null = v; self }
-    pub fn user_missing_as_null(mut self, v: bool) -> Self { self.user_missing_as_null = v; self }
-    pub fn value_labels_as_strings(mut self, v: bool) -> Self { self.value_labels_as_strings = v; self }
+    pub fn with_columns(mut self, cols: Vec<String>) -> Self {
+        self.columns = Some(cols);
+        self
+    }
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+    pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
+        self.schema = Some(schema);
+        self
+    }
+    pub fn with_n_threads(mut self, n: usize) -> Self {
+        self.num_threads = Some(n);
+        self
+    }
+    pub fn with_chunk_size(mut self, n: usize) -> Self {
+        self.chunk_size = Some(n);
+        self
+    }
+    pub fn sequential(mut self) -> Self {
+        self.parallel = false;
+        self
+    }
+    pub fn missing_string_as_null(mut self, v: bool) -> Self {
+        self.missing_string_as_null = v;
+        self
+    }
+    pub fn user_missing_as_null(mut self, v: bool) -> Self {
+        self.user_missing_as_null = v;
+        self
+    }
+    pub fn value_labels_as_strings(mut self, v: bool) -> Self {
+        self.value_labels_as_strings = v;
+        self
+    }
 
     pub fn finish(self) -> Result<DataFrame> {
-        let limit = self.limit.unwrap_or(self.reader.metadata.row_count as usize);
+        let limit = self
+            .limit
+            .unwrap_or(self.reader.metadata.row_count as usize);
         let cols = resolve_column_indices(&self.reader.metadata, self.columns.as_deref())?;
 
         let mut df = if self.parallel && limit > 0 {
@@ -184,7 +220,9 @@ impl SpssReader {
         }
         let n_chunks = (count + chunk_size - 1) / chunk_size;
 
-        let pool = ThreadPoolBuilder::new().num_threads(n_threads).build()
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(n_threads)
+            .build()
             .map_err(|e| Error::ParseError(format!("thread pool error: {}", e)))?;
 
         let mut dfs: Vec<(usize, Vec<Series>)> = pool.install(|| {
@@ -214,7 +252,6 @@ impl SpssReader {
         let chunks = dfs.into_iter().map(|(_, df)| df).collect::<Vec<_>>();
         combine_column_chunks(chunks)
     }
-
 }
 
 fn combine_column_chunks(chunks: Vec<Vec<Series>>) -> Result<DataFrame> {
@@ -224,7 +261,7 @@ fn combine_column_chunks(chunks: Vec<Vec<Series>>) -> Result<DataFrame> {
     if chunks.len() == 1 {
         let cols = chunks.into_iter().next().unwrap();
         let columns = cols.into_iter().map(Column::from).collect::<Vec<_>>();
-        return DataFrame::new(columns).map_err(|e| Error::ParseError(e.to_string()));
+        return DataFrame::new_infer_height(columns).map_err(|e| Error::ParseError(e.to_string()));
     }
 
     let ncols = chunks[0].len();
@@ -234,7 +271,9 @@ fn combine_column_chunks(chunks: Vec<Vec<Series>>) -> Result<DataFrame> {
 
     for cols in chunks {
         if cols.len() != ncols {
-            return Err(Error::ParseError("column count mismatch while combining frames".to_string()));
+            return Err(Error::ParseError(
+                "column count mismatch while combining frames".to_string(),
+            ));
         }
         for (i, col) in cols.into_iter().enumerate() {
             columns[i].push(col);
@@ -256,19 +295,25 @@ fn combine_column_chunks(chunks: Vec<Vec<Series>>) -> Result<DataFrame> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    DataFrame::new(combined).map_err(|e| Error::ParseError(e.to_string()))
+    DataFrame::new_infer_height(combined).map_err(|e| Error::ParseError(e.to_string()))
 }
 
-fn resolve_column_indices(metadata: &Metadata, cols: Option<&[String]>) -> Result<Option<Vec<usize>>> {
+fn resolve_column_indices(
+    metadata: &Metadata,
+    cols: Option<&[String]>,
+) -> Result<Option<Vec<usize>>> {
     cols.map(|cols| {
-        cols.iter().map(|name| {
-            metadata
-                .variables
-                .iter()
-                .position(|v| v.name == *name)
-                .ok_or_else(|| Error::ParseError(format!("Unknown column: {}", name)))
-        }).collect::<Result<Vec<_>>>()
-    }).transpose()
+        cols.iter()
+            .map(|name| {
+                metadata
+                    .variables
+                    .iter()
+                    .position(|v| v.name == *name)
+                    .ok_or_else(|| Error::ParseError(format!("Unknown column: {}", name)))
+            })
+            .collect::<Result<Vec<_>>>()
+    })
+    .transpose()
 }
 
 fn cast_dataframe(mut df: DataFrame, schema: &Schema) -> Result<DataFrame> {
@@ -278,7 +323,7 @@ fn cast_dataframe(mut df: DataFrame, schema: &Schema) -> Result<DataFrame> {
                 .as_materialized_series()
                 .cast(dtype)
                 .map_err(|e| Error::ParseError(format!("Cast failed for {}: {}", name, e)))?;
-            df.replace(name, casted)
+            df.replace(name, casted.into())
                 .map_err(|e| Error::ParseError(format!("Replace failed for {}: {}", name, e)))?;
         }
     }

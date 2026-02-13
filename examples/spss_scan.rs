@@ -12,25 +12,21 @@ fn main() -> PolarsResult<()> {
     let path = args[1].clone();
     let threads = args.get(2).and_then(|s| s.parse::<usize>().ok());
     let chunk_size = args.get(3).and_then(|s| s.parse::<usize>().ok());
-    let missing_string_as_null = args
-        .get(4)
-        .map(|s| s == "true" || s == "1")
-        .unwrap_or(true);
-    let user_missing_as_null = args
-        .get(5)
-        .map(|s| s == "true" || s == "1")
-        .unwrap_or(true);
-    let value_labels_as_strings = args
-        .get(6)
-        .map(|s| s == "true" || s == "1")
-        .unwrap_or(true);
+    let missing_string_as_null = args.get(4).map(|s| s == "true" || s == "1").unwrap_or(true);
+    let user_missing_as_null = args.get(5).map(|s| s == "true" || s == "1").unwrap_or(true);
+    let value_labels_as_strings = args.get(6).map(|s| s == "true" || s == "1").unwrap_or(true);
     let compress = args
         .get(7)
         .map(|s| s == "true" || s == "1")
         .unwrap_or(false);
     let compress_cols = args
         .get(8)
-        .map(|s| s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect::<Vec<_>>())
+        .map(|s| {
+            s.split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect::<Vec<_>>()
+        })
         .filter(|v| !v.is_empty());
 
     let mut compress_opts = CompressOptionsLite::default();
@@ -48,7 +44,7 @@ fn main() -> PolarsResult<()> {
         missing_string_as_null: Some(missing_string_as_null),
         user_missing_as_null: Some(user_missing_as_null),
         value_labels_as_strings: Some(value_labels_as_strings),
-        preserve_order:Some(true),
+        preserve_order: Some(true),
         compress_opts,
     };
     let df = scan_sav(path, opts)?.collect()?;

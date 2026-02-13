@@ -22,7 +22,12 @@ pub struct ValueParser {
 impl ValueParser {
     pub fn new(endian: Endian, encoding_byte: u8, missing_string_as_null: bool) -> Self {
         let encoding = encoding::get_encoding(encoding_byte);
-        Self { endian, encoding, encoding_byte, missing_string_as_null }
+        Self {
+            endian,
+            encoding,
+            encoding_byte,
+            missing_string_as_null,
+        }
     }
 
     /// Parse a single column value from row bytes
@@ -112,7 +117,6 @@ impl ValueParser {
 
         Ok(Value::Character(Some(s)))
     }
-
 }
 
 const SAS_MISSING_MIN: u64 = 0x7ff0_0000_0000_0000;
@@ -215,7 +219,10 @@ mod tests {
         let value = parser.parse_numeric(short).unwrap();
         match value {
             Value::Numeric(Some(v)) => assert!((v - 1.0).abs() < 0.001, "Expected ~1.0, got {}", v),
-            _ => panic!("Expected numeric value for short 3-byte LE, got {:?}", value),
+            _ => panic!(
+                "Expected numeric value for short 3-byte LE, got {:?}",
+                value
+            ),
         }
 
         // Value 2.0 as f64 LE bytes: [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40]
@@ -246,7 +253,10 @@ mod tests {
         let value = parser.parse_numeric(short).unwrap();
         match value {
             Value::Numeric(Some(v)) => assert!((v - 1.0).abs() < 0.001, "Expected ~1.0, got {}", v),
-            _ => panic!("Expected numeric value for short 3-byte BE, got {:?}", value),
+            _ => panic!(
+                "Expected numeric value for short 3-byte BE, got {:?}",
+                value
+            ),
         }
     }
 

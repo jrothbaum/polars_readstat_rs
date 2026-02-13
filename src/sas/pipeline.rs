@@ -2,9 +2,9 @@ use crate::data::{DataReader, DataSubheader};
 use crate::error::Result;
 use crate::page::PageReader;
 use crate::polars_output::DataFrameBuilder;
+use crate::polars_output::{kind_for_column, ColumnKind};
 use crate::types::{ColumnType, Endian, Format, Header, Metadata};
-use crate::value::{decode_numeric_bytes_mask, parse_row_values_into, ValueParser, Value};
-use crate::polars_output::{ColumnKind, kind_for_column};
+use crate::value::{decode_numeric_bytes_mask, parse_row_values_into, Value, ValueParser};
 use polars::prelude::*;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -31,7 +31,7 @@ pub fn read_pipeline(
     // We send (chunk_idx, Vec<row_bytes>) so workers can build columnar chunks
     let (row_tx, row_rx) = mpsc::sync_channel::<(usize, Vec<Vec<u8>>)>(100);
     let (result_tx, result_rx) = mpsc::channel::<(usize, DataFrame)>();
-    
+
     let row_rx = Arc::new(Mutex::new(row_rx));
     let col_indices_arc = col_indices.map(|c| Arc::new(c.to_vec()));
 
@@ -43,9 +43,18 @@ pub fn read_pipeline(
     thread::spawn(move || {
         let file = File::open(&path_buf).ok()?;
         let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(header_clone.header_length as u64)).ok()?;
+        reader
+            .seek(SeekFrom::Start(header_clone.header_length as u64))
+            .ok()?;
         let page_reader = PageReader::new(reader, header_clone, endian, format);
-        let mut data_reader = DataReader::new(page_reader, metadata_clone, endian, format, initial_data_subheaders_clone).ok()?;
+        let mut data_reader = DataReader::new(
+            page_reader,
+            metadata_clone,
+            endian,
+            format,
+            initial_data_subheaders_clone,
+        )
+        .ok()?;
 
         let mut count = 0usize;
         let mut chunk_idx = 0usize;
@@ -55,10 +64,19 @@ pub fn read_pipeline(
             chunk.push(row_bytes);
             count += 1;
             if chunk.len() >= chunk_size {
-                if row_tx.send((chunk_idx, std::mem::take(&mut chunk))).is_err() { break; }
+                if row_tx
+                    .send((chunk_idx, std::mem::take(&mut chunk)))
+                    .is_err()
+                {
+                    break;
+                }
                 chunk_idx += 1;
             }
-            if let Some(limit) = limit { if count >= limit { break; } }
+            if let Some(limit) = limit {
+                if count >= limit {
+                    break;
+                }
+            }
         }
         if !chunk.is_empty() {
             let _ = row_tx.send((chunk_idx, chunk));
@@ -73,14 +91,19 @@ pub fn read_pipeline(
         let metadata = metadata.clone();
         let cols = col_indices_arc.clone();
         thread::spawn(move || {
-            while let Ok((chunk_idx, rows)) = { let lock = rx.lock().unwrap(); lock.recv() } {
+            while let Ok((chunk_idx, rows)) = {
+                let lock = rx.lock().unwrap();
+                lock.recv()
+            } {
                 let col_idx_slice = cols.as_deref().map(|v| v.as_slice());
                 let mut builder = match col_idx_slice {
                     Some(idx) => DataFrameBuilder::new_with_columns(&metadata, idx, rows.len()),
                     None => DataFrameBuilder::new(metadata.clone(), rows.len()),
                 };
                 let numeric_only = match col_idx_slice {
-                    Some(indices) => indices.iter().all(|&idx| metadata.columns[idx].col_type == ColumnType::Numeric),
+                    Some(indices) => indices
+                        .iter()
+                        .all(|&idx| metadata.columns[idx].col_type == ColumnType::Numeric),
                     None => false,
                 };
                 struct NumericColumnPlan {
@@ -109,12 +132,15 @@ pub fn read_pipeline(
                 } else {
                     None
                 };
-                let numeric_max_end = numeric_plan.as_ref().map(|plan| {
-                    plan.iter().map(|p| p.end).max().unwrap_or(0)
-                });
-                let parser = ValueParser::new(endian, metadata.encoding_byte, missing_string_as_null);
+                let numeric_max_end = numeric_plan
+                    .as_ref()
+                    .map(|plan| plan.iter().map(|p| p.end).max().unwrap_or(0));
+                let parser =
+                    ValueParser::new(endian, metadata.encoding_byte, missing_string_as_null);
                 let mut row_values: Vec<Value> = Vec::with_capacity(
-                    col_idx_slice.map(|v| v.len()).unwrap_or(metadata.columns.len()),
+                    col_idx_slice
+                        .map(|v| v.len())
+                        .unwrap_or(metadata.columns.len()),
                 );
                 let mut ok = true;
                 for row_bytes in rows {
@@ -127,10 +153,17 @@ pub fn read_pipeline(
                                 }
                             }
                             for plan in plans {
-                                let (value, is_missing) = decode_numeric_bytes_mask(endian, &row_bytes[plan.start..plan.end]);
-                                builder.add_numeric_value_mask_kind(plan.pos, plan.kind, value, is_missing);
+                                let (value, is_missing) = decode_numeric_bytes_mask(
+                                    endian,
+                                    &row_bytes[plan.start..plan.end],
+                                );
+                                builder.add_numeric_value_mask_kind(
+                                    plan.pos, plan.kind, value, is_missing,
+                                );
                             }
-                            if !ok { break; }
+                            if !ok {
+                                break;
+                            }
                         }
                     } else {
                         match parse_row_values_into(
@@ -155,7 +188,9 @@ pub fn read_pipeline(
                 }
                 if ok {
                     if let Ok(df) = builder.build() {
-                        if tx.send((chunk_idx, df)).is_err() { break; }
+                        if tx.send((chunk_idx, df)).is_err() {
+                            break;
+                        }
                     }
                 }
             }
