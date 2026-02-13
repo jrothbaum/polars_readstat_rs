@@ -1567,15 +1567,8 @@ fn target_dtype_for_series(series: &Series) -> Result<DataType> {
                 Ok(DataType::Float64)
             }
         }
-        DataType::Float32 => {
-            let max_abs = max_abs_f64(series)?;
-            let max_f32 = f32::from_bits(0x7effffff) as f64;
-            if max_abs > max_f32 {
-                Ok(DataType::Float64)
-            } else {
-                Ok(DataType::Float32)
-            }
-        }
+        DataType::Float32 => Ok(DataType::Float32),
+        DataType::Float64 => Ok(DataType::Float64),
         _ => Ok(series.dtype().clone()),
     }
 }
@@ -1616,25 +1609,6 @@ fn min_max_i64(series: &Series) -> Result<(i64, i64, bool)> {
     }
 }
 
-fn max_abs_f64(series: &Series) -> Result<f64> {
-    let mut max = 0f64;
-    for idx in 0..series.len() {
-        let value = series.get(idx)?;
-        if anyvalue_is_null(&value) {
-            continue;
-        }
-        let v = match value {
-            AnyValue::Float32(v) => v as f64,
-            AnyValue::Float64(v) => v,
-            _ => continue,
-        };
-        let av = v.abs();
-        if av > max {
-            max = av;
-        }
-    }
-    Ok(max)
-}
 
 fn write_dta_strls<W: Write>(writer: &mut W, prepared: &PreparedWrite) -> Result<()> {
     write_tag(writer, "<strls>")?;
