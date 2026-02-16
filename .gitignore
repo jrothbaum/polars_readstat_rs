@@ -40,3 +40,4 @@ ehthumbs.db
 
 cpp-sas7bdat
 tests/**/data/too_big/
+/target_test

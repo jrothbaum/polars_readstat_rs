@@ -6,7 +6,9 @@ use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-const DTA_VERSION: u16 = 119;
+const DTA_VERSION_COMPAT: u16 = 118;
+const DTA_VERSION_WIDE: u16 = 119;
+const DTA_118_MAX_VARS: usize = 32_767;
 const DTA_MAX_STR: usize = 2045;
 const DTA_VAR_NAME_LEN: usize = 129;
 const DTA_FMT_ENTRY_LEN: usize = 57;
@@ -361,6 +363,7 @@ struct ValueLabelTable {
 
 #[derive(Debug, Clone)]
 struct PreparedWrite {
+    dta_version: u16,
     columns: Vec<ColumnSpec>,
     row_count: Option<usize>,
     record_len: usize,
@@ -414,8 +417,15 @@ impl PreparedWrite {
         if nvar == 0 {
             return Err(Error::ParseError("no columns to write".to_string()));
         }
+        if nvar > u32::MAX as usize {
+            return Err(Error::ParseError(format!(
+                "too many columns for Stata writer: {}",
+                nvar
+            )));
+        }
 
         validate_column_names_unique(&columns)?;
+        let dta_version = choose_dta_version(nvar);
         let typlist = columns
             .iter()
             .map(type_code_for_column)
@@ -432,7 +442,8 @@ impl PreparedWrite {
             slot[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
         }
 
-        let srtlist_len = (nvar + 1) * 4;
+        let srtlist_entry_len = if dta_version >= DTA_VERSION_WIDE { 4 } else { 2 };
+        let srtlist_len = (nvar + 1) * srtlist_entry_len;
         let fmtlist_len = DTA_FMT_ENTRY_LEN * nvar;
         let mut fmtlist = vec![0u8; fmtlist_len];
         for (i, col) in columns.iter().enumerate() {
@@ -450,6 +461,7 @@ impl PreparedWrite {
         let has_strl = columns.iter().any(|c| matches!(c.kind, ColumnKind::StrL));
 
         Ok(Self {
+            dta_version,
             columns,
             row_count,
             record_len,
@@ -463,6 +475,14 @@ impl PreparedWrite {
             has_strl,
             value_labels: value_label_tables,
         })
+    }
+}
+
+fn choose_dta_version(nvar: usize) -> u16 {
+    if nvar > DTA_118_MAX_VARS {
+        DTA_VERSION_WIDE
+    } else {
+        DTA_VERSION_COMPAT
     }
 }
 
@@ -989,12 +1009,20 @@ fn write_dta<W: Write>(
 fn write_dta_header_and_map<W: Write>(writer: &mut W, prepared: &PreparedWrite) -> Result<()> {
     write_tag(writer, "<stata_dta>")?;
     write_tag(writer, "<header>")?;
-    write_string(writer, &format!("<release>{}</release>", DTA_VERSION))?;
+    write_string(writer, &format!("<release>{}</release>", prepared.dta_version))?;
     write_tag(writer, "<byteorder>")?;
     write_string(writer, "LSF")?;
     write_tag(writer, "</byteorder>")?;
     write_tag(writer, "<K>")?;
-    write_u32(writer, prepared.columns.len() as u32)?;
+    if prepared.dta_version >= DTA_VERSION_WIDE {
+        let nvars = u32::try_from(prepared.columns.len())
+            .map_err(|_| Error::ParseError("too many columns for Stata 119 header".to_string()))?;
+        write_u32(writer, nvars)?;
+    } else {
+        let nvars = u16::try_from(prepared.columns.len())
+            .map_err(|_| Error::ParseError("too many columns for Stata 118 header".to_string()))?;
+        write_u16(writer, nvars)?;
+    }
     write_tag(writer, "</K>")?;
     write_tag(writer, "<N>")?;
     let nobs = prepared.row_count.unwrap_or(0) as u64;
@@ -1008,7 +1036,7 @@ fn write_dta_header_and_map<W: Write>(writer: &mut W, prepared: &PreparedWrite) 
     write_tag(writer, "</timestamp>")?;
     write_tag(writer, "</header>")?;
 
-    let offset_map = current_offset_after_header(prepared);
+    let offset_map = current_offset_after_header(prepared.dta_version);
     let map = build_map(prepared, offset_map);
     write_tag(writer, "<map>")?;
     for v in map {
@@ -1024,12 +1052,22 @@ fn write_dta_header_with_placeholders<W: Write + Seek>(
 ) -> Result<HeaderPatchOffsets> {
     write_tag(writer, "<stata_dta>")?;
     write_tag(writer, "<header>")?;
-    write_string(writer, &format!("<release>{}</release>", DTA_VERSION))?;
+    write_string(writer, &format!("<release>{}</release>", prepared.dta_version))?;
     write_tag(writer, "<byteorder>")?;
     write_string(writer, "LSF")?;
     write_tag(writer, "</byteorder>")?;
     write_tag(writer, "<K>")?;
-    write_u32(writer, prepared.columns.len() as u32)?;
+    if prepared.dta_version >= DTA_VERSION_WIDE {
+        let nvars = u32::try_from(prepared.columns.len()).map_err(|_| {
+            Error::ParseError("too many columns for Stata 119 header".to_string())
+        })?;
+        write_u32(writer, nvars)?;
+    } else {
+        let nvars = u16::try_from(prepared.columns.len()).map_err(|_| {
+            Error::ParseError("too many columns for Stata 118 header".to_string())
+        })?;
+        write_u16(writer, nvars)?;
+    }
     write_tag(writer, "</K>")?;
     write_tag(writer, "<N>")?;
     let nobs_offset = writer.stream_position()?;
@@ -1083,15 +1121,16 @@ fn patch_header_and_map<W: Write + Seek>(
     Ok(())
 }
 
-fn current_offset_after_header(_prepared: &PreparedWrite) -> u64 {
+fn current_offset_after_header(dta_version: u16) -> u64 {
+    let k_len = if dta_version >= DTA_VERSION_WIDE { 4 } else { 2 };
     let header_len = "<stata_dta>".len()
         + "<header>".len()
-        + format!("<release>{}</release>", DTA_VERSION).len()
+        + format!("<release>{}</release>", dta_version).len()
         + "<byteorder>".len()
         + "LSF".len()
         + "</byteorder>".len()
         + "<K>".len()
-        + 4
+        + k_len
         + "</K>".len()
         + "<N>".len()
         + 8

@@ -9,3 +9,6 @@ mod stata_value_labels;
 
 #[path = "stata/stata_writer_roundtrip.rs"]
 mod stata_writer_roundtrip;
+
+#[path = "stata/stata_writer_header.rs"]
+mod stata_writer_header;
