@@ -959,24 +959,32 @@ fn make_unique(name: &str, existing: &[String]) -> String {
 }
 
 fn build_strls(df: &DataFrame, columns: &[ColumnSpec]) -> Result<Vec<StrlEntry>> {
-    let mut entries = Vec::new();
-    for (col_idx, col) in columns.iter().enumerate() {
+    let mut strl_cols = Vec::new();
+
+    for col in columns {
         if !matches!(col.kind, ColumnKind::StrL) {
             continue;
         }
-        let column = df.column(&col.name).map_err(|e| Error::Polars(e))?;
+
+        let column = df.column(&col.name).map_err(Error::Polars)?;
         let series = column.as_materialized_series();
-        let utf8 = series.str().map_err(|e| Error::Polars(e))?;
-        for (row_idx, opt) in utf8.into_iter().enumerate() {
-            if let Some(s) = opt {
+        let utf8 = series.str().map_err(Error::Polars)?.clone();
+        strl_cols.push((col.index, utf8));
+    }
+
+    let mut entries = Vec::new();
+    for row_idx in 0..df.height() {
+        for (col_index, utf8) in &strl_cols {
+            if let Some(s) = utf8.get(row_idx) {
                 entries.push(StrlEntry {
-                    v: (col_idx + 1) as u32,
+                    v: (*col_index + 1) as u32,
                     o: (row_idx + 1) as u64,
                     data: s.as_bytes().to_vec(),
                 });
             }
         }
     }
+
     Ok(entries)
 }
 
