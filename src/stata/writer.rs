@@ -976,10 +976,14 @@ fn build_strls(df: &DataFrame, columns: &[ColumnSpec]) -> Result<Vec<StrlEntry>>
     for row_idx in 0..df.height() {
         for (col_index, utf8) in &strl_cols {
             if let Some(s) = utf8.get(row_idx) {
+                // Add null terminator for Stata compatibility
+                // Stata's native reader expects strL strings to be null-terminated
+                let mut data = s.as_bytes().to_vec();
+                data.push(0);
                 entries.push(StrlEntry {
                     v: (*col_index + 1) as u32,
                     o: (row_idx + 1) as u64,
-                    data: s.as_bytes().to_vec(),
+                    data,
                 });
             }
         }
