@@ -30,6 +30,13 @@ impl RleDecompressor {
         Self {}
     }
 
+    /// Decompress into a pre-allocated buffer, avoiding allocation.
+    pub fn decompress_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<()> {
+        let result = self.decompress(input, output.len())?;
+        output.copy_from_slice(&result);
+        Ok(())
+    }
+
     pub fn decompress(&mut self, input: &[u8], expected_output_size: usize) -> Result<Vec<u8>> {
         let mut output = Vec::with_capacity(expected_output_size);
         let mut src_pos = 0;

@@ -4,10 +4,8 @@ use crate::header::{check_header, read_header};
 use crate::metadata::read_metadata;
 use crate::page::PageReader;
 use crate::pipeline::DEFAULT_PIPELINE_CHUNK_SIZE;
-use crate::polars_output::DataFrameBuilder;
-use crate::polars_output::{kind_for_column, ColumnKind};
-use crate::types::{ColumnType, Compression, Endian, Format, Header, Metadata};
-use crate::value::{decode_numeric_bytes_mask, parse_row_values_into, ValueParser};
+use crate::polars_output::{ColumnPlan, DataFrameBuilder};
+use crate::types::{Compression, Endian, Format, Header, Metadata};
 use polars::prelude::*;
 use rayon::prelude::*;
 use std::fs::File;
@@ -15,6 +13,17 @@ use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Entry in the data page index for fast parallel seeking
+#[derive(Debug, Clone)]
+struct DataPageEntry {
+    /// Page number (0-indexed from start of file pages, after header)
+    page_number: usize,
+    /// Cumulative row count at the START of this page
+    row_start: usize,
+    /// Number of data rows on this page
+    row_count: usize,
+}
 
 /// Main reader for SAS7BDAT files
 pub struct Sas7bdatReader {
@@ -24,6 +33,12 @@ pub struct Sas7bdatReader {
     endian: Endian,
     format: Format,
     initial_data_subheaders: Vec<DataSubheader>,
+    /// 0-based index of the first DATA page (page right after all metadata pages).
+    /// Used for analytical parallel seek without scanning the file.
+    first_data_page: usize,
+    /// Number of data rows that live on MIX pages before the first DATA page.
+    /// These are returned by the DataReader before any DATA-page rows.
+    mix_data_rows: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +66,8 @@ impl Sas7bdatReader {
 
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(header.header_length as u64))?;
-        let (metadata, initial_data_subheaders) = read_metadata(file, &header, endian, format)?;
+        let (metadata, initial_data_subheaders, first_data_page, mix_data_rows) =
+            read_metadata(file, &header, endian, format)?;
 
         Ok(Self {
             path,
@@ -60,6 +76,8 @@ impl Sas7bdatReader {
             endian,
             format,
             initial_data_subheaders,
+            first_data_page,
+            mix_data_rows,
         })
     }
 
@@ -75,7 +93,8 @@ impl Sas7bdatReader {
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(header.header_length as u64))?;
         let metadata_start = Instant::now();
-        let (metadata, initial_data_subheaders) = read_metadata(file, &header, endian, format)?;
+        let (metadata, initial_data_subheaders, first_data_page, mix_data_rows) =
+            read_metadata(file, &header, endian, format)?;
         let metadata_ms = metadata_start.elapsed().as_secs_f64() * 1000.0;
 
         Ok((
@@ -86,6 +105,8 @@ impl Sas7bdatReader {
                 endian,
                 format,
                 initial_data_subheaders,
+                first_data_page,
+                mix_data_rows,
             },
             OpenProfile {
                 header_ms,
@@ -221,18 +242,29 @@ impl Sas7bdatReader {
         }
         let n_chunks = (count + chunk_size - 1) / chunk_size;
 
+        // Build page index analytically (one 6-byte read to validate, then pure arithmetic)
+        let page_index = compute_page_index(
+            &self.path,
+            &self.header,
+            &self.metadata,
+            self.endian,
+            self.format,
+            self.first_data_page,
+            self.mix_data_rows,
+        );
+
         let path = Arc::new(self.path.clone());
         let header = Arc::new(self.header.clone());
         let metadata = Arc::new(self.metadata.clone());
         let cols_arc = cols.map(|c| Arc::new(c.to_vec()));
-        let initial_data_subheaders = self.initial_data_subheaders.clone();
+        let page_index = Arc::new(page_index);
 
         let dfs = (0..n_chunks)
             .into_par_iter()
             .map(|i| {
                 let start = offset + (i * chunk_size);
                 let chunk_count = chunk_size.min(offset + count - start);
-                read_batch_selected(
+                read_batch_with_page_index(
                     &path,
                     &header,
                     &metadata,
@@ -242,7 +274,7 @@ impl Sas7bdatReader {
                     chunk_count,
                     cols_arc.as_deref().map(|v| v.as_slice()),
                     missing_string_as_null,
-                    &initial_data_subheaders,
+                    &page_index,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -366,63 +398,11 @@ fn read_batch_selected(
         None => DataFrameBuilder::new(metadata.clone(), count),
     };
 
-    let numeric_only = match col_indices {
-        Some(indices) => indices
-            .iter()
-            .all(|&idx| metadata.columns[idx].col_type == ColumnType::Numeric),
-        None => false,
-    };
-    let numeric_plan: Option<Vec<NumericColumnPlan>> = if numeric_only {
-        col_indices.map(|indices| {
-            indices
-                .iter()
-                .enumerate()
-                .map(|(pos, &idx)| {
-                    let col = &metadata.columns[idx];
-                    NumericColumnPlan {
-                        pos,
-                        start: col.offset,
-                        end: col.offset + col.length,
-                        kind: kind_for_column(col),
-                    }
-                })
-                .collect()
-        })
-    } else {
-        None
-    };
-    let numeric_max_end = numeric_plan
-        .as_ref()
-        .map(|plan| plan.iter().map(|p| p.end).max().unwrap_or(0));
-    let parser = ValueParser::new(endian, metadata.encoding_byte, missing_string_as_null);
-    let mut row_values: Vec<crate::value::Value> = Vec::with_capacity(
-        col_indices
-            .map(|v| v.len())
-            .unwrap_or(metadata.columns.len()),
-    );
+    let plans = ColumnPlan::build_plans(metadata, col_indices, endian, missing_string_as_null);
 
     for _ in 0..count {
-        if let Some(row_bytes) = data_reader.read_row()? {
-            if numeric_only {
-                if let Some(plans) = numeric_plan.as_ref() {
-                    if let Some(max_end) = numeric_max_end {
-                        if row_bytes.len() < max_end {
-                            return Err(crate::error::Error::BufferOutOfBounds {
-                                offset: max_end,
-                                length: 0,
-                            });
-                        }
-                    }
-                    for plan in plans {
-                        let (value, is_missing) =
-                            decode_numeric_bytes_mask(endian, &row_bytes[plan.start..plan.end]);
-                        builder.add_numeric_value_mask_kind(plan.pos, plan.kind, value, is_missing);
-                    }
-                }
-            } else {
-                parse_row_values_into(&parser, &row_bytes, metadata, col_indices, &mut row_values)?;
-                builder.add_row_ref(&row_values)?;
-            }
+        if let Some(row_bytes) = data_reader.read_row_borrowed()? {
+            builder.add_row_raw(row_bytes, &plans);
         } else {
             break;
         }
@@ -462,76 +442,14 @@ fn read_batch_selected_profiled(
         None => DataFrameBuilder::new(metadata.clone(), count),
     };
 
-    let numeric_only = match col_indices {
-        Some(indices) => indices
-            .iter()
-            .all(|&idx| metadata.columns[idx].col_type == ColumnType::Numeric),
-        None => false,
-    };
-    let numeric_plan: Option<Vec<NumericColumnPlan>> = if numeric_only {
-        col_indices.map(|indices| {
-            indices
-                .iter()
-                .enumerate()
-                .map(|(pos, &idx)| {
-                    let col = &metadata.columns[idx];
-                    NumericColumnPlan {
-                        pos,
-                        start: col.offset,
-                        end: col.offset + col.length,
-                        kind: kind_for_column(col),
-                    }
-                })
-                .collect()
-        })
-    } else {
-        None
-    };
-    let numeric_max_end = numeric_plan
-        .as_ref()
-        .map(|plan| plan.iter().map(|p| p.end).max().unwrap_or(0));
-    let parser = ValueParser::new(endian, metadata.encoding_byte, missing_string_as_null);
-    let mut row_values: Vec<crate::value::Value> = Vec::with_capacity(
-        col_indices
-            .map(|v| v.len())
-            .unwrap_or(metadata.columns.len()),
-    );
+    let plans = ColumnPlan::build_plans(metadata, col_indices, endian, missing_string_as_null);
 
     let parse_start = Instant::now();
-    let mut parse_values_ms = 0.0f64;
-    let mut add_row_ms = 0.0f64;
+    let parse_values_ms = 0.0f64;
+    let add_row_ms = 0.0f64;
     for _ in 0..count {
-        if let Some(row_bytes) = data_reader.read_row()? {
-            if numeric_only {
-                if let Some(plans) = numeric_plan.as_ref() {
-                    if let Some(max_end) = numeric_max_end {
-                        if row_bytes.len() < max_end {
-                            return Err(crate::error::Error::BufferOutOfBounds {
-                                offset: max_end,
-                                length: 0,
-                            });
-                        }
-                    }
-                    for plan in plans {
-                        let values_start = Instant::now();
-                        let (value, is_missing) =
-                            decode_numeric_bytes_mask(endian, &row_bytes[plan.start..plan.end]);
-                        parse_values_ms += values_start.elapsed().as_secs_f64() * 1000.0;
-
-                        let add_start = Instant::now();
-                        builder.add_numeric_value_mask_kind(plan.pos, plan.kind, value, is_missing);
-                        add_row_ms += add_start.elapsed().as_secs_f64() * 1000.0;
-                    }
-                }
-            } else {
-                let values_start = Instant::now();
-                parse_row_values_into(&parser, &row_bytes, metadata, col_indices, &mut row_values)?;
-                parse_values_ms += values_start.elapsed().as_secs_f64() * 1000.0;
-
-                let add_start = Instant::now();
-                builder.add_row_ref(&row_values)?;
-                add_row_ms += add_start.elapsed().as_secs_f64() * 1000.0;
-            }
+        if let Some(row_bytes) = data_reader.read_row_borrowed()? {
+            builder.add_row_raw(row_bytes, &plans);
         } else {
             break;
         }
@@ -553,6 +471,174 @@ fn read_batch_selected_profiled(
             total_ms,
         },
     ))
+}
+
+/// Build a page index analytically — zero I/O, pure arithmetic from header/metadata.
+///
+/// For uncompressed SAS files all pages after the metadata section are DATA pages
+/// with a constant rows-per-page value derived from page_length and row_length.
+/// We simply enumerate them without touching the file.
+fn compute_page_index(
+    path: &Path,
+    header: &Header,
+    metadata: &Metadata,
+    endian: Endian,
+    format: Format,
+    first_data_page: usize,
+    mix_data_rows: usize,
+) -> Vec<DataPageEntry> {
+    let row_length = metadata.row_length;
+    if row_length == 0 {
+        return Vec::new();
+    }
+
+    let page_bit_offset: usize = match format {
+        Format::Bit64 => 32,
+        Format::Bit32 => 16,
+    };
+    let data_start = page_bit_offset + 8;
+    let rows_per_page = header.page_length.saturating_sub(data_start) / row_length;
+    if rows_per_page == 0 {
+        return Vec::new();
+    }
+
+    // Validate: read the actual block_count from the first DATA page header.
+    // If it doesn't match our analytical rows_per_page the assumption is broken
+    // and we return an empty index so all workers fall back to skip_rows.
+    if let Ok(actual_block_count) = read_first_data_page_block_count(
+        path, header, endian, page_bit_offset, first_data_page,
+    ) {
+        if actual_block_count != rows_per_page {
+            return Vec::new();
+        }
+    } else {
+        return Vec::new();
+    }
+
+    // DATA-page rows start after any MIX-page data rows.
+    let total_rows = metadata.row_count;
+    let data_page_rows = total_rows.saturating_sub(mix_data_rows);
+    let n_data_pages = (data_page_rows + rows_per_page - 1) / rows_per_page;
+
+    let mut entries = Vec::with_capacity(n_data_pages);
+    for i in 0..n_data_pages {
+        let row_start = mix_data_rows + i * rows_per_page;
+        let row_count = rows_per_page.min(total_rows - row_start);
+        entries.push(DataPageEntry {
+            page_number: first_data_page + i,
+            row_start,
+            row_count,
+        });
+    }
+    entries
+}
+
+/// Read the block_count field from the first DATA page header.
+/// This is a single seek + 6-byte read — essentially free.
+fn read_first_data_page_block_count(
+    path: &Path,
+    header: &Header,
+    endian: Endian,
+    page_bit_offset: usize,
+    first_data_page: usize,
+) -> crate::error::Result<usize> {
+    use std::io::Read;
+    let byte_offset = header.header_length as u64
+        + first_data_page as u64 * header.page_length as u64
+        + page_bit_offset as u64;
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(byte_offset))?;
+    let mut buf = [0u8; 6];
+    file.read_exact(&mut buf)?;
+    // page_type: buf[0..2], block_count: buf[2..4]
+    let block_count = match endian {
+        Endian::Little => u16::from_le_bytes([buf[2], buf[3]]),
+        Endian::Big => u16::from_be_bytes([buf[2], buf[3]]),
+    };
+    Ok(block_count as usize)
+}
+
+/// Read a batch of rows using the page index for direct seeking.
+/// Instead of skip_rows (which reads through all preceding pages),
+/// this seeks directly to the page containing the target row.
+/// Falls back to skip_rows if target_row falls in the MIX-data prefix
+/// (i.e., before the first DATA page in the index).
+fn read_batch_with_page_index(
+    path: &Path,
+    header: &Header,
+    metadata: &Metadata,
+    endian: Endian,
+    format: Format,
+    target_row: usize,
+    count: usize,
+    col_indices: Option<&[usize]>,
+    missing_string_as_null: bool,
+    page_index: &[DataPageEntry],
+) -> Result<DataFrame> {
+    // Binary search for the DATA page containing target_row.
+    let page_idx = page_index
+        .partition_point(|p| p.row_start + p.row_count <= target_row);
+
+    // If the target row falls before the first DATA-page entry (i.e., in the
+    // MIX-data prefix) or the index is empty, fall back to the sequential
+    // skip_rows path which handles MIX pages correctly.
+    let use_index = page_idx < page_index.len()
+        && target_row >= page_index.first().map_or(0, |e| e.row_start);
+
+    if !use_index {
+        return read_batch_selected(
+            path,
+            header,
+            metadata,
+            endian,
+            format,
+            target_row,
+            count,
+            col_indices,
+            missing_string_as_null,
+            &[],
+        );
+    }
+
+    let entry = &page_index[page_idx];
+    let within_page_skip = target_row - entry.row_start;
+
+    // Seek directly to the target page
+    let page_byte_offset =
+        header.header_length as u64 + (entry.page_number as u64 * header.page_length as u64);
+    let mut file = BufReader::new(File::open(path)?);
+    file.seek(SeekFrom::Start(page_byte_offset))?;
+
+    let page_reader = PageReader::new(file, header.clone(), endian, format);
+    let mut data_reader = DataReader::new(
+        page_reader,
+        metadata.clone(),
+        endian,
+        format,
+        Vec::new(), // seeked past metadata, no initial data subheaders
+    )?;
+
+    // Set current_row so the row-count guard fires at the right place
+    data_reader.set_current_row(entry.row_start);
+
+    // Skip only within-page rows (no page reads needed)
+    data_reader.skip_rows(within_page_skip)?;
+
+    let mut builder = match col_indices {
+        Some(idx) => DataFrameBuilder::new_with_columns(metadata, idx, count),
+        None => DataFrameBuilder::new(metadata.clone(), count),
+    };
+
+    let plans = ColumnPlan::build_plans(metadata, col_indices, endian, missing_string_as_null);
+
+    for _ in 0..count {
+        if let Some(row_bytes) = data_reader.read_row_borrowed()? {
+            builder.add_row_raw(row_bytes, &plans);
+        } else {
+            break;
+        }
+    }
+    builder.build()
 }
 
 fn resolve_column_indices(
@@ -598,10 +684,4 @@ fn cast_dataframe(mut df: DataFrame, schema: &Schema) -> Result<DataFrame> {
         }
     }
     Ok(df)
-}
-struct NumericColumnPlan {
-    pos: usize,
-    start: usize,
-    end: usize,
-    kind: ColumnKind,
 }

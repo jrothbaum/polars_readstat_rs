@@ -28,6 +28,45 @@ pub(crate) enum ColumnKind {
     Character,
 }
 
+/// Pre-computed plan for parsing a column directly from raw row bytes.
+pub(crate) struct ColumnPlan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: ColumnKind,
+    pub endian: crate::types::Endian,
+    pub encoding_byte: u8,
+    pub encoding: &'static encoding_rs::Encoding,
+    pub missing_string_as_null: bool,
+}
+
+impl ColumnPlan {
+    /// Build plans for the given columns.
+    pub fn build_plans(
+        metadata: &Metadata,
+        col_indices: Option<&[usize]>,
+        endian: crate::types::Endian,
+        missing_string_as_null: bool,
+    ) -> Vec<ColumnPlan> {
+        let encoding = crate::encoding::get_encoding(metadata.encoding_byte);
+        let columns: Vec<&SasColumn> = match col_indices {
+            Some(indices) => indices.iter().map(|&i| &metadata.columns[i]).collect(),
+            None => metadata.columns.iter().collect(),
+        };
+        columns
+            .iter()
+            .map(|col| ColumnPlan {
+                start: col.offset,
+                end: col.offset + col.length,
+                kind: kind_for_column(col),
+                endian,
+                encoding_byte: metadata.encoding_byte,
+                encoding,
+                missing_string_as_null,
+            })
+            .collect()
+    }
+}
+
 enum ColumnBuffer {
     Numeric(PrimitiveChunkedBuilder<Float64Type>),
     Date(PrimitiveChunkedBuilder<Int32Type>),
@@ -83,64 +122,74 @@ impl DataFrameBuilder {
         Ok(())
     }
 
-    pub(crate) fn add_numeric_value_mask_kind(
-        &mut self,
-        col_pos: usize,
-        kind: ColumnKind,
-        value: f64,
-        is_missing: bool,
-    ) {
-        let buffer = &mut self.buffers[col_pos];
-        match kind {
-            ColumnKind::Numeric => {
-                if let ColumnBuffer::Numeric(builder) = buffer {
-                    if is_missing {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(value);
-                    }
-                } else {
-                    debug_assert!(false, "Expected numeric buffer");
+    /// Add a row directly from raw bytes, bypassing the Value enum entirely.
+    /// `plans` must match the builder's columns in order.
+    pub(crate) fn add_row_raw(&mut self, row_bytes: &[u8], plans: &[ColumnPlan]) {
+        for (pos, plan) in plans.iter().enumerate() {
+            let start = plan.start;
+            let end = plan.end;
+            if end > row_bytes.len() {
+                // Out of bounds → null
+                match &mut self.buffers[pos] {
+                    ColumnBuffer::Numeric(b) => b.append_null(),
+                    ColumnBuffer::Date(b) => b.append_null(),
+                    ColumnBuffer::DateTime(b) => b.append_null(),
+                    ColumnBuffer::Time(b) => b.append_null(),
+                    ColumnBuffer::Character(b) => b.append_null(),
                 }
+                continue;
             }
-            ColumnKind::Date => {
-                if let ColumnBuffer::Date(builder) = buffer {
-                    if is_missing {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(to_date_value(value));
+            match plan.kind {
+                ColumnKind::Numeric | ColumnKind::Date | ColumnKind::DateTime | ColumnKind::Time => {
+                    let (value, is_missing) =
+                        crate::value::decode_numeric_bytes_mask(plan.endian, &row_bytes[start..end]);
+                    match plan.kind {
+                        ColumnKind::Numeric => {
+                            if let ColumnBuffer::Numeric(b) = &mut self.buffers[pos] {
+                                if is_missing { b.append_null(); } else { b.append_value(value); }
+                            }
+                        }
+                        ColumnKind::Date => {
+                            if let ColumnBuffer::Date(b) = &mut self.buffers[pos] {
+                                if is_missing { b.append_null(); } else { b.append_value(to_date_value(value)); }
+                            }
+                        }
+                        ColumnKind::DateTime => {
+                            if let ColumnBuffer::DateTime(b) = &mut self.buffers[pos] {
+                                if is_missing { b.append_null(); } else { b.append_value(to_datetime_value(value)); }
+                            }
+                        }
+                        ColumnKind::Time => {
+                            if let ColumnBuffer::Time(b) = &mut self.buffers[pos] {
+                                if is_missing { b.append_null(); } else { b.append_value(to_time_value(value)); }
+                            }
+                        }
+                        _ => unreachable!(),
                     }
-                } else {
-                    debug_assert!(false, "Expected date buffer");
                 }
-            }
-            ColumnKind::DateTime => {
-                if let ColumnBuffer::DateTime(builder) = buffer {
-                    if is_missing {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(to_datetime_value(value));
+                ColumnKind::Character => {
+                    if let ColumnBuffer::Character(b) = &mut self.buffers[pos] {
+                        let bytes = &row_bytes[start..end];
+                        // Trim trailing spaces and nulls
+                        let mut trimmed_end = bytes.len();
+                        while trimmed_end > 0 && (bytes[trimmed_end - 1] == b' ' || bytes[trimmed_end - 1] == 0) {
+                            trimmed_end -= 1;
+                        }
+                        if trimmed_end == 0 {
+                            if plan.missing_string_as_null {
+                                b.append_null();
+                            } else {
+                                b.append_value("");
+                            }
+                        } else {
+                            let s = crate::encoding::decode_string(
+                                &bytes[..trimmed_end],
+                                plan.encoding_byte,
+                                plan.encoding,
+                            );
+                            b.append_value(&s);
+                        }
                     }
-                } else {
-                    debug_assert!(false, "Expected datetime buffer");
-                }
-            }
-            ColumnKind::Time => {
-                if let ColumnBuffer::Time(builder) = buffer {
-                    if is_missing {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(to_time_value(value));
-                    }
-                } else {
-                    debug_assert!(false, "Expected time buffer");
-                }
-            }
-            ColumnKind::Character => {
-                if let ColumnBuffer::Character(builder) = buffer {
-                    builder.append_null();
-                } else {
-                    debug_assert!(false, "Expected character buffer");
                 }
             }
         }

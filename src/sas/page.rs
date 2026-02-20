@@ -1,7 +1,5 @@
 use crate::error::Result;
 use crate::types::{Endian, Format, Header, PageType};
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
-use std::io::Cursor;
 use std::io::{Read, Seek};
 
 /// Page header containing metadata about the page
@@ -118,6 +116,7 @@ impl<R: Read + Seek> PageReader<R> {
         &self.header
     }
 
+    #[inline(always)]
     fn read_u8(&self, offset: usize) -> Result<u8> {
         self.page_buffer
             .get(offset)
@@ -125,45 +124,46 @@ impl<R: Read + Seek> PageReader<R> {
             .ok_or(crate::error::Error::BufferOutOfBounds { offset, length: 1 })
     }
 
+    #[inline(always)]
     fn read_u16(&self, offset: usize) -> Result<u16> {
-        let slice = self
+        let bytes: [u8; 2] = self
             .page_buffer
             .get(offset..offset + 2)
+            .and_then(|s| s.try_into().ok())
             .ok_or(crate::error::Error::BufferOutOfBounds { offset, length: 2 })?;
-        let mut cursor = Cursor::new(slice);
-        match self.endian {
-            Endian::Big => cursor.read_u16::<BigEndian>(),
-            Endian::Little => cursor.read_u16::<LittleEndian>(),
-        }
-        .map_err(|e| e.into())
+        Ok(match self.endian {
+            Endian::Little => u16::from_le_bytes(bytes),
+            Endian::Big => u16::from_be_bytes(bytes),
+        })
     }
 
+    #[inline(always)]
     fn read_u32(&self, offset: usize) -> Result<u32> {
-        let slice = self
+        let bytes: [u8; 4] = self
             .page_buffer
             .get(offset..offset + 4)
+            .and_then(|s| s.try_into().ok())
             .ok_or(crate::error::Error::BufferOutOfBounds { offset, length: 4 })?;
-        let mut cursor = Cursor::new(slice);
-        match self.endian {
-            Endian::Big => cursor.read_u32::<BigEndian>(),
-            Endian::Little => cursor.read_u32::<LittleEndian>(),
-        }
-        .map_err(|e| e.into())
+        Ok(match self.endian {
+            Endian::Little => u32::from_le_bytes(bytes),
+            Endian::Big => u32::from_be_bytes(bytes),
+        })
     }
 
+    #[inline(always)]
     fn read_u64(&self, offset: usize) -> Result<u64> {
-        let slice = self
+        let bytes: [u8; 8] = self
             .page_buffer
             .get(offset..offset + 8)
+            .and_then(|s| s.try_into().ok())
             .ok_or(crate::error::Error::BufferOutOfBounds { offset, length: 8 })?;
-        let mut cursor = Cursor::new(slice);
-        match self.endian {
-            Endian::Big => cursor.read_u64::<BigEndian>(),
-            Endian::Little => cursor.read_u64::<LittleEndian>(),
-        }
-        .map_err(|e| e.into())
+        Ok(match self.endian {
+            Endian::Little => u64::from_le_bytes(bytes),
+            Endian::Big => u64::from_be_bytes(bytes),
+        })
     }
 
+    #[inline(always)]
     fn read_integer(&self, offset: usize) -> Result<u64> {
         match self.format {
             Format::Bit32 => self.read_u32(offset).map(|v| v as u64),

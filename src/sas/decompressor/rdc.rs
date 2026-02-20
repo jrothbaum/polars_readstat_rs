@@ -17,6 +17,13 @@ impl RdcDecompressor {
         Self {}
     }
 
+    /// Decompress into a pre-allocated buffer, avoiding allocation.
+    pub fn decompress_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<()> {
+        let result = self.decompress(input, output.len())?;
+        output.copy_from_slice(&result);
+        Ok(())
+    }
+
     pub fn decompress(&mut self, input: &[u8], expected_output_size: usize) -> Result<Vec<u8>> {
         // Pre-allocate and zero-fill the output buffer
         // This is required for RDC pattern copying to work correctly

@@ -1,8 +1,6 @@
 use crate::encoding;
 use crate::error::{Error, Result};
-use crate::types::{Column, ColumnType, Endian, Metadata};
-use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
-use std::io::Cursor;
+use crate::types::{Column, ColumnType, Endian};
 
 /// Represents a parsed value from a SAS file
 #[derive(Debug, Clone)]
@@ -11,7 +9,9 @@ pub enum Value {
     Character(Option<String>),
 }
 
-/// Value parser for extracting column values from row bytes
+/// Value parser for extracting column values from row bytes.
+/// Retained for unit tests; the hot path uses `add_row_raw` instead.
+#[allow(dead_code)]
 pub struct ValueParser {
     endian: Endian,
     encoding: &'static encoding_rs::Encoding,
@@ -19,6 +19,7 @@ pub struct ValueParser {
     missing_string_as_null: bool,
 }
 
+#[allow(dead_code)]
 impl ValueParser {
     pub fn new(endian: Endian, encoding_byte: u8, missing_string_as_null: bool) -> Self {
         let encoding = encoding::get_encoding(encoding_byte);
@@ -59,32 +60,27 @@ impl ValueParser {
             return Ok(Value::Numeric(None));
         }
 
-        let value = if bytes.len() >= 8 {
-            let mut cursor = Cursor::new(bytes);
-            match self.endian {
-                Endian::Little => cursor.read_f64::<LittleEndian>()?,
-                Endian::Big => cursor.read_f64::<BigEndian>()?,
-            }
+        let buf = if bytes.len() >= 8 {
+            // SAFETY: we checked len >= 8
+            <[u8; 8]>::try_from(&bytes[..8]).unwrap()
         } else {
             // Short numeric: pad to 8 bytes following C++ get_incomplete_double pattern.
-            // Stored bytes are the most significant bytes of the IEEE 754 double.
             let mut buf = [0u8; 8];
             match self.endian {
                 Endian::Little => {
-                    // LE: MSB is at high address; pad zeros at start, copy bytes to end
                     let start = 8 - bytes.len();
                     buf[start..].copy_from_slice(bytes);
                 }
                 Endian::Big => {
-                    // BE: MSB is at low address; copy bytes to start, pad zeros at end
                     buf[..bytes.len()].copy_from_slice(bytes);
                 }
             }
-            let mut cursor = Cursor::new(&buf[..]);
-            match self.endian {
-                Endian::Little => cursor.read_f64::<LittleEndian>()?,
-                Endian::Big => cursor.read_f64::<BigEndian>()?,
-            }
+            buf
+        };
+
+        let value = match self.endian {
+            Endian::Little => f64::from_le_bytes(buf),
+            Endian::Big => f64::from_be_bytes(buf),
         };
 
         if value.is_nan() || value.is_infinite() {
@@ -152,32 +148,6 @@ pub fn decode_numeric_bytes_mask(endian: Endian, bytes: &[u8]) -> (f64, bool) {
     // Treat any NaN/Inf as missing (matches prior behavior and polars_readstat).
     let is_missing = abs_bits >= SAS_MISSING_MIN;
     (f64::from_bits(bits), is_missing)
-}
-
-/// Parse row values into a reusable buffer to avoid per-row allocations.
-pub fn parse_row_values_into(
-    parser: &ValueParser,
-    row_bytes: &[u8],
-    metadata: &Metadata,
-    column_indices: Option<&[usize]>,
-    out: &mut Vec<Value>,
-) -> Result<()> {
-    out.clear();
-    match column_indices {
-        Some(indices) => {
-            out.reserve(indices.len());
-            for &idx in indices {
-                out.push(parser.parse_value(row_bytes, &metadata.columns[idx])?);
-            }
-        }
-        None => {
-            out.reserve(metadata.columns.len());
-            for col in &metadata.columns {
-                out.push(parser.parse_value(row_bytes, col)?);
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

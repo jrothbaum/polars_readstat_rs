@@ -14,6 +14,8 @@ pub struct DataReader<R: Read + Seek> {
     decompressor: Decompressor,
     current_row: usize,
     page_state: Option<PageState>,
+    /// Reusable buffer for decompressed rows (avoids per-row allocation)
+    decompress_buf: Vec<u8>,
 }
 
 /// State for tracking position within a page
@@ -57,6 +59,7 @@ impl<R: Read + Seek> DataReader<R> {
         initial_data_subheaders: Vec<DataSubheader>,
     ) -> Result<Self> {
         let decompressor = Decompressor::new(metadata.compression);
+        let decompress_buf = vec![0u8; metadata.row_length];
 
         // If we have initial data subheaders from metadata reading, use them as first page
         // (matching C++ behavior)
@@ -75,6 +78,7 @@ impl<R: Read + Seek> DataReader<R> {
             decompressor,
             current_row: 0,
             page_state,
+            decompress_buf,
         };
 
         // Try to read the first page if we don't have initial data subheaders
@@ -85,7 +89,14 @@ impl<R: Read + Seek> DataReader<R> {
         Ok(reader)
     }
 
-    /// Read the next row
+    /// Set the current row counter (for direct-seek parallel reads).
+    /// Call this after constructing a DataReader that was seeked to a specific page,
+    /// so that the row counter correctly reflects the logical position.
+    pub fn set_current_row(&mut self, row: usize) {
+        self.current_row = row;
+    }
+
+    /// Read the next row (allocating). Used by pipeline which needs owned data.
     pub fn read_row(&mut self) -> Result<Option<RowBytes>> {
         // Check if we've read all rows
         if self.current_row >= self.metadata.row_count {
@@ -111,6 +122,53 @@ impl<R: Read + Seek> DataReader<R> {
         self.advance_row();
 
         Ok(Some(row_bytes))
+    }
+
+    /// Ensure we're positioned on a valid row, advancing pages if needed.
+    /// Returns (offset, length) or None if no more rows.
+    fn ensure_row_ready(&mut self) -> Result<Option<(usize, usize)>> {
+        if self.current_row >= self.metadata.row_count {
+            return Ok(None);
+        }
+        let (offset, length, _) = match self.get_current_row_info() {
+            Some(info) => info,
+            None => {
+                self.advance_page()?;
+                match self.get_current_row_info() {
+                    Some(info) => info,
+                    None => return Ok(None),
+                }
+            }
+        };
+        Ok(Some((offset, length)))
+    }
+
+    /// Read the next row without allocating. Returns a reference to either the
+    /// page buffer (uncompressed) or the internal decompress buffer (compressed).
+    /// The returned slice is valid until the next call to any read method.
+    pub fn read_row_borrowed(&mut self) -> Result<Option<&[u8]>> {
+        let (offset, length) = match self.ensure_row_ready()? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let page_buffer = self.page_reader.page_buffer();
+        if offset + length > page_buffer.len() {
+            return Err(Error::BufferOutOfBounds { offset, length });
+        }
+
+        if length < self.metadata.row_length {
+            // Compressed: decompress into reusable buffer
+            let raw_bytes = &page_buffer[offset..offset + length];
+            self.decompressor
+                .decompress_into(raw_bytes, &mut self.decompress_buf)?;
+            self.advance_row();
+            Ok(Some(&self.decompress_buf))
+        } else {
+            // Uncompressed: borrow directly from page buffer (zero-copy)
+            self.advance_row();
+            Ok(Some(&self.page_reader.page_buffer()[offset..offset + length]))
+        }
     }
 
     /// Skip n rows

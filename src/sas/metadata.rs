@@ -6,21 +6,39 @@ use crate::page::{PageHeader, PageReader, PageSubheader};
 use crate::types::{Column, ColumnType, Compression, Endian, Format, Header, Metadata};
 use std::io::{Read, Seek};
 
-/// Read metadata from SAS7BDAT file
+/// Read metadata from SAS7BDAT file.
+/// Returns (metadata, initial_data_subheaders, first_data_page, mix_data_rows).
+/// - `first_data_page`: 0-based index of the first non-metadata (DATA) page.
+/// - `mix_data_rows`: total data rows on MIX pages encountered before the first DATA page.
+///   These rows are returned by the DataReader before any DATA-page rows.
 pub fn read_metadata<R: Read + Seek>(
     reader: R,
     header: &Header,
     endian: Endian,
     format: Format,
-) -> Result<(Metadata, Vec<DataSubheader>)> {
+) -> Result<(Metadata, Vec<DataSubheader>, usize, usize)> {
+    use crate::types::PageType;
+
+    let page_bit_offset: usize = match format {
+        Format::Bit64 => 32,
+        Format::Bit32 => 16,
+    };
+    let integer_size: usize = match format {
+        Format::Bit64 => 8,
+        Format::Bit32 => 4,
+    };
+
     let mut page_reader = PageReader::new(reader, header.clone(), endian, format);
     let mut metadata_builder = MetadataBuilder::new(header.encoding_byte);
+    let mut pages_read = 0usize;
+    let mut mix_data_rows = 0usize;
 
     // Read metadata pages until we have all column information
     loop {
         if !page_reader.read_page()? {
             break;
         }
+        pages_read += 1;
 
         let page_header = page_reader.get_page_header()?;
 
@@ -37,16 +55,43 @@ pub fn read_metadata<R: Read + Seek>(
             metadata_builder.process_subheader(&buf, &subheader, format)?;
         }
 
+        // For MIX pages, count data rows they contain (uncompressed files only).
+        // Do this AFTER processing subheaders so row_length / mix_page_row_count
+        // are available even when the ROW_SIZE subheader lives on this same page.
+        if matches!(page_header.page_type, PageType::Mix1 | PageType::Mix2) {
+            if let (Some(row_length), Some(mix_row_count)) = (
+                metadata_builder.row_length,
+                metadata_builder.mix_page_row_count,
+            ) {
+                if row_length > 0 {
+                    let subheader_size = 3 * integer_size;
+                    let mut data_start = page_bit_offset
+                        + 8
+                        + page_header.subheader_count as usize * subheader_size;
+                    if data_start % 8 == 4 {
+                        data_start += 4;
+                    }
+                    let available = header.page_length.saturating_sub(data_start);
+                    let max_fit = available / row_length;
+                    mix_data_rows += max_fit.min(mix_row_count);
+                }
+            }
+        }
+
         // Continue reading metadata pages until we hit a data page
         // Don't stop early - we need to read ALL metadata pages to get
         // COLUMN_NAME, COLUMN_ATTRIBUTES, and FORMAT_AND_LABEL subheaders
     }
 
+    // The last page read was the first DATA page (or EOF if no data pages).
+    // first_data_page = pages_read - 1 (0-indexed).
+    let first_data_page = pages_read.saturating_sub(1);
+
     // Don't collect data_subheaders - causes issues with page state management
     // Instead, filter during data reading phase
     let data_subheaders = Vec::new();
     let metadata = metadata_builder.build()?;
-    Ok((metadata, data_subheaders))
+    Ok((metadata, data_subheaders, first_data_page, mix_data_rows))
 }
 
 fn is_metadata_page(page_header: &PageHeader) -> bool {

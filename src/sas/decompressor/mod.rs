@@ -30,4 +30,24 @@ impl Decompressor {
             Self::Rdc(d) => d.decompress(input, expected_output_size),
         }
     }
+
+    /// Decompress into a pre-allocated buffer, avoiding allocation.
+    /// The buffer must be at least `expected_output_size` bytes.
+    pub fn decompress_into(
+        &mut self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<()> {
+        match self {
+            Self::None => {
+                output[..input.len()].copy_from_slice(input);
+                for b in &mut output[input.len()..] {
+                    *b = 0;
+                }
+                Ok(())
+            }
+            Self::Rle(d) => d.decompress_into(input, output),
+            Self::Rdc(d) => d.decompress_into(input, output),
+        }
+    }
 }
