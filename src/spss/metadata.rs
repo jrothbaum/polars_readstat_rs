@@ -16,8 +16,93 @@ const SUBTYPE_VERY_LONG_STR: u32 = 14;
 const SUBTYPE_LONG_STRING_VALUE_LABELS: u32 = 21;
 const SUBTYPE_LONG_STRING_MISSING_VALUES: u32 = 22;
 
+/// Pre-scan the record stream to find the character encoding, then reset to the start.
+/// This ensures variable labels are decoded with the correct encoding from the outset.
+fn prescan_char_encoding<R: Read + Seek>(reader: &mut R, header: &Header) -> Option<&'static encoding_rs::Encoding> {
+    let start = reader.stream_position().ok()?;
+    let result = prescan_char_encoding_inner(reader, header);
+    reader.seek(SeekFrom::Start(start)).ok()?;
+    result
+}
+
+fn prescan_char_encoding_inner<R: Read + Seek>(reader: &mut R, header: &Header) -> Option<&'static encoding_rs::Encoding> {
+    loop {
+        let rec_type = read_u32(reader, header.endian).ok()?;
+        match rec_type {
+            REC_TYPE_VARIABLE => {
+                // Skip: read fixed 28 bytes, then optionally a label
+                let mut buf = [0u8; 28];
+                reader.read_exact(&mut buf).ok()?;
+                let has_label = read_i32(&buf[4..8], header.endian);
+                let n_missing = read_i32(&buf[8..12], header.endian);
+                if has_label != 0 {
+                    let len = read_u32(reader, header.endian).ok()? as usize;
+                    let padded = ((len + 3) / 4) * 4;
+                    reader.seek(SeekFrom::Current(padded as i64)).ok()?;
+                }
+                let abs_missing = n_missing.unsigned_abs() as usize;
+                if abs_missing > 0 {
+                    reader.seek(SeekFrom::Current((abs_missing * 8) as i64)).ok()?;
+                }
+            }
+            REC_TYPE_VALUE_LABEL => {
+                // Mirror the actual read_value_label_record format:
+                // N entries of (8 bytes key + 1 byte len + padded label),
+                // followed by an embedded REC_TYPE_VALUE_LABEL_VARIABLES record.
+                let count = read_u32(reader, header.endian).ok()? as usize;
+                for _ in 0..count {
+                    reader.seek(SeekFrom::Current(8)).ok()?; // 8-byte raw value
+                    let vlen = read_u8(reader).ok()? as usize;
+                    let padded = ((vlen + 8) / 8) * 8 - 1;
+                    reader.seek(SeekFrom::Current(padded as i64)).ok()?;
+                }
+                // Consume embedded value_label_variables record
+                let _rec = read_u32(reader, header.endian).ok()?; // should be 4
+                let var_count = read_u32(reader, header.endian).ok()? as usize;
+                reader.seek(SeekFrom::Current((var_count * 4) as i64)).ok()?;
+            }
+            REC_TYPE_VALUE_LABEL_VARIABLES => {
+                // Should not normally appear here (consumed inside VALUE_LABEL), but skip it.
+                let var_count = read_u32(reader, header.endian).ok()? as usize;
+                reader.seek(SeekFrom::Current((var_count * 4) as i64)).ok()?;
+            }
+            REC_TYPE_DOCUMENT => {
+                let line_count = read_u32(reader, header.endian).ok()? as usize;
+                reader.seek(SeekFrom::Current((line_count * 80) as i64)).ok()?;
+            }
+            REC_TYPE_HAS_DATA => {
+                let subtype = read_u32(reader, header.endian).ok()?;
+                let size = read_u32(reader, header.endian).ok()? as usize;
+                let count = read_u32(reader, header.endian).ok()? as usize;
+                let data_len = size * count;
+                if subtype == SUBTYPE_CHAR_ENCODING && data_len > 0 {
+                    let mut buf = vec![0u8; data_len];
+                    reader.read_exact(&mut buf).ok()?;
+                    if let Ok(codepage) = std::str::from_utf8(&buf) {
+                        return encoding_rs::Encoding::for_label(codepage.trim().as_bytes());
+                    }
+                    return None;
+                }
+                reader.seek(SeekFrom::Current(data_len as i64)).ok()?;
+            }
+            REC_TYPE_DICT_TERMINATION | _ => return None,
+        }
+    }
+}
+
+fn read_u8<R: Read>(reader: &mut R) -> Result<u8> {
+    let mut buf = [0u8; 1];
+    reader.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
 pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<Metadata> {
     let mut metadata = Metadata::default();
+    // Pre-scan to find character encoding before reading variable labels,
+    // since the encoding info record comes after the variable records in the file.
+    if let Some(enc) = prescan_char_encoding(reader, header) {
+        metadata.encoding = enc;
+    }
     metadata.row_count = header.row_count.max(0) as u64;
 
     let mut last_var_index: Option<usize> = None;
@@ -188,7 +273,8 @@ fn read_variable_record<R: Read + Seek>(
         let mut label_buf = vec![0u8; padded];
         reader.read_exact(&mut label_buf)?;
         let raw = &label_buf[..len.min(label_buf.len())];
-        let text = encoding_rs::WINDOWS_1252
+        let text = metadata
+            .encoding
             .decode_without_bom_handling(raw)
             .0
             .to_string();

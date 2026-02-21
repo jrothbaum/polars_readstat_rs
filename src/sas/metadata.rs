@@ -116,6 +116,8 @@ struct MetadataBuilder {
     columns: Vec<ColumnBuilder>,
     creator: String,
     creator_proc: String,
+    lcs: usize, // length of creator string (from row_size subheader)
+    lcp: usize, // length of creator_proc string (from row_size subheader)
     column_texts: Vec<Vec<u8>>, // Keep as bytes to preserve offset indexing
     next_column_name_position: usize, // Track position across multiple COLUMN_NAME subheaders
     next_column_attributes_position: usize, // Track position across multiple COLUMN_ATTRIBUTES subheaders
@@ -146,6 +148,8 @@ impl MetadataBuilder {
             columns: Vec::new(),
             creator: String::new(),
             creator_proc: String::new(),
+            lcs: 0,
+            lcp: 0,
             column_texts: Vec::new(),
             next_column_name_position: 0,
             next_column_attributes_position: 0,
@@ -230,6 +234,18 @@ impl MetadataBuilder {
         // It only stores col_count_p1 and col_count_p2 for reference.
         // The actual column_count should ONLY be set by COLUMN_SIZE subheader.
 
+        // Read lcs and lcp for creator_proc extraction (C++ offsets: 64-bit=682/706, 32-bit=354/378)
+        let (lcs_off, lcp_off) = match format {
+            Format::Bit64 => (682usize, 706usize),
+            Format::Bit32 => (354usize, 378usize),
+        };
+        if let Ok(lcs) = buf.get_u16(offset + lcs_off) {
+            self.lcs = lcs as usize;
+        }
+        if let Ok(lcp) = buf.get_u16(offset + lcp_off) {
+            self.lcp = lcp as usize;
+        }
+
         Ok(())
     }
 
@@ -291,6 +307,41 @@ impl MetadataBuilder {
                 .any(|w| w == COMPRESSION_SIGNATURE_RDC.as_bytes())
             {
                 self.compression = Compression::Rdc;
+            }
+
+            // On the first column text subheader, extract creator/creator_proc.
+            // Matches C++ logic: read compression string at compression_offset,
+            // then pick creator_proc location based on compression type.
+            if self.column_texts.is_empty() && (self.lcs > 0 || self.lcp > 0) {
+                let comp_off = match format {
+                    Format::Bit64 => 20usize,
+                    Format::Bit32 => 16usize,
+                };
+                // Read the 8-byte compression string at compression_offset
+                let comp_str = buf.get_string(offset + comp_off, 8).unwrap_or_default();
+                let comp_str = comp_str.trim_end_matches('\0').trim();
+                if comp_str.is_empty() {
+                    // No compression: creator_proc at comp_off + 16, length lcp
+                    self.lcs = 0;
+                    if self.lcp > 0 {
+                        if let Ok(s) = buf.get_string(offset + comp_off + 16, self.lcp) {
+                            self.creator_proc = s.trim_end_matches('\0').trim().to_string();
+                        }
+                    }
+                } else if comp_str == COMPRESSION_SIGNATURE_RLE.trim() || comp_str.contains("SASYZCRL") {
+                    // RLE: creator_proc at comp_off + 24, length lcp
+                    if self.lcp > 0 {
+                        if let Ok(s) = buf.get_string(offset + comp_off + 24, self.lcp) {
+                            self.creator_proc = s.trim_end_matches('\0').trim().to_string();
+                        }
+                    }
+                } else if self.lcs > 0 {
+                    // Other compression: creator at comp_off, length lcs
+                    self.lcp = 0;
+                    if let Ok(s) = buf.get_string(offset + comp_off, self.lcs) {
+                        self.creator = s.trim_end_matches('\0').trim().to_string();
+                    }
+                }
             }
 
             // Store raw bytes for later use by column names/labels

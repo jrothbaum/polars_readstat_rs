@@ -33,28 +33,45 @@ use std::path::Path;
 pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
     let reader = Sas7bdatReader::open(path)?;
     let meta = reader.metadata();
+    let hdr = reader.header();
     let columns = meta
         .columns
         .iter()
         .map(|c| {
             json!({
                 "name": c.name,
-                "label": c.label,
-                "format": c.format,
+                "label": if c.label.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(c.label.clone()) },
+                "format": if c.format.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(c.format.clone()) },
                 "type": format!("{:?}", c.col_type),
                 "offset": c.offset,
                 "length": c.length,
             })
         })
         .collect::<Vec<_>>();
+    let table_name = hdr.dataset_name.trim();
+    let sas_release = hdr.sas_release.trim();
+    let sas_server_type = hdr.sas_server_type.trim();
+    let os_name = hdr.os_name.trim();
+    let file_type = hdr.file_type.trim();
+    let creator_proc = meta.creator_proc.trim();
+    // Use the raw SAS encoding name (not the encoding_rs remapped name)
+    let encoding_name = encoding::get_encoding_name(meta.encoding_byte);
     let v = json!({
         "compression": format!("{:?}", meta.compression),
         "row_count": meta.row_count,
         "row_length": meta.row_length,
         "column_count": meta.column_count,
-        "creator": meta.creator,
-        "creator_proc": meta.creator_proc,
+        "table_name": if table_name.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(table_name.to_string()) },
+        "file_type": if file_type.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(file_type.to_string()) },
+        "sas_release": if sas_release.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(sas_release.to_string()) },
+        "sas_server_type": if sas_server_type.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(sas_server_type.to_string()) },
+        "os_name": if os_name.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(os_name.to_string()) },
+        "creator_proc": if creator_proc.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(creator_proc.to_string()) },
         "encoding_byte": meta.encoding_byte,
+        "file_encoding": encoding_name,
+        "page_size": hdr.page_length,
+        "page_count": hdr.page_count,
+        "header_length": hdr.header_length,
         "columns": columns,
     });
     Ok(v.to_string())

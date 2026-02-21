@@ -24,6 +24,12 @@ use std::path::Path;
 pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
     let reader = SpssReader::open(path)?;
     let meta = reader.metadata();
+    let hdr = reader.header();
+    let compression_str = match hdr.compression {
+        0 => "None",
+        2 => "ZLIB",
+        _ => "RLE", // 1 = bytecode/RLE
+    };
     let variables = meta
         .variables
         .iter()
@@ -44,6 +50,9 @@ pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
         .collect::<Vec<_>>();
     let v = json!({
         "row_count": meta.row_count,
+        "file_label": hdr.data_label,
+        "compression": compression_str,
+        "version": hdr.version,
         "data_offset": meta.data_offset,
         "encoding": meta.encoding.name(),
         "variables": variables,

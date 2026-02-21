@@ -29,7 +29,8 @@ pub fn read_header<R: Read>(reader: &mut R) -> Result<Header> {
     let row_count = read_i32(&buf[80..84], endian);
     let bias = read_f64(&buf[84..92], endian);
 
-    let file_label = read_string(&buf[104..168]);
+    // SAV header layout: creation_date[9] at 92, creation_time[8] at 101, file_label[64] at 109
+    let file_label = read_string(&buf[109..173]);
     let data_label = if file_label.is_empty() {
         None
     } else {

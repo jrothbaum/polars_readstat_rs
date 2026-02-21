@@ -30,6 +30,7 @@ use std::path::Path;
 pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
     let reader = StataReader::open(path)?;
     let meta = reader.metadata();
+    let hdr = reader.header();
     let variables = meta
         .variables
         .iter()
@@ -44,6 +45,7 @@ pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
         })
         .collect::<Vec<_>>();
     let v = json!({
+        "version": hdr.version,
         "byte_order": format!("{:?}", meta.byte_order),
         "row_count": meta.row_count,
         "data_label": meta.data_label,

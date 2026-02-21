@@ -35,6 +35,10 @@ impl SpssReader {
         &self.metadata
     }
 
+    pub fn header(&self) -> &Header {
+        &self.header
+    }
+
     pub fn compression(&self) -> i32 {
         self.header.compression
     }
