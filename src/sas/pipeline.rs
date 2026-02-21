@@ -26,8 +26,8 @@ pub fn read_pipeline(
     missing_string_as_null: bool,
     initial_data_subheaders: &[DataSubheader],
 ) -> Result<DataFrame> {
-    // We send (chunk_idx, Vec<row_bytes>) so workers can build columnar chunks
-    let (row_tx, row_rx) = mpsc::sync_channel::<(usize, Vec<Vec<u8>>)>(100);
+    // We send (chunk_idx, flat_bytes, row_count) — one allocation per chunk instead of per row
+    let (row_tx, row_rx) = mpsc::sync_channel::<(usize, Vec<u8>, usize)>(100);
     let (result_tx, result_rx) = mpsc::channel::<(usize, DataFrame)>();
 
     let row_rx = Arc::new(Mutex::new(row_rx));
@@ -47,37 +47,50 @@ pub fn read_pipeline(
         let page_reader = PageReader::new(reader, header_clone, endian, format);
         let mut data_reader = DataReader::new(
             page_reader,
-            metadata_clone,
+            metadata_clone.clone(),
             endian,
             format,
             initial_data_subheaders_clone,
         )
         .ok()?;
 
-        let mut count = 0usize;
-        let mut chunk_idx = 0usize;
-        let mut chunk: Vec<Vec<u8>> = Vec::with_capacity(chunk_size);
+        let row_length = metadata_clone.row_length;
         let limit = max_rows;
-        while let Ok(Some(row_bytes)) = data_reader.read_row() {
-            chunk.push(row_bytes);
-            count += 1;
-            if chunk.len() >= chunk_size {
-                if row_tx
-                    .send((chunk_idx, std::mem::take(&mut chunk)))
-                    .is_err()
-                {
-                    break;
-                }
-                chunk_idx += 1;
+        let mut total_count = 0usize;
+        let mut chunk_idx = 0usize;
+
+        loop {
+            let remaining = limit.map(|l| l.saturating_sub(total_count));
+            if remaining == Some(0) {
+                break;
             }
-            if let Some(limit) = limit {
-                if count >= limit {
-                    break;
+            let this_chunk_size = remaining.map(|r| r.min(chunk_size)).unwrap_or(chunk_size);
+            let mut flat_chunk = vec![0u8; this_chunk_size * row_length];
+            let mut chunk_count = 0usize;
+
+            while chunk_count < this_chunk_size {
+                match data_reader.read_row_borrowed() {
+                    Ok(Some(row_slice)) => {
+                        let start = chunk_count * row_length;
+                        flat_chunk[start..start + row_length].copy_from_slice(row_slice);
+                        chunk_count += 1;
+                    }
+                    _ => break,
                 }
             }
-        }
-        if !chunk.is_empty() {
-            let _ = row_tx.send((chunk_idx, chunk));
+
+            if chunk_count == 0 {
+                break;
+            }
+            total_count += chunk_count;
+            flat_chunk.truncate(chunk_count * row_length);
+            if row_tx.send((chunk_idx, flat_chunk, chunk_count)).is_err() {
+                break;
+            }
+            chunk_idx += 1;
+            if chunk_count < this_chunk_size {
+                break; // EOF reached mid-chunk
+            }
         }
         Some(())
     });
@@ -93,17 +106,19 @@ pub fn read_pipeline(
             let col_idx_slice = cols.as_deref().map(|v| v.as_slice());
             let plans =
                 ColumnPlan::build_plans(&metadata, col_idx_slice, endian, missing_string_as_null);
+            let row_length = metadata.row_length;
 
-            while let Ok((chunk_idx, rows)) = {
+            while let Ok((chunk_idx, flat_buf, row_count)) = {
                 let lock = rx.lock().unwrap();
                 lock.recv()
             } {
                 let mut builder = match col_idx_slice {
-                    Some(idx) => DataFrameBuilder::new_with_columns(&metadata, idx, rows.len()),
-                    None => DataFrameBuilder::new(metadata.clone(), rows.len()),
+                    Some(idx) => DataFrameBuilder::new_with_columns(&metadata, idx, row_count),
+                    None => DataFrameBuilder::new(metadata.clone(), row_count),
                 };
-                for row_bytes in &rows {
-                    builder.add_row_raw(row_bytes, &plans);
+                for i in 0..row_count {
+                    let start = i * row_length;
+                    builder.add_row_raw(&flat_buf[start..start + row_length], &plans);
                 }
                 if let Ok(df) = builder.build() {
                     if tx.send((chunk_idx, df)).is_err() {

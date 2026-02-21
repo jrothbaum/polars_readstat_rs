@@ -170,6 +170,32 @@ impl Sas7bdatReader {
                 col_indices.as_deref(),
                 missing_null,
             )?
+        } else if self.metadata.compression == Compression::None && opts.offset > 0 {
+            // Sequential read with a positive offset: use the page index for a direct file
+            // seek rather than skip_rows, which reads and discards every preceding page.
+            // This is critical for the multi-worker streaming path where each worker has
+            // a different start offset — without this, total I/O is O(n × threads).
+            let page_index = compute_page_index(
+                &self.path,
+                &self.header,
+                &self.metadata,
+                self.endian,
+                self.format,
+                self.first_data_page,
+                self.mix_data_rows,
+            );
+            read_batch_with_page_index(
+                &self.path,
+                &self.header,
+                &self.metadata,
+                self.endian,
+                self.format,
+                opts.offset,
+                limit,
+                col_indices.as_deref(),
+                missing_null,
+                &page_index,
+            )?
         } else {
             read_batch_selected(
                 &self.path,
