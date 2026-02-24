@@ -19,6 +19,7 @@ pub fn read_data_frame(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<DataFrame> {
     let shared = build_shared_decode(path, metadata, endian, ds_format, value_labels_as_strings)?;
@@ -31,6 +32,7 @@ pub fn read_data_frame(
         offset,
         limit,
         missing_string_as_null,
+        user_missing_as_null,
         value_labels_as_strings,
         &shared,
     )
@@ -79,6 +81,7 @@ pub fn read_data_frame_range(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: bool,
     shared: &SharedDecode,
 ) -> Result<DataFrame> {
@@ -93,7 +96,7 @@ pub fn read_data_frame_range(
 
     let label_maps = shared.label_maps.as_ref();
 
-    let rules = missing_rules(ds_format);
+    let rules = missing_rules(ds_format, user_missing_as_null);
     let (col_indices, mut builders, col_offsets, col_widths, col_labels, mut string_scratch) =
         build_column_builders(
             metadata,

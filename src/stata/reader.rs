@@ -100,6 +100,7 @@ impl StataReader {
                 _opts.chunk_size,
                 col_indices.as_deref(),
                 _opts.missing_string_as_null,
+                _opts.user_missing_as_null,
                 _opts.value_labels_as_strings,
             )?
         } else {
@@ -112,6 +113,7 @@ impl StataReader {
                 _opts.offset,
                 limit,
                 _opts.missing_string_as_null,
+                _opts.user_missing_as_null,
                 _opts.value_labels_as_strings,
             )?
         };
@@ -163,6 +165,7 @@ pub struct ReadBuilder<'a> {
     num_threads: Option<usize>,
     chunk_size: Option<usize>,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 }
 
@@ -178,6 +181,7 @@ impl<'a> ReadBuilder<'a> {
             num_threads: None,
             chunk_size: None,
             missing_string_as_null: true,
+            user_missing_as_null: true,
             value_labels_as_strings: true,
         }
     }
@@ -214,6 +218,10 @@ impl<'a> ReadBuilder<'a> {
         self.missing_string_as_null = v;
         self
     }
+    pub fn user_missing_as_null(mut self, v: bool) -> Self {
+        self.user_missing_as_null = v;
+        self
+    }
     pub fn value_labels_as_strings(mut self, v: bool) -> Self {
         self.value_labels_as_strings = v;
         self
@@ -239,6 +247,7 @@ impl StataReader {
         chunk_size: Option<usize>,
         cols: Option<&[usize]>,
         missing_string_as_null: bool,
+        user_missing_as_null: bool,
         value_labels_as_strings: bool,
     ) -> Result<DataFrame> {
         let n_threads = threads.unwrap_or_else(|| {
@@ -255,6 +264,7 @@ impl StataReader {
                 offset,
                 count,
                 missing_string_as_null,
+                user_missing_as_null,
                 value_labels_as_strings,
             );
         }
@@ -300,6 +310,7 @@ impl StataReader {
                         start,
                         cnt,
                         missing_string_as_null,
+                        user_missing_as_null,
                         value_labels_as_strings,
                         &shared,
                     )

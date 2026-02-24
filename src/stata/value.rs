@@ -10,13 +10,14 @@ pub struct MissingRules {
     pub system_missing_int8: i8,
     pub system_missing_int16: i16,
     pub system_missing_int32: i32,
+    pub user_missing_as_null: bool,
     pub max_float: u32,
     pub max_double: u64,
     pub missing_float: u32,
     pub missing_double: u64,
 }
 
-pub fn missing_rules(ds_format: u16) -> MissingRules {
+pub fn missing_rules(ds_format: u16, user_missing_as_null: bool) -> MissingRules {
     if ds_format < 113 {
         MissingRules {
             max_int8: 0x7e,
@@ -26,6 +27,7 @@ pub fn missing_rules(ds_format: u16) -> MissingRules {
             system_missing_int8: 0,
             system_missing_int16: 0,
             system_missing_int32: 0,
+            user_missing_as_null,
             max_float: 0x7effffff,
             max_double: 0x7fdfffffffffffff,
             missing_float: 0x7f000000,
@@ -43,6 +45,7 @@ pub fn missing_rules(ds_format: u16) -> MissingRules {
             system_missing_int8: 0x65,
             system_missing_int16: 0x7fe5,
             system_missing_int32: 0x7fffffe5,
+            user_missing_as_null,
             max_float: 0x7effffff,
             max_double: 0x7fdfffffffffffff,
             missing_float: 0x7f000000,
@@ -53,8 +56,14 @@ pub fn missing_rules(ds_format: u16) -> MissingRules {
 
 pub fn read_i8(buf: &[u8], rules: MissingRules) -> Option<i8> {
     let v = buf[0] as i8;
-    if rules.system_missing_enabled && v >= rules.system_missing_int8 {
-        return None;
+    if rules.system_missing_enabled {
+        if rules.user_missing_as_null {
+            if v >= rules.system_missing_int8 {
+                return None;
+            }
+        } else if v == rules.system_missing_int8 {
+            return None;
+        }
     }
     if v > rules.max_int8 {
         None
@@ -69,8 +78,14 @@ pub fn read_i16(buf: &[u8], endian: Endian, rules: MissingRules) -> Option<i16> 
         Endian::Little => cursor.read_i16::<LittleEndian>().ok()?,
         Endian::Big => cursor.read_i16::<BigEndian>().ok()?,
     };
-    if rules.system_missing_enabled && v >= rules.system_missing_int16 {
-        return None;
+    if rules.system_missing_enabled {
+        if rules.user_missing_as_null {
+            if v >= rules.system_missing_int16 {
+                return None;
+            }
+        } else if v == rules.system_missing_int16 {
+            return None;
+        }
     }
     if v > rules.max_int16 {
         None
@@ -85,8 +100,14 @@ pub fn read_i32(buf: &[u8], endian: Endian, rules: MissingRules) -> Option<i32> 
         Endian::Little => cursor.read_i32::<LittleEndian>().ok()?,
         Endian::Big => cursor.read_i32::<BigEndian>().ok()?,
     };
-    if rules.system_missing_enabled && v >= rules.system_missing_int32 {
-        return None;
+    if rules.system_missing_enabled {
+        if rules.user_missing_as_null {
+            if v >= rules.system_missing_int32 {
+                return None;
+            }
+        } else if v == rules.system_missing_int32 {
+            return None;
+        }
     }
     if v > rules.max_int32 {
         None

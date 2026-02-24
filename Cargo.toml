@@ -1,6 +1,6 @@
 [package]
 name = "polars-readstat-rs"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 rust-version="1.93"
 description = "Pure Rust readers for SAS, Stata, and SPSS with Polars and Arrow outputs"
@@ -46,6 +46,10 @@ harness = false
 
 [[bench]]
 name = "spss_schema_benchmarks"
+harness = false
+
+[[bench]]
+name = "readstat_stream_benchmarks"
 harness = false
 
 [[bench]]

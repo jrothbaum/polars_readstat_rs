@@ -2,12 +2,16 @@ use crate::constants::{
     DATETIME_FORMATS, DATE_FORMATS, SAS_EPOCH_OFFSET_DAYS, SECONDS_PER_DAY, TIME_FORMATS,
 };
 use crate::error::{Error, Result};
+use crate::data::DataReader;
+use crate::page::PageReader;
 use crate::reader::Sas7bdatReader;
-use crate::types::{Column as SasColumn, ColumnType, Metadata};
+use crate::types::{Column as SasColumn, ColumnType, Endian, Format, Header, Metadata};
 use crate::value::Value;
 use polars::prelude::*;
 use std::cmp::min;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -37,6 +41,7 @@ pub(crate) struct ColumnPlan {
     pub encoding_byte: u8,
     pub encoding: &'static encoding_rs::Encoding,
     pub missing_string_as_null: bool,
+    pub output_index: usize,
 }
 
 impl ColumnPlan {
@@ -52,9 +57,10 @@ impl ColumnPlan {
             Some(indices) => indices.iter().map(|&i| &metadata.columns[i]).collect(),
             None => metadata.columns.iter().collect(),
         };
-        columns
+        let mut plans: Vec<ColumnPlan> = columns
             .iter()
-            .map(|col| ColumnPlan {
+            .enumerate()
+            .map(|(output_index, col)| ColumnPlan {
                 start: col.offset,
                 end: col.offset + col.length,
                 kind: kind_for_column(col),
@@ -62,8 +68,12 @@ impl ColumnPlan {
                 encoding_byte: metadata.encoding_byte,
                 encoding,
                 missing_string_as_null,
+                output_index,
             })
-            .collect()
+            .collect();
+        // Improve cache locality by reading row bytes in offset order.
+        plans.sort_by_key(|plan| plan.start);
+        plans
     }
 }
 
@@ -125,7 +135,8 @@ impl DataFrameBuilder {
     /// Add a row directly from raw bytes, bypassing the Value enum entirely.
     /// `plans` must match the builder's columns in order.
     pub(crate) fn add_row_raw(&mut self, row_bytes: &[u8], plans: &[ColumnPlan]) {
-        for (pos, plan) in plans.iter().enumerate() {
+        for plan in plans.iter() {
+            let pos = plan.output_index;
             let start = plan.start;
             let end = plan.end;
             if end > row_bytes.len() {
@@ -390,7 +401,9 @@ enum ChunkMessage {
     Err(String),
 }
 
-pub(crate) struct SasBatchIter {
+pub(crate) type SasBatchIter = Box<dyn Iterator<Item = PolarsResult<DataFrame>> + Send>;
+
+struct ParallelSasBatchIter {
     rx: mpsc::Receiver<ChunkMessage>,
     buffer: BTreeMap<usize, DataFrame>,
     next_idx: usize,
@@ -399,7 +412,7 @@ pub(crate) struct SasBatchIter {
     handles: Vec<JoinHandle<()>>,
 }
 
-impl Iterator for SasBatchIter {
+impl Iterator for ParallelSasBatchIter {
     type Item = PolarsResult<DataFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -431,11 +444,101 @@ impl Iterator for SasBatchIter {
     }
 }
 
-impl Drop for SasBatchIter {
+impl Drop for ParallelSasBatchIter {
     fn drop(&mut self) {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+struct SerialSasBatchIter {
+    data_reader: DataReader<BufReader<File>>,
+    metadata: Metadata,
+    plans: Vec<ColumnPlan>,
+    col_indices: Option<Vec<usize>>,
+    batch_size: usize,
+    remaining: usize,
+}
+
+impl SerialSasBatchIter {
+    fn new(
+        path: PathBuf,
+        header: Header,
+        metadata: Metadata,
+        endian: Endian,
+        format: Format,
+        initial_data_subheaders: Vec<crate::data::DataSubheader>,
+        col_indices: Option<Vec<usize>>,
+        batch_size: usize,
+        total: usize,
+        missing_string_as_null: bool,
+    ) -> PolarsResult<Self> {
+        let mut file = BufReader::new(File::open(&path)?);
+        file.seek(SeekFrom::Start(header.header_length as u64))?;
+        let page_reader = PageReader::new(file, header, endian, format);
+        let data_reader = DataReader::new(
+            page_reader,
+            metadata.clone(),
+            endian,
+            format,
+            initial_data_subheaders,
+        )
+        .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+
+        let plans = ColumnPlan::build_plans(
+            &metadata,
+            col_indices.as_deref(),
+            endian,
+            missing_string_as_null,
+        );
+
+        Ok(Self {
+            data_reader,
+            metadata,
+            plans,
+            col_indices,
+            batch_size,
+            remaining: total,
+        })
+    }
+}
+
+impl Iterator for SerialSasBatchIter {
+    type Item = PolarsResult<DataFrame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let take = self.batch_size.min(self.remaining);
+        let mut builder = match self.col_indices.as_deref() {
+            Some(idx) => DataFrameBuilder::new_with_columns(&self.metadata, idx, take),
+            None => DataFrameBuilder::new(self.metadata.clone(), take),
+        };
+
+        let mut read = 0usize;
+        for _ in 0..take {
+            match self.data_reader.read_row_borrowed() {
+                Ok(Some(row_bytes)) => {
+                    builder.add_row_raw(row_bytes, &self.plans);
+                    read += 1;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Some(Err(PolarsError::ComputeError(
+                        e.to_string().into(),
+                    )))
+                }
+            }
+        }
+
+        if read == 0 {
+            self.remaining = 0;
+            return None;
+        }
+        self.remaining = self.remaining.saturating_sub(read);
+        Some(builder.build().map_err(|e| PolarsError::ComputeError(e.to_string().into())))
     }
 }
 
@@ -463,15 +566,7 @@ pub(crate) fn sas_batch_iter(
     });
 
     if total_chunks == 0 {
-        let (_tx, rx) = mpsc::channel::<ChunkMessage>();
-        return Ok(SasBatchIter {
-            rx,
-            buffer: BTreeMap::new(),
-            next_idx: 0,
-            completed: 0,
-            total_workers: 0,
-            handles: Vec::new(),
-        });
+        return Ok(Box::new(std::iter::empty()));
     }
 
     let default_threads = std::thread::available_parallelism()
@@ -482,6 +577,35 @@ pub(crate) fn sas_batch_iter(
         threads.unwrap_or(default_threads).max(1),
         total_chunks.max(1),
     );
+
+    // Use sequential streaming for compressed files or when explicitly single-threaded.
+    if reader.metadata().compression != crate::Compression::None || n_workers <= 1 {
+        let col_names: Option<Vec<String>> = col_indices.as_ref().map(|indices| {
+            indices
+                .iter()
+                .map(|&i| reader.metadata().columns[i].name.clone())
+                .collect()
+        });
+        let _ = col_names;
+        let header = reader.header().clone();
+        let metadata = reader.metadata().clone();
+        let endian = reader.endian();
+        let format = reader.format();
+        let initial_data_subheaders = reader.initial_data_subheaders().to_vec();
+        let serial = SerialSasBatchIter::new(
+            path.to_path_buf(),
+            header,
+            metadata,
+            endian,
+            format,
+            initial_data_subheaders,
+            col_indices,
+            batch_size,
+            total,
+            missing_string_as_null,
+        )?;
+        return Ok(Box::new(serial));
+    }
     let (tx, rx) = mpsc::channel::<ChunkMessage>();
     let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(n_workers);
 
@@ -552,14 +676,14 @@ pub(crate) fn sas_batch_iter(
     }
     drop(tx);
 
-    Ok(SasBatchIter {
+    Ok(Box::new(ParallelSasBatchIter {
         rx,
         buffer: BTreeMap::new(),
         next_idx: 0,
         completed: 0,
         total_workers: n_workers,
         handles,
-    })
+    }))
 }
 
 impl AnonymousScan for SasScan {
@@ -592,7 +716,7 @@ impl AnonymousScan for SasScan {
             None
         };
 
-        let mut iter = sas_batch_iter(
+        let iter = sas_batch_iter(
             self.path.clone(),
             self.num_threads,
             self.missing_string_as_null,
@@ -601,9 +725,9 @@ impl AnonymousScan for SasScan {
             opts.n_rows,
         )?;
 
+        let prefetch = crate::scan_prefetch::spawn_prefetcher(iter.map(|batch| batch));
         let mut out: Option<DataFrame> = None;
-        while let Some(batch) = iter.next() {
-            let df = batch?;
+        while let Some(df) = prefetch.next()? {
             if let Some(acc) = out.as_mut() {
                 acc.vstack_mut(&df)
                     .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;

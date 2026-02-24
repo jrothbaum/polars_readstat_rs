@@ -595,6 +595,13 @@ fn parse_long_string_value_labels(
         if pos >= data.len() {
             break;
         }
+        if pos + 8 > data.len() {
+            return Err(Error::ParseError(
+                "invalid long string value label header".to_string(),
+            ));
+        }
+        let string_len = read_u32_from(data, pos, header.endian)? as usize;
+        pos += 4;
         let label_count = read_u32_from(data, pos, header.endian)? as usize;
         pos += 4;
         let mut mapping = Vec::with_capacity(label_count);
@@ -635,7 +642,12 @@ fn parse_long_string_value_labels(
             name: name.clone(),
             mapping,
         });
-        if let Some(var) = metadata.variables.iter_mut().find(|v| v.name == var_name) {
+        if let Some(var) = metadata.variables.iter_mut().find(|v| {
+            v.name.eq_ignore_ascii_case(&var_name) || v.short_name.eq_ignore_ascii_case(&var_name)
+        }) {
+            if string_len > 0 && var.string_len < string_len {
+                var.string_len = string_len;
+            }
             var.value_label = Some(name);
         }
     }

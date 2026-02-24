@@ -62,7 +62,35 @@ let lf = readstat_scan("file.sav", Some(opts), None)?;
 let out = lf.select([col("id"), col("income")]).collect()?;
 ```
 
-### 4) Metadata and schema
+### 4) Format-agnostic batch streaming (no full materialization)
+```rust
+use polars_readstat_rs::{readstat_batch_iter, ReadStatFormat, ScanOptions};
+
+let opts = ScanOptions {
+    threads: Some(4),
+    chunk_size: Some(100_000),
+    preserve_order: Some(true), // keep row order deterministic when parallel
+    ..Default::default()
+};
+
+let mut iter = readstat_batch_iter(
+    "file.sas7bdat",
+    Some(opts),
+    Some(ReadStatFormat::Sas),
+    None,
+    Some(200_000),
+    Some(100_000),
+)?;
+
+while let Some(batch) = iter.next() {
+    let df = batch?;
+    // process batch
+}
+```
+
+`preserve_order` still matters for parallel scans: when `false` (default), batches may be emitted out of order for higher throughput; set `true` for deterministic row order.
+
+### 5) Metadata and schema
 ```rust
 use polars_readstat_rs::{readstat_metadata_json, readstat_schema};
 
@@ -70,7 +98,7 @@ let metadata_json = readstat_metadata_json("file.dta", None)?;
 let schema = readstat_schema("file.dta", None, None)?;
 ```
 
-### 5) Writing (Stata/SPSS)
+### 6) Writing (Stata/SPSS)
 ```rust
 use polars_readstat_rs::{StataWriter, SpssWriter};
 
@@ -78,7 +106,7 @@ StataWriter::new("out.dta").write_df(&df)?;
 SpssWriter::new("out.sav").write_df(&df)?;
 ```
 
-### 6) SPSS writer with schema and labels
+### 7) SPSS writer with schema and labels
 ```rust
 use polars::prelude::*;
 use polars_readstat_rs::{
@@ -165,4 +193,9 @@ Read performance checks:
 uv run tests/sas/bench_vs_python.py --file tests/sas/data/too_big/psam_p17.sas7bdat --rows 100000 --repeat 2
 uv run tests/stata/bench_vs_python.py --file tests/stata/data/too_big/usa_00009.dta --rows 100000 --repeat 2
 uv run tests/spss/bench_vs_python.py --file tests/spss/data/too_big/ess_data.sav --rows 100000 --repeat 2
+```
+
+Streaming batch benchmark (200k-row cap on `tests/*/data/too_big` files):
+```bash
+cargo bench --bench readstat_stream_benchmarks
 ```

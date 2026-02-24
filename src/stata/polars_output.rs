@@ -16,12 +16,14 @@ pub fn scan_dta(
 ) -> PolarsResult<LazyFrame> {
     let path = path.into();
     let missing_string_as_null = opts.missing_string_as_null.unwrap_or(true);
+    let user_missing_as_null = opts.user_missing_as_null.unwrap_or(true);
     let value_labels_as_strings = opts.value_labels_as_strings;
     let preserve_order = opts.preserve_order.unwrap_or(false);
     let scan_ptr = Arc::new(StataScan::new(
         path,
         opts.threads,
         missing_string_as_null,
+        user_missing_as_null,
         value_labels_as_strings,
         opts.chunk_size,
         preserve_order,
@@ -59,7 +61,8 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let mut iter = stata_batch_iter(path, None, true, true, Some(10), false, None, Some(25))
+        let mut iter =
+            stata_batch_iter(path, None, true, true, true, Some(10), false, None, Some(25))
             .expect("batch iter");
         let mut batches = 0usize;
         let mut rows = 0usize;
@@ -77,6 +80,7 @@ pub struct StataScan {
     path: PathBuf,
     threads: Option<usize>,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: Option<bool>,
     chunk_size: Option<usize>,
     preserve_order: bool,
@@ -88,6 +92,7 @@ impl StataScan {
         path: PathBuf,
         threads: Option<usize>,
         missing_string_as_null: bool,
+        user_missing_as_null: bool,
         value_labels_as_strings: Option<bool>,
         chunk_size: Option<usize>,
         preserve_order: bool,
@@ -97,6 +102,7 @@ impl StataScan {
             path,
             threads,
             missing_string_as_null,
+            user_missing_as_null,
             value_labels_as_strings,
             chunk_size,
             preserve_order,
@@ -164,6 +170,7 @@ struct SerialStataBatchIter {
     batch_size: usize,
     threads: Option<usize>,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: bool,
     chunk_size: Option<usize>,
 }
@@ -182,6 +189,7 @@ impl Iterator for SerialStataBatchIter {
             .with_offset(self.offset)
             .with_limit(take)
             .missing_string_as_null(self.missing_string_as_null)
+            .user_missing_as_null(self.user_missing_as_null)
             .value_labels_as_strings(self.value_labels_as_strings);
         if let Some(n) = self.threads {
             builder = builder.with_n_threads(n);
@@ -209,6 +217,7 @@ pub(crate) fn stata_batch_iter(
     path: PathBuf,
     threads: Option<usize>,
     missing_string_as_null: bool,
+    user_missing_as_null: bool,
     value_labels_as_strings: bool,
     chunk_size: Option<usize>,
     preserve_order: bool,
@@ -265,6 +274,7 @@ pub(crate) fn stata_batch_iter(
         let cols_idx = col_indices.clone();
         let formats = Arc::new(time_formats);
         let missing_null = missing_string_as_null;
+        let user_missing = user_missing_as_null;
         let labels_as_strings = value_labels_as_strings;
         let shared = build_shared_decode(&path, &metadata, endian, version, labels_as_strings)
             .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
@@ -292,6 +302,7 @@ pub(crate) fn stata_batch_iter(
                                 start,
                                 cnt,
                                 missing_null,
+                                user_missing,
                                 labels_as_strings,
                                 &shared,
                             )
@@ -326,6 +337,7 @@ pub(crate) fn stata_batch_iter(
         batch_size,
         threads,
         missing_string_as_null,
+        user_missing_as_null,
         value_labels_as_strings,
         chunk_size,
     }))
@@ -344,6 +356,7 @@ impl AnonymousScan for StataScan {
             self.path.clone(),
             self.threads,
             self.missing_string_as_null,
+            self.user_missing_as_null,
             self.value_labels_as_strings.unwrap_or(true),
             self.chunk_size,
             self.preserve_order,

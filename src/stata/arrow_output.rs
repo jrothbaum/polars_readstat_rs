@@ -99,6 +99,7 @@ pub fn read_to_arrow_stream_ffi(
         path.to_path_buf(),
         opts.threads,
         missing_string_as_null,
+        true,
         value_labels_as_strings.unwrap_or(true),
         Some(batch_size),
         true,

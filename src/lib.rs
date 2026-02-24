@@ -6,6 +6,7 @@
 
 pub mod sas;
 pub(crate) mod scan_prefetch;
+mod readstat_stream;
 pub mod spss;
 pub mod stata;
 
@@ -36,6 +37,7 @@ pub use sas::{Error, Result, Sas7bdatReader};
 pub use sas::{SasValueLabelKey, SasValueLabelMap, SasValueLabels, SasVariableLabels, SasWriter};
 
 pub use sas::scan_sas7bdat;
+pub use readstat_stream::{readstat_batch_iter, ReadstatBatchIter, ReadstatBatchStream};
 
 pub use spss::{scan_sav, Error as SpssError, Result as SpssResult, SpssReader};
 pub use spss::{
