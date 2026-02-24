@@ -88,7 +88,7 @@ while let Some(batch) = iter.next() {
 }
 ```
 
-`preserve_order` still matters for parallel scans: when `false` (default), batches may be emitted out of order for higher throughput; set `true` for deterministic row order.
+When scanning with multiple threads, `preserve_order = false` (default) allows batches to be emitted out of order for higher throughput. Set `true` for deterministic row order.
 
 ### 5) Metadata and schema
 ```rust
