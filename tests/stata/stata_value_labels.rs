@@ -1,5 +1,6 @@
 use polars::prelude::*;
-use polars_readstat_rs::{StataReader, StataWriter, ValueLabelMap, ValueLabels, VariableLabels};
+use polars_readstat_rs::{stata, StataReader, StataWriter, ValueLabelMap, ValueLabels, VariableLabels};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -54,6 +55,24 @@ fn test_stata_value_labels_roundtrip() {
         .find(|v| v.name == "status")
         .unwrap();
     assert_eq!(label.mapping.len(), 6);
+
+    let json = stata::metadata_json(&path).unwrap();
+    let meta_json: Value = serde_json::from_str(&json).unwrap();
+    let vars = meta_json
+        .get("variables")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let var = vars
+        .iter()
+        .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("status"))
+        .unwrap();
+    let vlabels = var
+        .get("value_labels")
+        .and_then(|v| v.as_object())
+        .unwrap();
+    assert_eq!(vlabels.get("1").and_then(|v| v.as_str()), Some("one"));
+    assert_eq!(vlabels.get("2").and_then(|v| v.as_str()), Some("two"));
+    assert_eq!(vlabels.get("3").and_then(|v| v.as_str()), Some("three"));
 
     let df_labeled = reader
         .read()

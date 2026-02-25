@@ -18,14 +18,21 @@ const SUBTYPE_LONG_STRING_MISSING_VALUES: u32 = 22;
 
 /// Pre-scan the record stream to find the character encoding, then reset to the start.
 /// This ensures variable labels are decoded with the correct encoding from the outset.
-fn prescan_char_encoding<R: Read + Seek>(reader: &mut R, header: &Header) -> Option<&'static encoding_rs::Encoding> {
+fn prescan_char_encoding<R: Read + Seek>(
+    reader: &mut R,
+    header: &Header,
+) -> Option<&'static encoding_rs::Encoding> {
     let start = reader.stream_position().ok()?;
     let result = prescan_char_encoding_inner(reader, header);
     reader.seek(SeekFrom::Start(start)).ok()?;
     result
 }
 
-fn prescan_char_encoding_inner<R: Read + Seek>(reader: &mut R, header: &Header) -> Option<&'static encoding_rs::Encoding> {
+fn prescan_char_encoding_inner<R: Read + Seek>(
+    reader: &mut R,
+    header: &Header,
+) -> Option<&'static encoding_rs::Encoding> {
+    let mut fallback_encoding: Option<&'static encoding_rs::Encoding> = None;
     loop {
         let rec_type = read_u32(reader, header.endian).ok()?;
         match rec_type {
@@ -79,15 +86,29 @@ fn prescan_char_encoding_inner<R: Read + Seek>(reader: &mut R, header: &Header) 
                     let mut buf = vec![0u8; data_len];
                     reader.read_exact(&mut buf).ok()?;
                     if let Ok(codepage) = std::str::from_utf8(&buf) {
-                        return encoding_rs::Encoding::for_label(codepage.trim().as_bytes());
+                        if let Some(enc) =
+                            encoding_rs::Encoding::for_label(codepage.trim().as_bytes())
+                        {
+                            return Some(enc);
+                        }
                     }
-                    return None;
+                } else if subtype == SUBTYPE_INTEGER_INFO && data_len >= 8 * 4 {
+                    let mut buf = vec![0u8; data_len];
+                    reader.read_exact(&mut buf).ok()?;
+                    let character_code = read_i32_from(&buf, 28, header.endian).ok()?;
+                    if character_code > 0 {
+                        if let Some(enc) = encoding_for_code(character_code) {
+                            fallback_encoding = Some(enc);
+                        }
+                    }
+                } else {
+                    reader.seek(SeekFrom::Current(data_len as i64)).ok()?;
                 }
-                reader.seek(SeekFrom::Current(data_len as i64)).ok()?;
             }
-            REC_TYPE_DICT_TERMINATION | _ => return None,
+            REC_TYPE_DICT_TERMINATION | _ => break,
         }
     }
+    fallback_encoding
 }
 
 fn read_u8<R: Read>(reader: &mut R) -> Result<u8> {
@@ -154,7 +175,7 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
                         if let Some(enc) =
                             encoding_rs::Encoding::for_label(codepage.trim().as_bytes())
                         {
-                            metadata.encoding = enc;
+                            update_encoding(&mut metadata, enc);
                         }
                     }
                 } else if subtype == SUBTYPE_VERY_LONG_STR && data_len > 0 {
@@ -455,6 +476,58 @@ fn decode_string(buf: &[u8], _endian: Endian, encoding: &'static encoding_rs::En
     s.trim().to_string()
 }
 
+fn redecode_string(
+    value: &str,
+    from: &'static encoding_rs::Encoding,
+    to: &'static encoding_rs::Encoding,
+) -> String {
+    let (bytes, _, _) = from.encode(value);
+    let s = to.decode_without_bom_handling(&bytes).0;
+    s.trim().to_string()
+}
+
+fn redecode_metadata_strings(
+    metadata: &mut Metadata,
+    from: &'static encoding_rs::Encoding,
+    to: &'static encoding_rs::Encoding,
+) {
+    for var in &mut metadata.variables {
+        var.name = redecode_string(&var.name, from, to);
+        var.short_name = redecode_string(&var.short_name, from, to);
+        if let Some(label) = var.label.as_mut() {
+            *label = redecode_string(label, from, to);
+        }
+        if let Some(label_name) = var.value_label.as_mut() {
+            *label_name = redecode_string(label_name, from, to);
+        }
+        if !var.missing_strings.is_empty() {
+            var.missing_strings = var
+                .missing_strings
+                .iter()
+                .map(|s| redecode_string(s, from, to))
+                .collect();
+        }
+    }
+
+    for value_label in &mut metadata.value_labels {
+        value_label.name = redecode_string(&value_label.name, from, to);
+        for (key, label) in value_label.mapping.iter_mut() {
+            if let crate::spss::types::ValueLabelKey::Str(s) = key {
+                *s = redecode_string(s, from, to);
+            }
+            *label = redecode_string(label, from, to);
+        }
+    }
+}
+
+fn update_encoding(metadata: &mut Metadata, new_encoding: &'static encoding_rs::Encoding) {
+    if metadata.encoding != new_encoding {
+        let previous = metadata.encoding;
+        metadata.encoding = new_encoding;
+        redecode_metadata_strings(metadata, previous, new_encoding);
+    }
+}
+
 fn parse_integer_info(data: &[u8], header: &Header, metadata: &mut Metadata) -> Result<()> {
     if data.len() < 32 {
         return Ok(());
@@ -462,7 +535,7 @@ fn parse_integer_info(data: &[u8], header: &Header, metadata: &mut Metadata) -> 
     let character_code = read_i32_from(data, 28, header.endian)?;
     if character_code > 0 {
         if let Some(enc) = encoding_for_code(character_code) {
-            metadata.encoding = enc;
+            update_encoding(metadata, enc);
         }
     }
     Ok(())

@@ -114,6 +114,15 @@ fn test_spss_long_string_value_labels_record_parses() {
         var.get("value_label").and_then(|v| v.as_str()),
         Some("labels0")
     );
+    let labels = var
+        .get("value_labels")
+        .and_then(|v| v.as_object())
+        .expect("value_labels map");
+    let expected_label = "L".repeat(300);
+    assert_eq!(
+        labels.get("A").and_then(|v| v.as_str()),
+        Some(expected_label.as_str())
+    );
 
     let _ = fs::remove_file(&path);
 }
@@ -161,6 +170,11 @@ fn test_spss_long_string_value_labels_pyreadstat_regression() {
         var.get("value_label").and_then(|v| v.as_str()).is_some(),
         "expected long string value labels"
     );
+    let labels = var
+        .get("value_labels")
+        .and_then(|v| v.as_object())
+        .expect("value_labels map");
+    assert!(!labels.is_empty(), "expected value_labels entries");
 
     let reader = polars_readstat_rs::SpssReader::open(&path).expect("open");
     let df = reader
