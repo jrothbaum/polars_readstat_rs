@@ -9,7 +9,6 @@ use std::path::PathBuf;
 ///       [--offset N] [--limit N]
 ///       [--threads N] [--chunk-size N]
 ///       [--missing-string-as-null true|false]
-///       [--user-missing-as-null true|false]
 ///       [--value-labels-as-strings true|false]
 ///       [--compress true|false]
 ///       [--compress-cols a,b,c]
@@ -69,10 +68,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .next()
                     .ok_or("missing --missing-string-as-null value")?;
                 opts.missing_string_as_null = Some(parse_bool(&v)?);
-            }
-            "--user-missing-as-null" => {
-                let v = args.next().ok_or("missing --user-missing-as-null value")?;
-                opts.user_missing_as_null = Some(parse_bool(&v)?);
             }
             "--value-labels-as-strings" => {
                 let v = args

@@ -4,7 +4,7 @@ use crate::constants::{
 use crate::error::{Error, Result};
 use crate::data::DataReader;
 use crate::page::PageReader;
-use crate::reader::Sas7bdatReader;
+use crate::reader::{compute_page_index, read_batch_with_page_index, Sas7bdatReader};
 use crate::types::{Column as SasColumn, ColumnType, Endian, Format, Header, Metadata};
 use crate::value::Value;
 use polars::prelude::*;
@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -375,6 +376,7 @@ pub struct SasScan {
     missing_string_as_null: bool,
     chunk_size: Option<usize>,
     compress_opts: crate::CompressOptionsLite,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 }
 
 impl SasScan {
@@ -384,6 +386,7 @@ impl SasScan {
         missing_string_as_null: bool,
         chunk_size: Option<usize>,
         compress_opts: crate::CompressOptionsLite,
+        informative_nulls: Option<crate::InformativeNullOpts>,
     ) -> Self {
         Self {
             path,
@@ -391,6 +394,7 @@ impl SasScan {
             missing_string_as_null,
             chunk_size,
             compress_opts,
+            informative_nulls,
         }
     }
 }
@@ -452,17 +456,46 @@ impl Drop for ParallelSasBatchIter {
     }
 }
 
-struct SerialSasBatchIter {
+// For serial SAS paths (compressed files or single-thread): wraps SerialSasBatchIter
+// in a background thread so IO can overlap with the consumer's processing.
+struct SasBackgroundIter {
+    rx: mpsc::Receiver<PolarsResult<DataFrame>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Iterator for SasBackgroundIter {
+    type Item = PolarsResult<DataFrame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rx.recv().ok()
+    }
+}
+
+impl Drop for SasBackgroundIter {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+pub(crate) struct SerialSasBatchIter {
     data_reader: DataReader<BufReader<File>>,
     metadata: Metadata,
     plans: Vec<ColumnPlan>,
     col_indices: Option<Vec<usize>>,
     batch_size: usize,
     remaining: usize,
+    // Informative-null state (empty/None when not tracking)
+    null_opts: Option<crate::InformativeNullOpts>,
+    indicator_plan_indices: Vec<usize>,
+    indicator_names: Vec<String>,
+    null_pairs: Vec<(String, String)>,
 }
 
 impl SerialSasBatchIter {
-    fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
         path: PathBuf,
         header: Header,
         metadata: Metadata,
@@ -473,11 +506,13 @@ impl SerialSasBatchIter {
         batch_size: usize,
         total: usize,
         missing_string_as_null: bool,
+        null_opts: Option<crate::InformativeNullOpts>,
+        skip: usize,
     ) -> PolarsResult<Self> {
         let mut file = BufReader::new(File::open(&path)?);
         file.seek(SeekFrom::Start(header.header_length as u64))?;
         let page_reader = PageReader::new(file, header, endian, format);
-        let data_reader = DataReader::new(
+        let mut data_reader = DataReader::new(
             page_reader,
             metadata.clone(),
             endian,
@@ -486,12 +521,61 @@ impl SerialSasBatchIter {
         )
         .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
 
+        if skip > 0 {
+            data_reader
+                .skip_rows(skip)
+                .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+        }
+
         let plans = ColumnPlan::build_plans(
             &metadata,
             col_indices.as_deref(),
             endian,
             missing_string_as_null,
         );
+
+        // Compute indicator state when informative nulls are requested.
+        let (indicator_plan_indices, indicator_names, null_pairs) =
+            if let Some(ref opts) = null_opts {
+                let active_cols: Vec<&str> = match col_indices.as_deref() {
+                    Some(idx) => idx.iter().map(|&i| metadata.columns[i].name.as_str()).collect(),
+                    None => metadata.columns.iter().map(|c| c.name.as_str()).collect(),
+                };
+                let eligible_cols: Vec<&str> = match col_indices.as_deref() {
+                    Some(idx) => idx
+                        .iter()
+                        .map(|&i| &metadata.columns[i])
+                        .filter(|c| c.col_type == crate::types::ColumnType::Numeric)
+                        .map(|c| c.name.as_str())
+                        .collect(),
+                    None => metadata
+                        .columns
+                        .iter()
+                        .filter(|c| c.col_type == crate::types::ColumnType::Numeric)
+                        .map(|c| c.name.as_str())
+                        .collect(),
+                };
+                let pairs = crate::informative_null_pairs(&active_cols, &eligible_cols, opts);
+                let ind_map: std::collections::HashMap<&str, &str> = pairs
+                    .iter()
+                    .map(|(m, i)| (m.as_str(), i.as_str()))
+                    .collect();
+                let mut ipi = Vec::new();
+                let mut inames = Vec::new();
+                for (pi, plan) in plans.iter().enumerate() {
+                    let col_name = match col_indices.as_deref() {
+                        Some(idx) => &metadata.columns[idx[plan.output_index]].name,
+                        None => &metadata.columns[plan.output_index].name,
+                    };
+                    if let Some(&ind_name) = ind_map.get(col_name.as_str()) {
+                        ipi.push(pi);
+                        inames.push(ind_name.to_string());
+                    }
+                }
+                (ipi, inames, pairs)
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
 
         Ok(Self {
             data_reader,
@@ -500,6 +584,10 @@ impl SerialSasBatchIter {
             col_indices,
             batch_size,
             remaining: total,
+            null_opts,
+            indicator_plan_indices,
+            indicator_names,
+            null_pairs,
         })
     }
 }
@@ -517,18 +605,70 @@ impl Iterator for SerialSasBatchIter {
             None => DataFrameBuilder::new(self.metadata.clone(), take),
         };
 
+        // Set up indicator builders if tracking informative nulls.
+        let has_inds = !self.indicator_plan_indices.is_empty();
+        let mut ind_builders: Vec<StringChunkedBuilder> = if has_inds {
+            self.indicator_names
+                .iter()
+                .map(|name| StringChunkedBuilder::new(name.as_str().into(), take))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let plan_to_ind: Vec<Option<usize>> = if has_inds {
+            let mut v = vec![None; self.plans.len()];
+            for (i, &pi) in self.indicator_plan_indices.iter().enumerate() {
+                v[pi] = Some(i);
+            }
+            v
+        } else {
+            Vec::new()
+        };
+
         let mut read = 0usize;
         for _ in 0..take {
             match self.data_reader.read_row_borrowed() {
                 Ok(Some(row_bytes)) => {
                     builder.add_row_raw(row_bytes, &self.plans);
+                    if has_inds {
+                        for (plan_pos, plan) in self.plans.iter().enumerate() {
+                            let Some(ind_idx) = plan_to_ind[plan_pos] else { continue };
+                            let start = plan.start;
+                            let end = plan.end;
+                            let ind_builder = &mut ind_builders[ind_idx];
+                            if end > row_bytes.len() {
+                                ind_builder.append_null();
+                                continue;
+                            }
+                            match plan.kind {
+                                ColumnKind::Numeric
+                                | ColumnKind::Date
+                                | ColumnKind::DateTime
+                                | ColumnKind::Time => {
+                                    let (_val, offset) =
+                                        crate::value::decode_numeric_bytes_mask_tagged(
+                                            plan.endian,
+                                            &row_bytes[start..end],
+                                        );
+                                    match offset {
+                                        Some(off) => {
+                                            let label = crate::value::sas_offset_to_label(off);
+                                            ind_builder.append_value(&label);
+                                        }
+                                        None => ind_builder.append_null(),
+                                    }
+                                }
+                                ColumnKind::Character => {
+                                    ind_builder.append_null();
+                                }
+                            }
+                        }
+                    }
                     read += 1;
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    return Some(Err(PolarsError::ComputeError(
-                        e.to_string().into(),
-                    )))
+                    return Some(Err(PolarsError::ComputeError(e.to_string().into())))
                 }
             }
         }
@@ -538,7 +678,36 @@ impl Iterator for SerialSasBatchIter {
             return None;
         }
         self.remaining = self.remaining.saturating_sub(read);
-        Some(builder.build().map_err(|e| PolarsError::ComputeError(e.to_string().into())))
+
+        let base_df = match builder.build() {
+            Ok(df) => df,
+            Err(e) => return Some(Err(PolarsError::ComputeError(e.to_string().into()))),
+        };
+
+        if !has_inds {
+            return Some(Ok(base_df));
+        }
+
+        // Append indicator columns and apply informative null mode.
+        let ind_series: Vec<Column> = ind_builders
+            .into_iter()
+            .map(|b| b.finish().into_series().into())
+            .collect();
+        let ind_df = match DataFrame::new_infer_height(ind_series) {
+            Ok(df) => df,
+            Err(e) => return Some(Err(e)),
+        };
+        let df_with_inds = match base_df.hstack(ind_df.columns()) {
+            Ok(df) => df,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let null_opts = self.null_opts.as_ref().unwrap();
+        Some(crate::apply_informative_null_mode(
+            df_with_inds,
+            &null_opts.mode,
+            &self.null_pairs,
+        ))
     }
 }
 
@@ -549,6 +718,7 @@ pub(crate) fn sas_batch_iter(
     chunk_size: Option<usize>,
     col_indices: Option<Vec<usize>>,
     n_rows: Option<usize>,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 ) -> PolarsResult<SasBatchIter> {
     let reader =
         Sas7bdatReader::open(&path).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
@@ -558,21 +728,76 @@ pub(crate) fn sas_batch_iter(
         .max(1);
     let total_chunks = total.div_ceil(batch_size);
 
-    let col_names: Option<Vec<String>> = col_indices.as_ref().map(|indices| {
-        indices
-            .iter()
-            .map(|&i| reader.metadata().columns[i].name.clone())
-            .collect()
-    });
-
     if total_chunks == 0 {
         return Ok(Box::new(std::iter::empty()));
     }
 
-    let default_threads = std::thread::available_parallelism()
+    // When informative nulls are requested, always use the serial path (needs row-by-row decode).
+    if let Some(null_opts) = informative_nulls {
+        // Collision check
+        let var_names: Vec<&str> = reader.metadata().columns.iter().map(|c| c.name.as_str()).collect();
+        let active_names: Vec<&str> = match col_indices.as_deref() {
+            Some(idx) => idx.iter().map(|&i| var_names[i]).collect(),
+            None => var_names.clone(),
+        };
+        let eligible_names: Vec<&str> = match col_indices.as_deref() {
+            Some(idx) => idx
+                .iter()
+                .map(|&i| reader.metadata().columns[i].name.as_str())
+                .filter(|_| true)
+                .zip(col_indices.as_deref().unwrap().iter().map(|&i| &reader.metadata().columns[i]))
+                .filter(|(_, c)| c.col_type == crate::types::ColumnType::Numeric)
+                .map(|(name, _)| name)
+                .collect(),
+            None => reader.metadata().columns.iter()
+                .filter(|c| c.col_type == crate::types::ColumnType::Numeric)
+                .map(|c| c.name.as_str())
+                .collect(),
+        };
+        let pairs = crate::informative_null_pairs(&active_names, &eligible_names, &null_opts);
+        crate::check_informative_null_collisions(&var_names, &pairs)?;
+
+        let header = reader.header().clone();
+        let metadata = reader.metadata().clone();
+        let endian = reader.endian();
+        let format = reader.format();
+        let initial_data_subheaders = reader.initial_data_subheaders().to_vec();
+        let serial = SerialSasBatchIter::new(
+            path.to_path_buf(),
+            header,
+            metadata,
+            endian,
+            format,
+            initial_data_subheaders,
+            col_indices,
+            batch_size,
+            total,
+            missing_string_as_null,
+            Some(null_opts),
+            0,
+        )?;
+        let (tx, rx) = mpsc::sync_channel::<PolarsResult<DataFrame>>(2);
+        let handle = std::thread::spawn(move || {
+            for batch in serial {
+                if tx.send(batch).is_err() {
+                    return;
+                }
+            }
+        });
+        return Ok(Box::new(SasBackgroundIter { rx, handle: Some(handle) }));
+    }
+
+    let n_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
         .max(1);
+    // Uncompressed SAS is I/O-bound: hyperthreads don't help and cost extra RAM.
+    // Default to physical core count; users can override with `threads` explicitly.
+    let default_threads = if threads.is_none() {
+        num_cpus::get_physical().max(1).min(n_cpus)
+    } else {
+        n_cpus
+    };
     let n_workers = min(
         threads.unwrap_or(default_threads).max(1),
         total_chunks.max(1),
@@ -603,72 +828,90 @@ pub(crate) fn sas_batch_iter(
             batch_size,
             total,
             missing_string_as_null,
+            None,
+            0,
         )?;
-        return Ok(Box::new(serial));
+        let (tx, rx) = mpsc::sync_channel::<PolarsResult<DataFrame>>(2);
+        let handle = std::thread::spawn(move || {
+            for batch in serial {
+                if tx.send(batch).is_err() {
+                    return;
+                }
+            }
+        });
+        return Ok(Box::new(SasBackgroundIter { rx, handle: Some(handle) }));
     }
-    let (tx, rx) = mpsc::channel::<ChunkMessage>();
+    // Bounded channel: one slot per worker — each worker can have one batch queued
+    // while building the next, keeping peak in-flight memory to ~2×n_workers batches.
+    let (tx, rx) = mpsc::sync_channel::<ChunkMessage>(n_workers);
+    let header = Arc::new(reader.header().clone());
+    let metadata = Arc::new(reader.metadata().clone());
+    let endian = reader.endian();
+    let format = reader.format();
+    // Build page index once — pure arithmetic, one 6-byte validation read.
+    // Each worker uses this to seek directly to its target page instead of
+    // calling skip_rows(), which reads through every preceding page (O(n) I/O).
+    let page_index = Arc::new(compute_page_index(
+        &path,
+        &header,
+        &metadata,
+        endian,
+        format,
+        reader.first_data_page(),
+        reader.mix_data_rows(),
+    ));
     let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(n_workers);
 
-    let base_chunks = total_chunks / n_workers;
-    let extra_chunks = total_chunks % n_workers;
-    let mut worker_ranges: Vec<(usize, usize)> = Vec::with_capacity(n_workers);
-    let mut next_chunk = 0usize;
-    for worker_idx in 0..n_workers {
-        let worker_chunk_count = base_chunks + usize::from(worker_idx < extra_chunks);
-        if worker_chunk_count == 0 {
-            continue;
-        }
-        let start_chunk = next_chunk;
-        let end_chunk = start_chunk + worker_chunk_count;
-        worker_ranges.push((start_chunk, end_chunk));
-        next_chunk = end_chunk;
-    }
+    // Work-stealing: workers atomically claim the next chunk index.
+    // This bounds the BTreeMap reorder-buffer to at most n_workers entries,
+    // preventing the old fixed-range approach from accumulating O(total_chunks)
+    // out-of-order batches in RAM when workers raced ahead.
+    let next_chunk_counter = Arc::new(AtomicUsize::new(0));
 
-    for (start_chunk, end_chunk) in worker_ranges {
+    for _ in 0..n_workers {
         let tx = tx.clone();
         let path = path.clone();
-        let col_names = col_names.clone();
-        let missing_string_as_null = missing_string_as_null;
+        let header = header.clone();
+        let metadata = metadata.clone();
+        let page_index = page_index.clone();
+        let col_indices = col_indices.clone();
+        let next_chunk_counter = next_chunk_counter.clone();
         let handle = std::thread::spawn(move || {
-            let reader = match Sas7bdatReader::open(&path) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(ChunkMessage::Err(e.to_string()));
-                    return;
-                }
-            };
-
-            let start_row = start_chunk * batch_size;
-            if start_row >= total {
-                let _ = tx.send(ChunkMessage::Done);
-                return;
-            }
-            let worker_rows = min(total - start_row, (end_chunk - start_chunk) * batch_size);
-            let mut builder = reader
-                .read()
-                .with_offset(start_row)
-                .with_limit(worker_rows)
-                .missing_string_as_null(missing_string_as_null)
-                .sequential();
-            if let Some(cols) = col_names {
-                builder = builder.with_columns(cols);
-            }
-            let worker_df = match builder.finish() {
-                Ok(df) => df,
-                Err(e) => {
-                    let _ = tx.send(ChunkMessage::Err(e.to_string()));
-                    return;
-                }
-            };
-
-            for out_idx in start_chunk..end_chunk {
-                let local_offset = (out_idx - start_chunk) * batch_size;
-                if local_offset >= worker_df.height() {
+            loop {
+                // Claim the next chunk atomically.
+                let out_idx = next_chunk_counter.fetch_add(1, Ordering::Relaxed);
+                if out_idx >= total_chunks {
                     break;
                 }
-                let local_take = min(batch_size, worker_df.height() - local_offset);
-                let df = worker_df.slice(local_offset as i64, local_take);
-                let _ = tx.send(ChunkMessage::Data { idx: out_idx, df });
+                let start_row = out_idx * batch_size;
+                if start_row >= total {
+                    break;
+                }
+                let count = min(batch_size, total - start_row);
+                // Direct page seek: O(1) file seek regardless of start_row.
+                let result = read_batch_with_page_index(
+                    &path,
+                    &header,
+                    &metadata,
+                    endian,
+                    format,
+                    start_row,
+                    count,
+                    col_indices.as_deref(),
+                    missing_string_as_null,
+                    &page_index,
+                );
+                match result {
+                    Ok(df) => {
+                        if tx.send(ChunkMessage::Data { idx: out_idx, df }).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ChunkMessage::Err(e.to_string()));
+                        return;
+                    }
+                }
             }
             let _ = tx.send(ChunkMessage::Done);
         });
@@ -723,6 +966,7 @@ impl AnonymousScan for SasScan {
             self.chunk_size,
             col_indices,
             opts.n_rows,
+            self.informative_nulls.clone(),
         )?;
 
         let prefetch = crate::scan_prefetch::spawn_prefetcher(iter.map(|batch| batch));
@@ -750,13 +994,14 @@ impl AnonymousScan for SasScan {
         let reader = Sas7bdatReader::open(&self.path)
             .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
 
-        // FIX: Schema::new() replaced with with_capacity
-        let mut schema = Schema::with_capacity(reader.metadata().columns.len());
+        let cols = &reader.metadata().columns;
+        let var_names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
 
-        for col in &reader.metadata().columns {
+        // Build base schema
+        let mut schema = Schema::with_capacity(cols.len());
+        for col in cols.iter() {
             let dtype = match col.col_type {
                 ColumnType::Numeric => {
-                    // Check format to determine date/time types
                     // IMPORTANT: Check DATETIME before DATE since "DATETIME" starts with "DATE"
                     if is_datetime_format(&col.format) {
                         DataType::Datetime(TimeUnit::Microseconds, None)
@@ -772,6 +1017,60 @@ impl AnonymousScan for SasScan {
             };
             schema.with_column(col.name.as_str().into(), dtype);
         }
+
+        // If informative nulls requested, add/transform indicator columns
+        if let Some(null_opts) = &self.informative_nulls {
+            let eligible: Vec<&str> = cols
+                .iter()
+                .filter(|c| c.col_type == ColumnType::Numeric)
+                .map(|c| c.name.as_str())
+                .collect();
+            let pairs = crate::informative_null_pairs(&var_names, &eligible, null_opts);
+            crate::check_informative_null_collisions(&var_names, &pairs)?;
+
+            use crate::InformativeNullMode;
+            match &null_opts.mode {
+                InformativeNullMode::SeparateColumn { .. } => {
+                    // Interleave indicator String columns after each main col
+                    let indicator_set: std::collections::HashSet<&str> =
+                        pairs.iter().map(|(_, ind)| ind.as_str()).collect();
+                    let main_to_ind: std::collections::HashMap<&str, &str> =
+                        pairs.iter().map(|(m, i)| (m.as_str(), i.as_str())).collect();
+                    let existing_names: Vec<String> =
+                        schema.iter_names().map(|n| n.to_string()).collect();
+                    let mut new_schema = Schema::with_capacity(existing_names.len() + pairs.len());
+                    for name in &existing_names {
+                        if indicator_set.contains(name.as_str()) {
+                            continue;
+                        }
+                        let dt = schema.get(name.as_str()).unwrap().clone();
+                        new_schema.with_column(name.as_str().into(), dt);
+                        if let Some(&ind) = main_to_ind.get(name.as_str()) {
+                            new_schema.with_column(ind.into(), DataType::String);
+                        }
+                    }
+                    schema = new_schema;
+                }
+                InformativeNullMode::Struct => {
+                    for (main, _ind) in &pairs {
+                        let main_dt = schema.get(main.as_str()).cloned().unwrap_or(DataType::Float64);
+                        schema.with_column(
+                            main.as_str().into(),
+                            DataType::Struct(vec![
+                                Field::new(main.as_str().into(), main_dt),
+                                Field::new("null_indicator".into(), DataType::String),
+                            ]),
+                        );
+                    }
+                }
+                InformativeNullMode::MergedString => {
+                    for (main, _ind) in &pairs {
+                        schema.with_column(main.as_str().into(), DataType::String);
+                    }
+                }
+            }
+        }
+
         Ok(Arc::new(schema))
     }
 }
@@ -788,6 +1087,7 @@ pub fn scan_sas7bdat(
         missing_string_as_null,
         opts.chunk_size,
         opts.compress_opts,
+        opts.informative_nulls,
     ));
     LazyFrame::anonymous_scan(scan_ptr, Default::default())
 }
@@ -822,7 +1122,7 @@ mod tests {
             return;
         }
         let mut iter =
-            sas_batch_iter(path, None, true, Some(10), None, Some(25)).expect("batch iter");
+            sas_batch_iter(path, None, true, Some(10), None, Some(25), None).expect("batch iter");
         let mut batches = 0usize;
         let mut rows = 0usize;
         while let Some(batch) = iter.next() {

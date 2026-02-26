@@ -13,16 +13,15 @@ use std::thread::JoinHandle;
 pub fn scan_sav(path: impl Into<PathBuf>, opts: crate::ScanOptions) -> PolarsResult<LazyFrame> {
     let path = path.into();
     let missing_string_as_null = opts.missing_string_as_null.unwrap_or(true);
-    let user_missing_as_null = opts.user_missing_as_null.unwrap_or(true);
     let preserve_order = opts.preserve_order.unwrap_or(false);
     let scan_ptr = Arc::new(SpssScan::new(
         path,
         opts.threads,
         missing_string_as_null,
-        user_missing_as_null,
         opts.value_labels_as_strings,
         opts.chunk_size,
         preserve_order,
+        opts.informative_nulls,
         opts.compress_opts,
     ));
     LazyFrame::anonymous_scan(scan_ptr, Default::default())
@@ -62,11 +61,11 @@ mod tests {
             None,
             true,
             true,
-            true,
             Some(10),
             false,
             None,
             Some(25),
+            None,
         )
         .expect("batch iter");
         let mut batches = 0usize;
@@ -131,6 +130,30 @@ impl Drop for ParallelSpssBatchIter {
     }
 }
 
+// For compressed SPSS files: reads the full range sequentially in a background
+// thread (one pass, no re-seeking) and sends batches via a bounded channel.
+// This avoids the O(N²) re-decompression cost of calling with_offset() per batch.
+struct SpssBackgroundIter {
+    rx: mpsc::Receiver<PolarsResult<DataFrame>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Iterator for SpssBackgroundIter {
+    type Item = PolarsResult<DataFrame>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rx.recv().ok()
+    }
+}
+
+impl Drop for SpssBackgroundIter {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 struct SerialSpssBatchIter {
     reader: SpssReader,
     cols: Option<Vec<String>>,
@@ -139,10 +162,10 @@ struct SerialSpssBatchIter {
     batch_size: usize,
     threads: Option<usize>,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
     chunk_size: Option<usize>,
     schema: Arc<Schema>,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 }
 
 impl Iterator for SerialSpssBatchIter {
@@ -159,8 +182,8 @@ impl Iterator for SerialSpssBatchIter {
             .with_offset(self.offset)
             .with_limit(take)
             .missing_string_as_null(self.missing_string_as_null)
-            .user_missing_as_null(self.user_missing_as_null)
-            .value_labels_as_strings(self.value_labels_as_strings);
+            .value_labels_as_strings(self.value_labels_as_strings)
+            .informative_nulls(self.informative_nulls.clone());
         builder = builder.with_schema(self.schema.clone());
         if let Some(n) = self.threads {
             builder = builder.with_n_threads(n);
@@ -180,16 +203,17 @@ impl Iterator for SerialSpssBatchIter {
     }
 }
 
+
 pub(crate) fn spss_batch_iter(
     path: PathBuf,
     threads: Option<usize>,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
     chunk_size: Option<usize>,
     preserve_order: bool,
     cols: Option<Vec<String>>,
     n_rows: Option<usize>,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 ) -> PolarsResult<SpssBatchIter> {
     let reader =
         SpssReader::open(&path).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
@@ -197,13 +221,30 @@ pub(crate) fn spss_batch_iter(
     let total = n_rows.unwrap_or(reader.metadata().row_count as usize);
     let batch_size = chunk_size.unwrap_or(100_000).max(1);
 
+    // Informative nulls require the serial path (handled by ReadBuilder/finish)
+    if informative_nulls.is_some() {
+        return Ok(Box::new(SerialSpssBatchIter {
+            reader,
+            cols,
+            offset: 0,
+            remaining: total,
+            batch_size,
+            threads,
+            missing_string_as_null,
+            value_labels_as_strings,
+            chunk_size,
+            schema,
+            informative_nulls,
+        }));
+    }
+
     let n_threads = threads.unwrap_or_else(|| {
         let cur = rayon::current_num_threads();
         cur.min(4).max(1)
     });
     if reader.compression() == 0 && n_threads > 1 && total >= 1000 {
         let n_chunks = (total + batch_size - 1) / batch_size;
-        let (tx, rx) = mpsc::channel::<(usize, PolarsResult<DataFrame>)>();
+        let (tx, rx) = mpsc::sync_channel::<(usize, PolarsResult<DataFrame>)>(n_threads);
         let path = Arc::new(path);
         let metadata = Arc::new(reader.metadata().clone());
         let endian = reader.endian();
@@ -223,7 +264,6 @@ pub(crate) fn spss_batch_iter(
             })
             .transpose()?;
         let missing_null = missing_string_as_null;
-        let user_missing = user_missing_as_null;
         let labels_as_strings = value_labels_as_strings;
 
         let handle = std::thread::spawn(move || {
@@ -247,7 +287,6 @@ pub(crate) fn spss_batch_iter(
                                 start,
                                 cnt,
                                 missing_null,
-                                user_missing,
                                 labels_as_strings,
                             )
                             .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
@@ -268,6 +307,57 @@ pub(crate) fn spss_batch_iter(
         }));
     }
 
+    // Compressed SPSS: a background thread reads the full range in one sequential
+    // pass and slices it into batches. Re-seeking through compressed data for each
+    // batch would require re-decompressing from row 0, making it O(N²).
+    if reader.compression() != 0 {
+        let metadata = Arc::new(reader.metadata().clone());
+        let endian = reader.endian();
+        let compression = reader.compression();
+        let bias = reader.header().bias;
+        let cols_idx = cols
+            .as_ref()
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| {
+                        metadata
+                            .variables
+                            .iter()
+                            .position(|v| v.name == *name)
+                            .ok_or_else(|| PolarsError::ColumnNotFound(name.clone().into()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let missing_null = missing_string_as_null;
+        let labels = value_labels_as_strings;
+        let (tx, rx) = mpsc::sync_channel::<PolarsResult<DataFrame>>(2);
+        let handle = std::thread::spawn(move || {
+            if let Err(e) = crate::spss::data::read_data_frame_streaming(
+                &path,
+                &metadata,
+                endian,
+                compression,
+                bias,
+                cols_idx.as_deref(),
+                0,
+                total,
+                missing_null,
+                labels,
+                batch_size,
+                &mut |df| tx.send(Ok(df)).is_ok(),
+            ) {
+                let _ = tx.send(Err(PolarsError::ComputeError(e.to_string().into())));
+            }
+        });
+        return Ok(Box::new(SpssBackgroundIter {
+            rx,
+            handle: Some(handle),
+        }));
+    }
+
+    // Uncompressed single-thread: each batch does an O(1) byte seek, so this is O(N) total.
     let _ = preserve_order;
     Ok(Box::new(SerialSpssBatchIter {
         reader,
@@ -277,10 +367,10 @@ pub(crate) fn spss_batch_iter(
         batch_size,
         threads,
         missing_string_as_null,
-        user_missing_as_null,
         value_labels_as_strings,
         chunk_size,
         schema,
+        informative_nulls: None,
     }))
 }
 
@@ -293,10 +383,10 @@ pub struct SpssScan {
     path: PathBuf,
     threads: Option<usize>,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: Option<bool>,
     chunk_size: Option<usize>,
     preserve_order: bool,
+    informative_nulls: Option<crate::InformativeNullOpts>,
     compress_opts: crate::CompressOptionsLite,
 }
 
@@ -305,20 +395,20 @@ impl SpssScan {
         path: PathBuf,
         threads: Option<usize>,
         missing_string_as_null: bool,
-        user_missing_as_null: bool,
         value_labels_as_strings: Option<bool>,
         chunk_size: Option<usize>,
         preserve_order: bool,
+        informative_nulls: Option<crate::InformativeNullOpts>,
         compress_opts: crate::CompressOptionsLite,
     ) -> Self {
         Self {
             path,
             threads,
             missing_string_as_null,
-            user_missing_as_null,
             value_labels_as_strings,
             chunk_size,
             preserve_order,
+            informative_nulls,
             compress_opts,
         }
     }
@@ -337,12 +427,12 @@ impl AnonymousScan for SpssScan {
             self.path.clone(),
             self.threads,
             self.missing_string_as_null,
-            self.user_missing_as_null,
             self.value_labels_as_strings.unwrap_or(true),
             self.chunk_size,
             self.preserve_order,
             cols,
             opts.n_rows,
+            self.informative_nulls.clone(),
         )?;
 
         let prefetch = crate::scan_prefetch::spawn_prefetcher(iter.map(|batch| batch));
@@ -368,11 +458,30 @@ impl AnonymousScan for SpssScan {
     fn schema(&self, _n_rows: Option<usize>) -> PolarsResult<SchemaRef> {
         let reader = SpssReader::open(&self.path)
             .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
+        let metadata = reader.metadata();
+        let value_labels_as_strings = self.value_labels_as_strings.unwrap_or(true);
+        let base_schema = build_schema(metadata, value_labels_as_strings);
 
-        Ok(Arc::new(build_schema(
-            reader.metadata(),
-            self.value_labels_as_strings.unwrap_or(true),
-        )))
+        if let Some(null_opts) = &self.informative_nulls {
+            let var_names: Vec<&str> =
+                metadata.variables.iter().map(|v| v.name.as_str()).collect();
+            let eligible: Vec<&str> = metadata
+                .variables
+                .iter()
+                .filter(|v| {
+                    use crate::spss::types::VarType;
+                    (v.var_type == VarType::Numeric
+                        && (!v.missing_doubles.is_empty() || v.missing_range))
+                        || (v.var_type == VarType::Str && !v.missing_strings.is_empty())
+                })
+                .map(|v| v.name.as_str())
+                .collect();
+            let pairs = crate::informative_null_pairs(&var_names, &eligible, null_opts);
+            crate::check_informative_null_collisions(&var_names, &pairs)?;
+            Ok(Arc::new(crate::build_indicator_schema(base_schema, &pairs, &null_opts.mode)))
+        } else {
+            Ok(Arc::new(base_schema))
+        }
     }
 }
 
@@ -396,3 +505,4 @@ fn build_schema(metadata: &crate::spss::types::Metadata, value_labels_as_strings
     }
     schema
 }
+

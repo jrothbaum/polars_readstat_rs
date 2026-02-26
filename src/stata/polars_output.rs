@@ -1,4 +1,4 @@
-use crate::stata::data::{build_shared_decode, read_data_frame_range};
+use crate::stata::data::{build_shared_decode, read_data_frame_range, read_data_frame_range_with_indicators};
 use crate::stata::reader::StataReader;
 use crate::stata::types::{NumericType, VarType};
 use polars::prelude::*;
@@ -16,18 +16,17 @@ pub fn scan_dta(
 ) -> PolarsResult<LazyFrame> {
     let path = path.into();
     let missing_string_as_null = opts.missing_string_as_null.unwrap_or(true);
-    let user_missing_as_null = opts.user_missing_as_null.unwrap_or(true);
     let value_labels_as_strings = opts.value_labels_as_strings;
     let preserve_order = opts.preserve_order.unwrap_or(false);
     let scan_ptr = Arc::new(StataScan::new(
         path,
         opts.threads,
         missing_string_as_null,
-        user_missing_as_null,
         value_labels_as_strings,
         opts.chunk_size,
         preserve_order,
         opts.compress_opts,
+        opts.informative_nulls,
     ));
     LazyFrame::anonymous_scan(scan_ptr, Default::default())
 }
@@ -62,7 +61,7 @@ mod tests {
             return;
         }
         let mut iter =
-            stata_batch_iter(path, None, true, true, true, Some(10), false, None, Some(25))
+            stata_batch_iter(path, None, true, true, Some(10), false, None, Some(25), None)
             .expect("batch iter");
         let mut batches = 0usize;
         let mut rows = 0usize;
@@ -80,11 +79,11 @@ pub struct StataScan {
     path: PathBuf,
     threads: Option<usize>,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: Option<bool>,
     chunk_size: Option<usize>,
     preserve_order: bool,
     compress_opts: crate::CompressOptionsLite,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 }
 
 impl StataScan {
@@ -92,21 +91,21 @@ impl StataScan {
         path: PathBuf,
         threads: Option<usize>,
         missing_string_as_null: bool,
-        user_missing_as_null: bool,
         value_labels_as_strings: Option<bool>,
         chunk_size: Option<usize>,
         preserve_order: bool,
         compress_opts: crate::CompressOptionsLite,
+        informative_nulls: Option<crate::InformativeNullOpts>,
     ) -> Self {
         Self {
             path,
             threads,
             missing_string_as_null,
-            user_missing_as_null,
             value_labels_as_strings,
             chunk_size,
             preserve_order,
             compress_opts,
+            informative_nulls,
         }
     }
 }
@@ -161,68 +160,41 @@ impl Drop for ParallelStataBatchIter {
     }
 }
 
-struct SerialStataBatchIter {
-    reader: StataReader,
-    cols: Option<Vec<String>>,
-    time_formats: Vec<(String, StataTimeFormatKind)>,
-    offset: usize,
-    remaining: usize,
-    batch_size: usize,
-    threads: Option<usize>,
-    missing_string_as_null: bool,
-    user_missing_as_null: bool,
-    value_labels_as_strings: bool,
-    chunk_size: Option<usize>,
+// For serial Stata paths: background thread builds SharedDecode once (avoids
+// re-reading the StrL table per batch) and calls read_data_frame_range with
+// O(1) byte seeks for each batch (fixed-width records).
+struct StataBackgroundIter {
+    rx: Receiver<PolarsResult<DataFrame>>,
+    handle: Option<JoinHandle<()>>,
 }
 
-impl Iterator for SerialStataBatchIter {
+impl Iterator for StataBackgroundIter {
     type Item = PolarsResult<DataFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        let take = self.batch_size.min(self.remaining);
-        let mut builder = self
-            .reader
-            .read()
-            .with_offset(self.offset)
-            .with_limit(take)
-            .missing_string_as_null(self.missing_string_as_null)
-            .user_missing_as_null(self.user_missing_as_null)
-            .value_labels_as_strings(self.value_labels_as_strings);
-        if let Some(n) = self.threads {
-            builder = builder.with_n_threads(n);
-        }
-        if let Some(n) = self.chunk_size {
-            builder = builder.with_chunk_size(n);
-        }
-        if let Some(cols) = &self.cols {
-            builder = builder.with_columns(cols.clone());
-        }
-        let out = builder
-            .finish()
-            .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
-            .and_then(|mut df| {
-                apply_stata_time_formats(&mut df, &self.time_formats)?;
-                Ok(df)
-            });
-        self.offset += take;
-        self.remaining -= take;
-        Some(out)
+        self.rx.recv().ok()
     }
 }
+
+impl Drop for StataBackgroundIter {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 
 pub(crate) fn stata_batch_iter(
     path: PathBuf,
     threads: Option<usize>,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
     chunk_size: Option<usize>,
     preserve_order: bool,
     cols: Option<Vec<String>>,
     n_rows: Option<usize>,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 ) -> PolarsResult<StataBatchIter> {
     let reader =
         StataReader::open(&path).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
@@ -264,17 +236,16 @@ pub(crate) fn stata_batch_iter(
         let cur = rayon::current_num_threads();
         cur.min(4).max(1)
     });
-    if n_threads > 1 && total >= 1000 {
+    if informative_nulls.is_none() && n_threads > 1 && total >= 1000 {
         let n_chunks = (total + batch_size - 1) / batch_size;
-        let (tx, rx) = mpsc::channel::<(usize, PolarsResult<DataFrame>)>();
+        let (tx, rx) = mpsc::sync_channel::<(usize, PolarsResult<DataFrame>)>(n_threads);
         let path = Arc::new(path);
         let metadata = Arc::new(reader.metadata().clone());
         let endian = reader.header().endian;
         let version = reader.header().version;
-        let cols_idx = col_indices.clone();
+        let cols_idx = col_indices;
         let formats = Arc::new(time_formats);
         let missing_null = missing_string_as_null;
-        let user_missing = user_missing_as_null;
         let labels_as_strings = value_labels_as_strings;
         let shared = build_shared_decode(&path, &metadata, endian, version, labels_as_strings)
             .map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
@@ -291,7 +262,7 @@ pub(crate) fn stata_batch_iter(
                             if start >= total {
                                 return;
                             }
-                            let end = (total).min(start + batch_size);
+                            let end = total.min(start + batch_size);
                             let cnt = end - start;
                             let result = read_data_frame_range(
                                 &path,
@@ -302,7 +273,6 @@ pub(crate) fn stata_batch_iter(
                                 start,
                                 cnt,
                                 missing_null,
-                                user_missing,
                                 labels_as_strings,
                                 &shared,
                             )
@@ -328,19 +298,97 @@ pub(crate) fn stata_batch_iter(
     }
 
     let _ = preserve_order;
-    Ok(Box::new(SerialStataBatchIter {
-        reader,
-        cols,
-        time_formats,
-        offset: 0,
-        remaining: total,
-        batch_size,
-        threads,
-        missing_string_as_null,
-        user_missing_as_null,
-        value_labels_as_strings,
-        chunk_size,
-    }))
+
+    // Serial path: background thread builds SharedDecode once (avoids re-loading
+    // StrL tables per batch) and reads with O(1) byte seeks (fixed-width records).
+    let path = Arc::new(path);
+    let metadata = Arc::new(reader.metadata().clone());
+    let endian = reader.header().endian;
+    let version = reader.header().version;
+    let formats = Arc::new(time_formats);
+    let missing_null = missing_string_as_null;
+    let labels = value_labels_as_strings;
+    let (tx, rx) = mpsc::sync_channel::<PolarsResult<DataFrame>>(2);
+
+    if let Some(null_opts) = informative_nulls {
+        // Compute pairs/indicator_set before spawning so errors surface immediately.
+        let var_names: Vec<String> = metadata.variables.iter().map(|v| v.name.clone()).collect();
+        let var_name_refs: Vec<&str> = var_names.iter().map(|s| s.as_str()).collect();
+        let eligible: Vec<&str> = metadata.variables.iter()
+            .filter(|v| matches!(v.var_type, VarType::Numeric(_)))
+            .map(|v| v.name.as_str())
+            .collect();
+        let pairs = crate::informative_null_pairs(&var_name_refs, &eligible, &null_opts);
+        crate::check_informative_null_collisions(&var_name_refs, &pairs)?;
+        let indicator_set: std::collections::HashSet<String> =
+            pairs.iter().map(|(m, _)| m.clone()).collect();
+        let suffix = match &null_opts.mode {
+            crate::InformativeNullMode::SeparateColumn { suffix } => suffix.clone(),
+            _ => "_null".to_string(),
+        };
+        let col_indices_clone = col_indices;
+        let path_clone = path.clone();
+        let metadata_clone = metadata.clone();
+        let formats_clone = formats.clone();
+        let handle = std::thread::spawn(move || {
+            let shared = match build_shared_decode(&path_clone, &metadata_clone, endian, version, labels) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(PolarsError::ComputeError(e.to_string().into())));
+                    return;
+                }
+            };
+            let mut offset = 0;
+            while offset < total {
+                let take = batch_size.min(total - offset);
+                let result = read_data_frame_range_with_indicators(
+                    &path_clone, &metadata_clone, endian, version,
+                    col_indices_clone.as_deref(), offset, take, missing_null, labels,
+                    &shared, &indicator_set, null_opts.use_value_labels, &suffix,
+                )
+                .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
+                .and_then(|mut df| {
+                    apply_stata_time_formats(&mut df, &formats_clone)?;
+                    Ok(df)
+                })
+                .and_then(|df| crate::apply_informative_null_mode(df, &null_opts.mode, &pairs));
+                if tx.send(result).is_err() {
+                    return;
+                }
+                offset += take;
+            }
+        });
+        return Ok(Box::new(StataBackgroundIter { rx, handle: Some(handle) }));
+    }
+
+    // Normal serial: build SharedDecode once, then read one batch at a time.
+    let handle = std::thread::spawn(move || {
+        let shared = match build_shared_decode(&path, &metadata, endian, version, labels) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(Err(PolarsError::ComputeError(e.to_string().into())));
+                return;
+            }
+        };
+        let mut offset = 0;
+        while offset < total {
+            let take = batch_size.min(total - offset);
+            let result = read_data_frame_range(
+                &path, &metadata, endian, version, col_indices.as_deref(),
+                offset, take, missing_null, labels, &shared,
+            )
+            .map_err(|e| PolarsError::ComputeError(e.to_string().into()))
+            .and_then(|mut df| {
+                apply_stata_time_formats(&mut df, &formats)?;
+                Ok(df)
+            });
+            if tx.send(result).is_err() {
+                return;
+            }
+            offset += take;
+        }
+    });
+    Ok(Box::new(StataBackgroundIter { rx, handle: Some(handle) }))
 }
 
 impl AnonymousScan for StataScan {
@@ -356,12 +404,12 @@ impl AnonymousScan for StataScan {
             self.path.clone(),
             self.threads,
             self.missing_string_as_null,
-            self.user_missing_as_null,
             self.value_labels_as_strings.unwrap_or(true),
             self.chunk_size,
             self.preserve_order,
             cols,
             opts.n_rows,
+            self.informative_nulls.clone(),
         )?;
 
         let prefetch = crate::scan_prefetch::spawn_prefetcher(iter.map(|batch| batch));
@@ -414,6 +462,25 @@ impl AnonymousScan for StataScan {
                 }
             };
             schema.with_column(var.name.as_str().into(), dtype);
+        }
+
+        if let Some(ref null_opts) = self.informative_nulls {
+            let var_names: Vec<&str> = reader
+                .metadata()
+                .variables
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect();
+            let eligible: Vec<&str> = reader
+                .metadata()
+                .variables
+                .iter()
+                .filter(|v| matches!(v.var_type, VarType::Numeric(_)))
+                .map(|v| v.name.as_str())
+                .collect();
+            let pairs = crate::informative_null_pairs(&var_names, &eligible, null_opts);
+            crate::check_informative_null_collisions(&var_names, &pairs)?;
+            return Ok(Arc::new(crate::build_indicator_schema(schema, &pairs, &null_opts.mode)));
         }
 
         Ok(Arc::new(schema))

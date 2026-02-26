@@ -150,6 +150,74 @@ pub fn decode_numeric_bytes_mask(endian: Endian, bytes: &[u8]) -> (f64, bool) {
     (f64::from_bits(bits), is_missing)
 }
 
+/// Decode numeric bytes into (value, missing_offset) for informative-null tracking.
+///
+/// Returns:
+///   `(value, None)`       — valid value
+///   `(NAN,  None)`        — system missing (`.`) or unknown NaN → plain null, no indicator
+///   `(NAN,  Some(1..=26))` — user missing `.A`..`.Z` (1=.A, 26=.Z)
+///   `(NAN,  Some(27))`    — underscore missing `._`
+///
+/// SAS7BDAT NaN encoding (bits [47:40] of the logical u64 after endian reconstruction):
+///   `0xA5`..=`0xBE` → `.Z`..`.A`  (reverse: offset = `(0xFF ^ type_byte) - 0x40`)
+///   `0xD1`           → `.`  (system missing, no indicator)
+///   `0xD2`           → `._` (underscore, offset 27)
+///   everything else  → system missing (no indicator)
+pub fn decode_numeric_bytes_mask_tagged(endian: Endian, bytes: &[u8]) -> (f64, Option<u8>) {
+    if bytes.is_empty() {
+        return (f64::NAN, None);
+    }
+    let bits = if bytes.len() >= 8 {
+        let slice = &bytes[..8];
+        match endian {
+            Endian::Little => u64::from_le_bytes(slice.try_into().unwrap_or([0u8; 8])),
+            Endian::Big => u64::from_be_bytes(slice.try_into().unwrap_or([0u8; 8])),
+        }
+    } else {
+        let mut buf = [0u8; 8];
+        match endian {
+            Endian::Little => {
+                let start = 8 - bytes.len();
+                buf[start..].copy_from_slice(bytes);
+            }
+            Endian::Big => {
+                buf[..bytes.len()].copy_from_slice(bytes);
+            }
+        }
+        match endian {
+            Endian::Little => u64::from_le_bytes(buf),
+            Endian::Big => u64::from_be_bytes(buf),
+        }
+    };
+    let abs_bits = bits & 0x7fff_ffff_ffff_ffff;
+    if abs_bits < SAS_MISSING_MIN {
+        return (f64::from_bits(bits), None); // valid value
+    }
+    // NaN — classify by type byte at bits [47:40]
+    let type_byte = ((bits >> 40) & 0xFF) as u8;
+    let offset = if type_byte >= 0xA5 && type_byte <= 0xBE {
+        // .A (0xBE) through .Z (0xA5) — reversed because SAS XORs with 0xFF
+        // offset = (0xFF ^ type_byte) - 0x40: 0xBE→1(.A), 0xA5→26(.Z)
+        let letter_code = 0xFF ^ type_byte; // 0x41='A' through 0x5A='Z'
+        Some(letter_code - 0x40)            // 1 through 26
+    } else if type_byte == 0xD2 {
+        Some(27u8) // ._ (underscore)
+    } else {
+        None // system missing (.) at 0xD1, or any other NaN → no indicator
+    };
+    (f64::NAN, offset)
+}
+
+/// Convert a SAS missing offset to the label string.
+/// `offset` 1–26 → `.A`–`.Z`, 27 → `._`, anything else → `.`
+pub fn sas_offset_to_label(offset: u8) -> String {
+    match offset {
+        1..=26 => format!(".{}", (b'A' + offset - 1) as char),
+        27 => "._".to_string(),
+        _ => ".".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

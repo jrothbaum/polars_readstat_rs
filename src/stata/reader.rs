@@ -1,4 +1,5 @@
-use crate::stata::data::{build_shared_decode, read_data_frame, read_data_frame_range};
+use crate::stata::data::{build_shared_decode, read_data_frame, read_data_frame_range, read_data_frame_range_with_indicators};
+use std::collections::HashSet;
 use crate::stata::error::Result;
 use crate::stata::header::read_header;
 use crate::stata::metadata::read_metadata;
@@ -92,6 +93,73 @@ impl StataReader {
             .limit
             .unwrap_or(self.metadata.row_count.saturating_sub(_opts.offset as u64) as usize);
 
+        // Informative nulls: serial path using the indicator-aware reader
+        if let Some(ref null_opts) = _opts.informative_nulls {
+            let var_names: Vec<&str> = self
+                .metadata
+                .variables
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect();
+            let eligible: Vec<&str> = self
+                .metadata
+                .variables
+                .iter()
+                .filter(|v| {
+                    matches!(v.var_type, crate::stata::types::VarType::Numeric(_))
+                })
+                .map(|v| v.name.as_str())
+                .collect();
+            let pairs = crate::informative_null_pairs(&var_names, &eligible, null_opts);
+            crate::check_informative_null_collisions(&var_names, &pairs)?;
+            let suffix = match &null_opts.mode {
+                crate::InformativeNullMode::SeparateColumn { suffix } => suffix.clone(),
+                _ => "_null".to_string(),
+            };
+            let indicator_set: HashSet<String> =
+                pairs.iter().map(|(m, _)| m.clone()).collect();
+            let shared = build_shared_decode(
+                &self.path,
+                &self.metadata,
+                self.header.endian,
+                self.header.version,
+                _opts.value_labels_as_strings,
+            )?;
+            let mut df = read_data_frame_range_with_indicators(
+                &self.path,
+                &self.metadata,
+                self.header.endian,
+                self.header.version,
+                col_indices.as_deref(),
+                _opts.offset,
+                limit,
+                _opts.missing_string_as_null,
+                _opts.value_labels_as_strings,
+                &shared,
+                &indicator_set,
+                null_opts.use_value_labels,
+                &suffix,
+            )?;
+            if df.height() > 0 {
+                let mut formats = Vec::new();
+                for var in &self.metadata.variables {
+                    if let Some(kind) =
+                        stata_time_format_kind(var.format.as_deref(), &var.var_type)
+                    {
+                        formats.push((var.name.clone(), kind));
+                    }
+                }
+                if !formats.is_empty() {
+                    apply_stata_time_formats(&mut df, &formats)?;
+                }
+            }
+            if let Some(schema) = _opts.schema {
+                df = cast_dataframe(df, &schema)?;
+            }
+            df = crate::apply_informative_null_mode(df, &null_opts.mode, &pairs)?;
+            return Ok(df);
+        }
+
         let mut df = if _opts.parallel && limit > 0 {
             self.read_parallel(
                 _opts.offset,
@@ -100,7 +168,6 @@ impl StataReader {
                 _opts.chunk_size,
                 col_indices.as_deref(),
                 _opts.missing_string_as_null,
-                _opts.user_missing_as_null,
                 _opts.value_labels_as_strings,
             )?
         } else {
@@ -113,7 +180,6 @@ impl StataReader {
                 _opts.offset,
                 limit,
                 _opts.missing_string_as_null,
-                _opts.user_missing_as_null,
                 _opts.value_labels_as_strings,
             )?
         };
@@ -165,8 +231,8 @@ pub struct ReadBuilder<'a> {
     num_threads: Option<usize>,
     chunk_size: Option<usize>,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 }
 
 impl<'a> ReadBuilder<'a> {
@@ -181,8 +247,8 @@ impl<'a> ReadBuilder<'a> {
             num_threads: None,
             chunk_size: None,
             missing_string_as_null: true,
-            user_missing_as_null: true,
             value_labels_as_strings: true,
+            informative_nulls: None,
         }
     }
 
@@ -218,12 +284,12 @@ impl<'a> ReadBuilder<'a> {
         self.missing_string_as_null = v;
         self
     }
-    pub fn user_missing_as_null(mut self, v: bool) -> Self {
-        self.user_missing_as_null = v;
-        self
-    }
     pub fn value_labels_as_strings(mut self, v: bool) -> Self {
         self.value_labels_as_strings = v;
+        self
+    }
+    pub fn informative_nulls(mut self, v: Option<crate::InformativeNullOpts>) -> Self {
+        self.informative_nulls = v;
         self
     }
 
@@ -247,7 +313,6 @@ impl StataReader {
         chunk_size: Option<usize>,
         cols: Option<&[usize]>,
         missing_string_as_null: bool,
-        user_missing_as_null: bool,
         value_labels_as_strings: bool,
     ) -> Result<DataFrame> {
         let n_threads = threads.unwrap_or_else(|| {
@@ -264,7 +329,6 @@ impl StataReader {
                 offset,
                 count,
                 missing_string_as_null,
-                user_missing_as_null,
                 value_labels_as_strings,
             );
         }
@@ -310,7 +374,6 @@ impl StataReader {
                         start,
                         cnt,
                         missing_string_as_null,
-                        user_missing_as_null,
                         value_labels_as_strings,
                         &shared,
                     )

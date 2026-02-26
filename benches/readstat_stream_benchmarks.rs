@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 const ROW_LIMIT: usize = 200_000;
-const BATCH_SIZE: usize = 100_000;
+const BATCH_SIZE: usize = 8_192;
 
 fn find_files(pattern: &str) -> Vec<PathBuf> {
     glob(pattern)

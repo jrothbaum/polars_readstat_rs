@@ -82,7 +82,6 @@ pub fn read_data_frame(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<DataFrame> {
     let file = File::open(path)?;
@@ -97,9 +96,235 @@ pub fn read_data_frame(
         offset,
         limit,
         missing_string_as_null,
-        user_missing_as_null,
         value_labels_as_strings,
     )
+}
+
+/// Streaming variant: reads `limit` rows starting at `offset`, dispatching
+/// a batch of `batch_size` rows to `on_batch` as soon as each batch is ready.
+/// Returns `false` from the callback to stop early.
+/// For compression=1 (SAV) this maintains the decompressor state across batches
+/// so the file is read in a single sequential pass with no re-seeking.
+/// For compression=2 (ZSAV) it falls back to reading the full range first.
+pub fn read_data_frame_streaming(
+    path: &Path,
+    metadata: &Metadata,
+    endian: Endian,
+    compression: i32,
+    bias: f64,
+    columns: Option<&[usize]>,
+    offset: usize,
+    limit: usize,
+    missing_string_as_null: bool,
+    value_labels_as_strings: bool,
+    batch_size: usize,
+    on_batch: &mut dyn FnMut(DataFrame) -> bool,
+) -> Result<()> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let data_offset = metadata
+        .data_offset
+        .ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
+    let record_len = metadata.variables.iter().map(|v| v.width * 8).sum::<usize>();
+    reader.seek(SeekFrom::Start(data_offset))?;
+
+    let total_rows = metadata.row_count as usize;
+    let start_row = offset;
+    let end_row = (offset + limit).min(total_rows);
+
+    let col_indices: Vec<usize> = match columns {
+        Some(cols) => cols.to_vec(),
+        None => (0..metadata.variables.len()).collect(),
+    };
+
+    let needed_label_names = if value_labels_as_strings && columns.is_some() {
+        let mut names = HashSet::new();
+        for &idx in &col_indices {
+            if let Some(name) = metadata.variables[idx].value_label.as_ref() {
+                names.insert(name.clone());
+            }
+        }
+        Some(names)
+    } else {
+        None
+    };
+    let label_maps = if value_labels_as_strings {
+        build_label_maps(metadata, needed_label_names.as_ref())
+    } else {
+        std::collections::HashMap::new()
+    };
+    // Plans are created once and reused across batches (they hold Arc refs to label maps).
+    let mut plans = Vec::with_capacity(col_indices.len());
+    for &idx in &col_indices {
+        let var = &metadata.variables[idx];
+        let label_map = var
+            .value_label
+            .as_ref()
+            .and_then(|n| label_maps.get(n))
+            .cloned();
+        let missing_set = if var.missing_strings.is_empty() {
+            None
+        } else {
+            Some(var.missing_strings.iter().cloned().collect::<HashSet<_>>())
+        };
+        plans.push(ColumnPlan::new(
+            var,
+            var.offset * 8,
+            var.width * 8,
+            label_map,
+            missing_set,
+            missing_string_as_null,
+        ));
+    }
+
+    // Inline helper: create a fresh set of column builders for one batch.
+    let make_builders = |cap: usize| -> Vec<ColumnBuilder> {
+        col_indices
+            .iter()
+            .map(|&idx| {
+                let var = &metadata.variables[idx];
+                let name = var.name.as_str();
+                let has_label = var
+                    .value_label
+                    .as_ref()
+                    .map(|n| label_maps.contains_key(n))
+                    .unwrap_or(false);
+                match (var.var_type, has_label && value_labels_as_strings) {
+                    (VarType::Numeric, true) => ColumnBuilder::Utf8 {
+                        builder: StringChunkedBuilder::new(name.into(), cap),
+                        num_cache: Some(NumericStringCache::new()),
+                    },
+                    (VarType::Numeric, false) => match var.format_class {
+                        Some(FormatClass::Date) => ColumnBuilder::Date(
+                            PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), cap),
+                        ),
+                        Some(FormatClass::DateTime) => ColumnBuilder::DateTime(
+                            PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), cap),
+                        ),
+                        Some(FormatClass::Time) => ColumnBuilder::Time(
+                            PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), cap),
+                        ),
+                        None => ColumnBuilder::Float64(
+                            PrimitiveChunkedBuilder::<Float64Type>::new(name.into(), cap),
+                        ),
+                    },
+                    (VarType::Str, _) => ColumnBuilder::Utf8 {
+                        builder: StringChunkedBuilder::new(name.into(), cap),
+                        num_cache: None,
+                    },
+                }
+            })
+            .collect()
+    };
+
+    // Inline helper: finish builders into a DataFrame.
+    let finish_batch = |builders: Vec<ColumnBuilder>| -> Result<DataFrame> {
+        let cols: Vec<_> = builders.into_iter().map(|b| b.finish().into()).collect();
+        DataFrame::new_infer_height(cols).map_err(|e| Error::ParseError(e.to_string()))
+    };
+
+    let mut row_buf = vec![0u8; record_len];
+
+    if compression == 0 {
+        // Uncompressed: O(1) seek directly to start_row.
+        if start_row > 0 {
+            reader.seek(SeekFrom::Current((start_row as i64) * (record_len as i64)))?;
+        }
+        let mut row_idx = start_row;
+        while row_idx < end_row {
+            let batch_rows = batch_size.min(end_row - row_idx);
+            let mut builders = make_builders(batch_rows);
+            let np = build_numeric_plans(&plans, &builders);
+            let mut added = 0usize;
+            while added < batch_rows {
+                reader.read_exact(&mut row_buf)?;
+                if let Some(np) = np.as_deref() {
+                    append_numeric_row(&mut builders, &plans, np, &row_buf, endian)?;
+                } else {
+                    append_row(&mut builders, &plans, &row_buf, endian, metadata.encoding)?;
+                }
+                row_idx += 1;
+                added += 1;
+            }
+            if added == 0 {
+                break;
+            }
+            let df = finish_batch(builders)?;
+            if !on_batch(df) {
+                return Ok(());
+            }
+        }
+    } else if compression == 1 {
+        // SAV byte-run compression: maintain decompressor state across batches so
+        // the file is read in a single forward pass (no re-seeking per batch).
+        let mut decompressor = SavRowDecompressor::new(endian, bias);
+        let mut row_idx = 0usize;
+
+        // Consume rows before start_row without storing them.
+        while row_idx < start_row {
+            let status = decompressor.read_row(&mut reader, &mut row_buf, record_len)?;
+            if status == DecompressStatus::FinishedAll {
+                return Ok(());
+            }
+            row_idx += 1;
+        }
+
+        // Dispatch batches.
+        while row_idx < end_row {
+            let batch_rows = batch_size.min(end_row - row_idx);
+            let mut builders = make_builders(batch_rows);
+            let np = build_numeric_plans(&plans, &builders);
+            let mut added = 0usize;
+            while added < batch_rows {
+                let status = decompressor.read_row(&mut reader, &mut row_buf, record_len)?;
+                if status == DecompressStatus::FinishedAll {
+                    break;
+                }
+                if let Some(np) = np.as_deref() {
+                    append_numeric_row(&mut builders, &plans, np, &row_buf, endian)?;
+                } else {
+                    append_row(&mut builders, &plans, &row_buf, endian, metadata.encoding)?;
+                }
+                row_idx += 1;
+                added += 1;
+            }
+            if added == 0 {
+                break;
+            }
+            let df = finish_batch(builders)?;
+            if !on_batch(df) {
+                return Ok(());
+            }
+        }
+    } else {
+        // compression == 2 (ZSAV) or unknown: read the full range at once, then
+        // slice into batches. Block-level streaming for ZSAV is left as a future
+        // improvement.
+        let df = read_data_frame_with_reader(
+            &mut reader,
+            metadata,
+            endian,
+            compression,
+            bias,
+            columns,
+            offset,
+            limit,
+            missing_string_as_null,
+            value_labels_as_strings,
+        )?;
+        let height = df.height();
+        let mut off = 0usize;
+        while off < height {
+            let take = batch_size.min(height - off);
+            let batch = df.slice(off as i64, take);
+            if !on_batch(batch) {
+                return Ok(());
+            }
+            off += take;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn read_data_frame_with_reader(
@@ -112,7 +337,6 @@ pub fn read_data_frame_with_reader(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<DataFrame> {
     let data_offset = metadata
@@ -203,7 +427,6 @@ pub fn read_data_frame_with_reader(
             label_map,
             missing_set,
             missing_string_as_null,
-            user_missing_as_null,
         );
         builders.push(builder);
         plans.push(plan);
@@ -280,7 +503,6 @@ pub fn read_data_columns_uncompressed(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<Vec<Series>> {
     let data_offset = metadata
@@ -373,7 +595,6 @@ pub fn read_data_columns_uncompressed(
             label_map,
             missing_set,
             missing_string_as_null,
-            user_missing_as_null,
         );
         builders.push(builder);
         plans.push(plan);
@@ -677,11 +898,10 @@ fn append_value(
             }
 
             let is_missing = (plan.missing_string_as_null && s.is_empty())
-                || (plan.user_missing_as_null
-                    && plan
-                        .missing_set
-                        .as_ref()
-                        .map_or(false, |set| set.contains(s)));
+                || plan
+                    .missing_set
+                    .as_ref()
+                    .map_or(false, |set| set.contains(s));
             if is_missing {
                 builder.append_null();
             } else if let Some(labels) = plan.label_map.as_deref() {
@@ -720,9 +940,6 @@ fn is_missing_numeric(plan: &ColumnPlan, v: f64, bits: u64) -> bool {
     {
         return true;
     }
-    if !plan.user_missing_as_null {
-        return false;
-    }
     if plan.missing_doubles.is_empty() {
         return false;
     }
@@ -743,6 +960,418 @@ fn is_missing_numeric(plan: &ColumnPlan, v: f64, bits: u64) -> bool {
     } else {
         plan.missing_double_bits.iter().any(|b| *b == bits)
     }
+}
+
+/// Returns the user-declared missing indicator string for a numeric SPSS value, or `None`
+/// if the value is system-missing (or not missing at all).
+///
+/// - System missing (`SAV_MISSING_DOUBLE`), LOWEST, HIGHEST, NaN → `None`
+/// - Discrete user-declared missing → label (if available) or `v.to_string()`
+/// - Range user-declared missing → label (if available) or `"MISSING"`
+fn missing_numeric_indicator(plan: &ColumnPlan, v: f64, bits: u64) -> Option<String> {
+    // System-missing sentinel values or NaN → no indicator (plain null)
+    if bits == SAV_MISSING_DOUBLE
+        || bits == SAV_LOWEST_DOUBLE
+        || bits == SAV_HIGHEST_DOUBLE
+        || v.is_nan()
+    {
+        return None;
+    }
+    if plan.missing_doubles.is_empty() {
+        return None; // no user-declared missings at all
+    }
+    if plan.missing_range {
+        if plan.missing_doubles.len() >= 2 {
+            let low = plan.missing_doubles[0].min(plan.missing_doubles[1]);
+            let high = plan.missing_doubles[0].max(plan.missing_doubles[1]);
+            if v >= low && v <= high {
+                if let Some(label_map) = plan.label_map.as_deref() {
+                    if let Some(label) = label_map.get_float_bits(bits) {
+                        return Some(label.clone());
+                    }
+                }
+                return Some("MISSING".to_string());
+            }
+        }
+        // Third (discrete) value in range-mode
+        if plan.missing_doubles.len() >= 3
+            && bits == plan.missing_double_bits.get(2).copied().unwrap_or(0)
+        {
+            if let Some(label_map) = plan.label_map.as_deref() {
+                if let Some(label) = label_map.get_float_bits(bits) {
+                    return Some(label.clone());
+                }
+            }
+            return Some(v.to_string());
+        }
+        None
+    } else {
+        if plan.missing_double_bits.iter().any(|b| *b == bits) {
+            if let Some(label_map) = plan.label_map.as_deref() {
+                if let Some(label) = label_map.get_float_bits(bits) {
+                    return Some(label.clone());
+                }
+            }
+            return Some(v.to_string());
+        }
+        None
+    }
+}
+
+/// Compute the informative-null indicator string for a single column value from raw row bytes.
+/// Returns `None` if not a user-declared missing (or if no indicator tracking is configured).
+fn compute_col_indicator(
+    plan: &ColumnPlan,
+    buf: &[u8],
+    endian: Endian,
+    encoding: &'static encoding_rs::Encoding,
+) -> Option<String> {
+    match plan.var_type {
+        VarType::Numeric => {
+            if buf.len() < 8 {
+                return None;
+            }
+            let bytes: [u8; 8] = buf[..8].try_into().ok()?;
+            let v = match endian {
+                Endian::Little => f64::from_le_bytes(bytes),
+                Endian::Big => f64::from_be_bytes(bytes),
+            };
+            let bits = v.to_bits();
+            if is_missing_numeric(plan, v, bits) {
+                missing_numeric_indicator(plan, v, bits)
+            } else {
+                None
+            }
+        }
+        VarType::Str => {
+            let missing_set = plan.missing_set.as_ref()?;
+            // Trim trailing spaces and nulls
+            let mut end = buf.len();
+            while end > 0 && (buf[end - 1] == b' ' || buf[end - 1] == 0) {
+                end -= 1;
+            }
+            if end == 0 {
+                return None; // empty → system-missing-like, no indicator
+            }
+            let s: String = if encoding == encoding_rs::UTF_8 {
+                let filtered: Vec<u8> =
+                    buf[..end].iter().filter(|&&b| b != 0).copied().collect();
+                String::from_utf8_lossy(&filtered).into_owned()
+            } else {
+                encoding
+                    .decode_without_bom_handling(&buf[..end])
+                    .0
+                    .into_owned()
+            };
+            if missing_set.contains(s.as_str()) {
+                if let Some(label_map) = plan.label_map.as_deref() {
+                    if let Some(label) = label_map.get_str(&s) {
+                        return Some(label.clone());
+                    }
+                }
+                Some(s)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Like `append_row` but also appends to per-column indicator builders.
+/// `ind_builders[i]` is `Some(builder)` when column i is tracked for informative nulls.
+fn append_row_with_indicators(
+    builders: &mut [ColumnBuilder],
+    ind_builders: &mut [Option<StringChunkedBuilder>],
+    plans: &[ColumnPlan],
+    row_buf: &[u8],
+    endian: Endian,
+    encoding: &'static encoding_rs::Encoding,
+) -> Result<()> {
+    for (i, plan) in plans.iter().enumerate() {
+        let slice = &row_buf[plan.offset..plan.offset + plan.width];
+        if let Some(ind_b) = ind_builders[i].as_mut() {
+            let indicator = compute_col_indicator(plan, slice, endian, encoding);
+            match indicator {
+                Some(s) => ind_b.append_value(&s),
+                None => ind_b.append_null(),
+            }
+        }
+        append_value(&mut builders[i], plan, slice, endian, encoding)?;
+    }
+    Ok(())
+}
+
+/// Like `read_zsav_data` but routes rows through `append_row_with_indicators`.
+fn read_zsav_data_with_indicators<R: Read + Seek>(
+    reader: &mut R,
+    endian: Endian,
+    bias: f64,
+    start_row: usize,
+    end_row: usize,
+    plans: &[ColumnPlan],
+    builders: &mut [ColumnBuilder],
+    ind_builders: &mut [Option<StringChunkedBuilder>],
+    row_buf: &mut [u8],
+    encoding: &'static encoding_rs::Encoding,
+) -> Result<()> {
+    let zheader_ofs = reader.stream_position()?;
+    let zheader = read_zheader(reader, endian)?;
+    if zheader.zheader_ofs != zheader_ofs {
+        return Err(Error::ParseError("invalid zsav header offset".to_string()));
+    }
+
+    reader.seek(SeekFrom::Start(zheader.ztrailer_ofs))?;
+    let ztrailer = read_ztrailer(reader, endian)?;
+    let n_blocks = ztrailer.n_blocks as usize;
+
+    let mut entries = Vec::with_capacity(n_blocks);
+    for _ in 0..n_blocks {
+        entries.push(read_ztrailer_entry(reader, endian)?);
+    }
+
+    let mut stream = SavRowStream::new(endian, bias);
+    let mut row_idx = 0usize;
+    let mut out_offset = 0usize;
+
+    for entry in entries {
+        reader.seek(SeekFrom::Start(entry.compressed_ofs as u64))?;
+        let mut compressed = vec![0u8; entry.compressed_size as usize];
+        reader.read_exact(&mut compressed)?;
+
+        let mut decoder = ZlibDecoder::new(&compressed[..]);
+        let mut uncompressed = Vec::with_capacity(entry.uncompressed_size as usize);
+        decoder.read_to_end(&mut uncompressed)?;
+        if uncompressed.len() != entry.uncompressed_size as usize {
+            return Err(Error::ParseError("zsav block size mismatch".to_string()));
+        }
+
+        let mut input_offset = 0usize;
+        while input_offset <= uncompressed.len() {
+            let status = stream.decompress_from_slice(
+                &uncompressed,
+                &mut input_offset,
+                row_buf,
+                &mut out_offset,
+            )?;
+            match status {
+                StreamStatus::NeedData => break,
+                StreamStatus::FinishedAll => return Ok(()),
+                StreamStatus::FinishedRow => {
+                    if row_idx >= start_row && row_idx < end_row {
+                        append_row_with_indicators(
+                            builders,
+                            ind_builders,
+                            plans,
+                            row_buf,
+                            endian,
+                            encoding,
+                        )?;
+                    }
+                    row_idx += 1;
+                    out_offset = 0;
+                    if row_idx >= end_row {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a range of rows into a DataFrame that includes informative-null indicator columns.
+///
+/// `indicator_col_names` must be aligned with the resolved `columns` slice (or all variables if
+/// `columns` is `None`). `indicator_col_names[i]` is `Some(name)` to add an indicator column
+/// named `name` immediately after column i, or `None` to skip.
+///
+/// Indicator columns are of type `String?` (null = not a user-declared missing; `Some(str)` =
+/// the indicator label/value).
+pub fn read_data_frame_with_indicators(
+    path: &Path,
+    metadata: &Metadata,
+    endian: Endian,
+    compression: i32,
+    bias: f64,
+    columns: Option<&[usize]>,
+    offset: usize,
+    limit: usize,
+    missing_string_as_null: bool,
+    value_labels_as_strings: bool,
+    indicator_col_names: &[Option<String>],
+) -> Result<DataFrame> {
+    let data_offset = metadata
+        .data_offset
+        .ok_or_else(|| Error::ParseError("missing data offset".to_string()))?;
+    let record_len = metadata
+        .variables
+        .iter()
+        .map(|v| v.width * 8)
+        .sum::<usize>();
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    reader.seek(SeekFrom::Start(data_offset))?;
+
+    let total_rows = metadata.row_count as usize;
+    let start_row = offset;
+    let end_row = (offset + limit).min(total_rows);
+
+    let col_indices: Vec<usize> = match columns {
+        Some(cols) => cols.to_vec(),
+        None => (0..metadata.variables.len()).collect(),
+    };
+
+    let needed_label_names = if value_labels_as_strings && columns.is_some() {
+        let mut names = HashSet::new();
+        for &idx in &col_indices {
+            if let Some(name) = metadata.variables[idx].value_label.as_ref() {
+                names.insert(name.clone());
+            }
+        }
+        Some(names)
+    } else {
+        None
+    };
+
+    let label_maps = if value_labels_as_strings {
+        build_label_maps(metadata, needed_label_names.as_ref())
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let mut builders = Vec::with_capacity(col_indices.len());
+    let mut plans = Vec::with_capacity(col_indices.len());
+    let mut ind_builders: Vec<Option<StringChunkedBuilder>> = Vec::with_capacity(col_indices.len());
+
+    for (local_i, &idx) in col_indices.iter().enumerate() {
+        let var = &metadata.variables[idx];
+        let name = var.name.as_str();
+        let label_map = var
+            .value_label
+            .as_ref()
+            .and_then(|lname| label_maps.get(lname))
+            .cloned();
+        let builder = match (var.var_type, label_map.is_some() && value_labels_as_strings) {
+            (VarType::Numeric, true) => ColumnBuilder::Utf8 {
+                builder: StringChunkedBuilder::new(name.into(), limit),
+                num_cache: Some(NumericStringCache::new()),
+            },
+            (VarType::Numeric, false) => match var.format_class {
+                Some(FormatClass::Date) => ColumnBuilder::Date(
+                    PrimitiveChunkedBuilder::<Int32Type>::new(name.into(), limit),
+                ),
+                Some(FormatClass::DateTime) => {
+                    ColumnBuilder::DateTime(PrimitiveChunkedBuilder::<Int64Type>::new(
+                        name.into(),
+                        limit,
+                    ))
+                }
+                Some(FormatClass::Time) => ColumnBuilder::Time(
+                    PrimitiveChunkedBuilder::<Int64Type>::new(name.into(), limit),
+                ),
+                None => ColumnBuilder::Float64(PrimitiveChunkedBuilder::<Float64Type>::new(
+                    name.into(),
+                    limit,
+                )),
+            },
+            (VarType::Str, _) => ColumnBuilder::Utf8 {
+                builder: StringChunkedBuilder::new(name.into(), limit),
+                num_cache: None,
+            },
+        };
+        let missing_set = if var.missing_strings.is_empty() {
+            None
+        } else {
+            Some(var.missing_strings.iter().cloned().collect::<HashSet<_>>())
+        };
+        let plan = ColumnPlan::new(
+            var,
+            var.offset * 8,
+            var.width * 8,
+            label_map,
+            missing_set,
+            missing_string_as_null,
+        );
+        let ind_builder = indicator_col_names
+            .get(local_i)
+            .and_then(|opt| opt.as_ref())
+            .map(|ind_name| StringChunkedBuilder::new(ind_name.as_str().into(), limit));
+        builders.push(builder);
+        plans.push(plan);
+        ind_builders.push(ind_builder);
+    }
+
+    if compression == 0 {
+        if start_row > 0 {
+            let byte_skip = (start_row as u64) * (record_len as u64);
+            reader.seek(SeekFrom::Current(byte_skip as i64))?;
+        }
+        let mut row_buf = vec![0u8; record_len];
+        for _row_idx in start_row..end_row {
+            reader.read_exact(&mut row_buf)?;
+            append_row_with_indicators(
+                &mut builders,
+                &mut ind_builders,
+                &plans,
+                &row_buf,
+                endian,
+                metadata.encoding,
+            )?;
+        }
+    } else if compression == 1 {
+        let mut row_buf = vec![0u8; record_len];
+        let mut decompressor = SavRowDecompressor::new(endian, bias);
+        let mut row_idx = 0usize;
+        while row_idx < end_row {
+            let status = decompressor.read_row(&mut reader, &mut row_buf, record_len)?;
+            if status == DecompressStatus::FinishedAll {
+                break;
+            }
+            if row_idx >= start_row {
+                append_row_with_indicators(
+                    &mut builders,
+                    &mut ind_builders,
+                    &plans,
+                    &row_buf,
+                    endian,
+                    metadata.encoding,
+                )?;
+            }
+            row_idx += 1;
+        }
+    } else if compression == 2 {
+        let mut row_buf = vec![0u8; record_len];
+        read_zsav_data_with_indicators(
+            &mut reader,
+            endian,
+            bias,
+            start_row,
+            end_row,
+            &plans,
+            &mut builders,
+            &mut ind_builders,
+            &mut row_buf,
+            metadata.encoding,
+        )?;
+    } else {
+        return Err(Error::Unsupported(format!(
+            "SPSS compression {} not supported",
+            compression
+        )));
+    }
+
+    // Interleave main and indicator columns
+    let mut cols: Vec<Column> = Vec::with_capacity(
+        builders.len() + ind_builders.iter().filter(|b| b.is_some()).count(),
+    );
+    for (b, ind_b) in builders.into_iter().zip(ind_builders.into_iter()) {
+        cols.push(b.finish().into());
+        if let Some(ind_b) = ind_b {
+            cols.push(Column::from(ind_b.finish().into_series()));
+        }
+    }
+    DataFrame::new_infer_height(cols).map_err(|e| Error::ParseError(e.to_string()))
 }
 
 fn apply_format_class(v: f64, class: Option<FormatClass>) -> f64 {
@@ -776,7 +1405,6 @@ struct ColumnPlan {
     label_map: Option<Arc<LabelMap>>,
     missing_set: Option<HashSet<String>>,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     fast_no_checks: bool,
     missing_range: bool,
     missing_doubles: Vec<f64>,
@@ -791,7 +1419,6 @@ impl ColumnPlan {
         label_map: Option<Arc<LabelMap>>,
         missing_set: Option<HashSet<String>>,
         missing_string_as_null: bool,
-        user_missing_as_null: bool,
     ) -> Self {
         let fast_no_checks = matches!(var.var_type, VarType::Str)
             && !missing_string_as_null
@@ -811,7 +1438,6 @@ impl ColumnPlan {
             label_map,
             missing_set,
             missing_string_as_null,
-            user_missing_as_null,
             fast_no_checks,
             missing_range: var.missing_range,
             missing_doubles: var.missing_doubles.clone(),

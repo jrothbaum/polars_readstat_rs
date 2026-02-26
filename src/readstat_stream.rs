@@ -68,7 +68,6 @@ pub fn readstat_batch_iter(
 
     let chunk_size = batch_size.or(opts.chunk_size);
     let missing_string_as_null = opts.missing_string_as_null.unwrap_or(true);
-    let user_missing_as_null = opts.user_missing_as_null.unwrap_or(true);
     let value_labels_as_strings = opts.value_labels_as_strings.unwrap_or(true);
     let preserve_order = opts.preserve_order.unwrap_or(false);
 
@@ -89,6 +88,7 @@ pub fn readstat_batch_iter(
                 chunk_size,
                 col_indices,
                 n_rows,
+                opts.informative_nulls.clone(),
             )?;
             Box::new(iter)
         }
@@ -97,12 +97,12 @@ pub fn readstat_batch_iter(
                 path.to_path_buf(),
                 opts.threads,
                 missing_string_as_null,
-                user_missing_as_null,
                 value_labels_as_strings,
                 chunk_size,
                 preserve_order,
                 columns,
                 n_rows,
+                opts.informative_nulls.clone(),
             )?;
             Box::new(iter)
         }
@@ -111,12 +111,12 @@ pub fn readstat_batch_iter(
                 path.to_path_buf(),
                 opts.threads,
                 missing_string_as_null,
-                user_missing_as_null,
                 value_labels_as_strings,
                 chunk_size,
                 preserve_order,
                 columns,
                 n_rows,
+                opts.informative_nulls.clone(),
             )?;
             Box::new(iter)
         }

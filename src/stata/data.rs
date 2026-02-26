@@ -1,10 +1,13 @@
 use crate::stata::encoding;
 use crate::stata::error::{Error, Result};
 use crate::stata::types::{Endian, Metadata, NumericType, VarType};
-use crate::stata::value::{missing_rules, read_f32, read_f64, read_i16, read_i32, read_i8};
+use crate::stata::value::{
+    missing_rules, offset_to_stata_label, read_f32, read_f32_tagged, read_f64, read_f64_tagged,
+    read_i16, read_i16_tagged, read_i32, read_i32_tagged, read_i8, read_i8_tagged,
+};
 use byteorder::ReadBytesExt;
 use polars::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -19,7 +22,6 @@ pub fn read_data_frame(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
 ) -> Result<DataFrame> {
     let shared = build_shared_decode(path, metadata, endian, ds_format, value_labels_as_strings)?;
@@ -32,7 +34,6 @@ pub fn read_data_frame(
         offset,
         limit,
         missing_string_as_null,
-        user_missing_as_null,
         value_labels_as_strings,
         &shared,
     )
@@ -81,7 +82,6 @@ pub fn read_data_frame_range(
     offset: usize,
     limit: usize,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
     shared: &SharedDecode,
 ) -> Result<DataFrame> {
@@ -96,7 +96,7 @@ pub fn read_data_frame_range(
 
     let label_maps = shared.label_maps.as_ref();
 
-    let rules = missing_rules(ds_format, user_missing_as_null);
+    let rules = missing_rules(ds_format);
     let (col_indices, mut builders, col_offsets, col_widths, col_labels, mut string_scratch) =
         build_column_builders(
             metadata,
@@ -886,4 +886,279 @@ impl ColumnBuilder {
             ColumnBuilder::Utf8(b) => b.finish().into_series(),
         }
     }
+}
+
+// ─── Informative null code paths ──────────────────────────────────────────────
+// These functions are only called when InformativeNullOpts is Some.
+// The existing fast path above is completely unchanged.
+
+/// Returns the indicator string for a user-missing value, given the missing offset (1-26).
+/// Checks the label map first if `use_value_labels` is true.
+fn indicator_from_offset(
+    offset: u8,
+    raw_value: i32,
+    label_map: Option<&LabelMap>,
+    use_value_labels: bool,
+) -> String {
+    if use_value_labels {
+        if let Some(label_map) = label_map {
+            if let Some(label) = label_map.get_int(raw_value) {
+                return label.clone();
+            }
+        }
+    }
+    offset_to_stata_label(offset)
+}
+
+fn indicator_from_offset_f(
+    offset: u8,
+    raw_bits: u64,
+    label_map: Option<&LabelMap>,
+    use_value_labels: bool,
+) -> String {
+    if use_value_labels {
+        if let Some(label_map) = label_map {
+            if let Some(label) = label_map.get_float(f64::from_bits(raw_bits)) {
+                return label.clone();
+            }
+        }
+    }
+    offset_to_stata_label(offset)
+}
+
+/// Informative-null read of a full batch. Returns a DataFrame where indicator columns
+/// are appended after all data columns (caller must apply mode transformation).
+pub fn read_data_frame_range_with_indicators(
+    path: &Path,
+    metadata: &Metadata,
+    endian: Endian,
+    ds_format: u16,
+    columns: Option<&[usize]>,
+    offset: usize,
+    limit: usize,
+    missing_string_as_null: bool,
+    value_labels_as_strings: bool,
+    shared: &SharedDecode,
+    indicator_cols: &HashSet<String>,
+    use_value_labels: bool,
+    indicator_suffix: &str,
+) -> Result<DataFrame> {
+    let file = File::open(path)?;
+    let data_offset = metadata.data_offset.ok_or_else(|| Error::MissingMetadata)?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+
+    reader.seek(SeekFrom::Start(data_offset))?;
+    if ds_format >= 117 {
+        read_tag(&mut reader, b"<data>")?;
+    }
+
+    let label_maps = shared.label_maps.as_ref();
+    let rules = missing_rules(ds_format);
+
+    let (col_indices, mut builders, col_offsets, col_widths, col_labels, mut string_scratch) =
+        build_column_builders(metadata, columns, limit, label_maps, value_labels_as_strings)?;
+
+    // Build parallel indicator builders for columns in indicator_cols
+    let mut null_builders: Vec<Option<StringChunkedBuilder>> = col_indices
+        .iter()
+        .map(|&idx| {
+            let var = &metadata.variables[idx];
+            let is_numeric = matches!(var.var_type, VarType::Numeric(_));
+            if is_numeric && indicator_cols.contains(&var.name) {
+                let ind_name = format!("{}{}", var.name, indicator_suffix);
+                Some(StringChunkedBuilder::new(ind_name.as_str().into(), limit))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let record_len = metadata.storage_widths.iter().map(|v| *v as usize).sum::<usize>();
+    let mut row_buf = vec![0u8; record_len];
+
+    let total_rows = metadata.row_count as usize;
+    let start_row = offset;
+    let end_row = (offset + limit).min(total_rows);
+
+    if start_row > 0 {
+        let byte_skip = (start_row as u64) * (record_len as u64);
+        reader.seek(SeekFrom::Current(byte_skip as i64))?;
+    }
+
+    for _row_idx in start_row..end_row {
+        reader.read_exact(&mut row_buf)?;
+
+        for (i, &col_idx) in col_indices.iter().enumerate() {
+            let col_offset = col_offsets[i];
+            let width = col_widths[i];
+            let slice = &row_buf[col_offset..col_offset + width];
+
+            if let Some(ref mut null_builder) = null_builders[i] {
+                // This column needs indicator tracking — use tagged path
+                append_value_tagged(
+                    &mut builders[i],
+                    null_builder,
+                    &metadata.variables[col_idx].var_type,
+                    slice,
+                    endian,
+                    rules,
+                    missing_string_as_null,
+                    shared.strls.as_ref().map(|v| v.as_ref()),
+                    ds_format,
+                    col_labels[i].as_deref(),
+                    metadata.encoding,
+                    string_scratch[i].as_mut(),
+                    use_value_labels,
+                )?;
+            } else {
+                // No indicator — use the regular (fast) path
+                append_value(
+                    &mut builders[i],
+                    &metadata.variables[col_idx].var_type,
+                    slice,
+                    endian,
+                    rules,
+                    missing_string_as_null,
+                    shared.strls.as_ref().map(|v| v.as_ref()),
+                    ds_format,
+                    col_labels[i].as_deref(),
+                    metadata.encoding,
+                    string_scratch[i].as_mut(),
+                )?;
+            }
+        }
+    }
+
+    if ds_format >= 117 && offset + (end_row - start_row) >= total_rows {
+        read_tag(&mut reader, b"</data>")?;
+    }
+
+    // Build the DataFrame: data columns first, then indicator columns appended
+    let mut cols: Vec<Column> = Vec::with_capacity(builders.len() + null_builders.iter().filter(|b| b.is_some()).count());
+    for builder in builders {
+        cols.push(builder.finish().into());
+    }
+    for null_builder in null_builders {
+        if let Some(b) = null_builder {
+            cols.push(b.finish().into_series().into());
+        }
+    }
+
+    Ok(DataFrame::new_infer_height(cols)?)
+}
+
+fn append_value_tagged(
+    builder: &mut ColumnBuilder,
+    null_builder: &mut StringChunkedBuilder,
+    var_type: &VarType,
+    buf: &[u8],
+    endian: Endian,
+    rules: crate::stata::value::MissingRules,
+    missing_string_as_null: bool,
+    strls: Option<&HashMap<(u32, u64), String>>,
+    ds_format: u16,
+    label_map: Option<&LabelMap>,
+    encoding: &'static encoding_rs::Encoding,
+    scratch: Option<&mut StringScratch>,
+    use_value_labels: bool,
+) -> Result<()> {
+    match (builder, var_type) {
+        (ColumnBuilder::Int8(b), VarType::Numeric(NumericType::Byte)) => {
+            let (val, offset) = read_i8_tagged(buf, rules);
+            match (val, offset) {
+                (Some(v), _) => { b.append_value(v); null_builder.append_null(); }
+                (None, Some(k)) => {
+                    b.append_null();
+                    let raw = rules.system_missing_int8 as i32 + k as i32;
+                    null_builder.append_value(&indicator_from_offset(k, raw, label_map, use_value_labels));
+                }
+                (None, None) => { b.append_null(); null_builder.append_null(); }
+            }
+        }
+        (ColumnBuilder::Int16(b), VarType::Numeric(NumericType::Int)) => {
+            let (val, offset) = read_i16_tagged(buf, endian, rules);
+            match (val, offset) {
+                (Some(v), _) => { b.append_value(v); null_builder.append_null(); }
+                (None, Some(k)) => {
+                    b.append_null();
+                    let raw = rules.system_missing_int16 as i32 + k as i32;
+                    null_builder.append_value(&indicator_from_offset(k, raw, label_map, use_value_labels));
+                }
+                (None, None) => { b.append_null(); null_builder.append_null(); }
+            }
+        }
+        (ColumnBuilder::Int32(b), VarType::Numeric(NumericType::Long)) => {
+            let (val, offset) = read_i32_tagged(buf, endian, rules);
+            match (val, offset) {
+                (Some(v), _) => { b.append_value(v); null_builder.append_null(); }
+                (None, Some(k)) => {
+                    b.append_null();
+                    let raw = rules.system_missing_int32 + k as i32;
+                    null_builder.append_value(&indicator_from_offset(k, raw, label_map, use_value_labels));
+                }
+                (None, None) => { b.append_null(); null_builder.append_null(); }
+            }
+        }
+        (ColumnBuilder::Float32(b), VarType::Numeric(NumericType::Float)) => {
+            let (val, offset) = read_f32_tagged(buf, endian, rules);
+            match (val, offset) {
+                (Some(v), _) => { b.append_value(v); null_builder.append_null(); }
+                (None, Some(k)) => {
+                    b.append_null();
+                    // For float, reconstruct raw bits for label lookup
+                    let raw_bits = (rules.missing_float as u64) + (k as u64) * 0x0008_0000;
+                    null_builder.append_value(&indicator_from_offset_f(k, raw_bits, label_map, use_value_labels));
+                }
+                (None, None) => { b.append_null(); null_builder.append_null(); }
+            }
+        }
+        (ColumnBuilder::Float64(b), VarType::Numeric(NumericType::Double)) => {
+            let (val, offset) = read_f64_tagged(buf, endian, rules);
+            match (val, offset) {
+                (Some(v), _) => { b.append_value(v); null_builder.append_null(); }
+                (None, Some(k)) => {
+                    b.append_null();
+                    let raw_bits = rules.missing_double + k as u64;
+                    null_builder.append_value(&indicator_from_offset_f(k, raw_bits, label_map, use_value_labels));
+                }
+                (None, None) => { b.append_null(); null_builder.append_null(); }
+            }
+        }
+        // For labeled numeric columns (Utf8 builder), tagged path uses the same logic but
+        // the label map is for data values, not missing indicators. Fall through to regular path.
+        (b @ ColumnBuilder::Utf8(_), vt @ VarType::Numeric(_)) => {
+            null_builder.append_null();
+            append_value(
+                b,
+                vt,
+                buf,
+                endian,
+                rules,
+                missing_string_as_null,
+                strls,
+                ds_format,
+                label_map,
+                encoding,
+                scratch,
+            )?;
+        }
+        // Strings have no extended missing in Stata — fall through to regular path
+        (b, vt) => {
+            null_builder.append_null();
+            append_value(
+                b,
+                vt,
+                buf,
+                endian,
+                rules,
+                missing_string_as_null,
+                strls,
+                ds_format,
+                label_map,
+                encoding,
+                scratch,
+            )?;
+        }
+    }
+    Ok(())
 }

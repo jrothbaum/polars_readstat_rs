@@ -13,15 +13,26 @@ The crate provides:
 
 Benchmarks run via the [`polars_readstat`](https://github.com/jrothbaum/polars_readstat) Python bindings (AMD Ryzen 7 8845HS, 16 cores, external SSD), comparing against pandas:
 
-| Format | Full file | Column subset | Column subset + row filter |
-|--------|----------:|-------------:|---------------------------:|
-| SAS    | 2.9×      | —            | **51.5×**                  |
-| Stata  | 6.7×      | 9.8×         | —                          |
-| SPSS   | 6.6×      | 9.1×         | —                          |
+| Format | Full file | Column subset | Row filter | Subset + filter |
+|--------|----------:|-------------:|-----------:|----------------:|
+| SAS    | 2.9×      | **51.5×**    | 2.9×       | **52.5×**       |
+| Stata  | 6.7×      | 9.8×         | 4.1×       | 8.7×            |
+| SPSS   | 16×       | 25×          | 15×        | **64×**         |
 
 The largest gains come from column projection: the reader skips parsing unwanted columns entirely rather than reading and discarding them. Speedups will vary with file shape, storage, and hardware.
 
-For full tables, methodology, and pyreadstat comparisons, see the [polars_readstat benchmarks](https://github.com/jrothbaum/polars_readstat).
+SPSS reading was significantly improved in v0.3. The library also handles large SPSS files (600MB+) that crash pandas due to memory exhaustion.
+
+SPSS run times (`anes_timeseries_cdf.sav`, 73,745 rows × 1,030 cols, 87 MB — one run per scenario):
+
+```
+                  Full file   Subset   Filter   Subset+Filter
+polars_readstat    1.30       0.74     1.24     0.28
+pandas            21.26      18.17    17.94    17.93
+pyreadstat         6.37       1.58     5.49     1.43
+```
+
+For full methodology and tables, see [BENCHMARKS.md](https://github.com/jrothbaum/polars_readstat/blob/main/BENCHMARKS.md).
 
 This was nearly completely coded by Claude Code and Codex, but with a very particular setup that I hope makes it less likely to be a mess than other moslty-AI code repository.  It was meant to directly replace the C++ and C code in relatively small, existing codebase ([polars_readstat, v0.11.1](https://github.com/jrothbaum/polars_readstat/releases/tag/v0.11.1)) with the ability to exactly validate the new code's output against the old.  For any given regression, the AI models could be told to refer directly to the spot in the code where the prior implementation did the same operation to try to figure out how to solve the issue.  It could also compare any output to the output produced by other similar tools such as [pandas](https://github.com/pandas-dev/pandas) and [pyreadstat](https://github.com/Roche/pyreadstat/).  I'm sure it's not the most beautiful code, but I'm an economist and I wanted a tool to exist that was faster than what's out there and implemented in Rust (so many build issues with using C++ and C across systems.  So many...) but I didn't want to spend months on figuring out records layouts and encoding of SAS, Stata, and SPSS files.  Hence, my first attempt that just directly plugged into other tools ([polars_readstat, v0.11.1](https://github.com/jrothbaum/polars_readstat/releases/tag/v0.11.1)) and the AI-first version of this.
 
@@ -56,8 +67,8 @@ All three readers expose the same fluent builder. Options and their defaults:
 | `.with_schema(schema)` | `Arc<Schema>` | none | cast columns after read |
 | `.sequential()` | — | parallel on | force single-threaded read |
 | `.missing_string_as_null(bool)` | `bool` | `true` | treat empty/missing strings as null |
-| `.user_missing_as_null(bool)` | `bool` | `true` | treat user-defined missing values as null *(Stata/SPSS only)* |
 | `.value_labels_as_strings(bool)` | `bool` | `true` | decode value labels as strings *(Stata/SPSS only)* |
+| `.informative_nulls(opts)` | `Option<InformativeNullOpts>` | `None` | capture user-defined missing value indicators (see [Informative Nulls](#informative-nulls)) |
 
 ```rust
 use polars_readstat_rs::StataReader;
@@ -69,7 +80,6 @@ let df = StataReader::open("file.dta")?
     .with_limit(5_000)
     .with_n_threads(4)
     .missing_string_as_null(true)
-    .user_missing_as_null(true)
     .value_labels_as_strings(true)
     .finish()?;
 ```
@@ -107,9 +117,9 @@ let opts = ScanOptions {
     threads: Some(4),
     chunk_size: Some(100_000),
     missing_string_as_null: Some(true),  // default: true
-    user_missing_as_null: Some(true),    // default: true (Stata/SPSS)
     value_labels_as_strings: Some(true), // default: true (Stata/SPSS)
     preserve_order: Some(false),         // default: false; true = deterministic row order when parallel
+    informative_nulls: None,             // see Informative Nulls section
     compress_opts: CompressOptionsLite {
         enabled: false,              // post-read type narrowing (disabled by default)
         cols: None,                  // columns to compress; None = all
@@ -296,6 +306,46 @@ SPSS writer behavior and current limits:
 - Value labels are currently supported for numeric variables only.
 - String value labels are not currently supported.
 - Output encoding is selected automatically: Windows-1252 when possible, otherwise UTF-8 with an SPSS encoding record.
+
+## Informative Nulls
+
+SAS, Stata, and SPSS files support user-defined missing value codes (SAS `.A`–`.Z`, Stata `.a`–`.z`, SPSS discrete/range missings). By default these are read as `null`. The `informative_nulls` option captures the missing-value indicator alongside the data value.
+
+```rust
+use polars_readstat_rs::{
+    InformativeNullColumns, InformativeNullMode, InformativeNullOpts, StataReader,
+};
+
+// Track all eligible columns using the default mode (separate indicator column)
+let opts = InformativeNullOpts::new(InformativeNullColumns::All);
+
+let df = StataReader::open("file.dta")?
+    .read()
+    .informative_nulls(Some(opts))
+    .finish()?;
+```
+
+**Three output modes:**
+
+| Mode | Description |
+|---|---|
+| `SeparateColumn { suffix }` (default `"_null"`) | Adds a parallel `String` column `<col><suffix>` after each tracked column |
+| `Struct` | Wraps each `(value, indicator)` pair into a `Struct` column |
+| `MergedString` | Merges into a single `String` column (value as string, or the indicator code) |
+
+```rust
+use polars_readstat_rs::{
+    InformativeNullColumns, InformativeNullMode, InformativeNullOpts,
+};
+
+let opts = InformativeNullOpts {
+    columns: InformativeNullColumns::Selected(vec!["income".into(), "age".into()]),
+    mode: InformativeNullMode::SeparateColumn { suffix: "_missing".into() },
+    use_value_labels: true, // use the value label for the indicator string when defined
+};
+```
+
+Works with all three format readers and with `ScanOptions` / `readstat_batch_iter`.
 
 ## Arrow export
 ```rust

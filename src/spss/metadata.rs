@@ -2,6 +2,22 @@ use crate::spss::error::{Error, Result};
 use crate::spss::types::{Endian, FormatClass, Header, Metadata, VarType, Variable};
 use std::io::{Read, Seek, SeekFrom};
 
+/// Discard `n` bytes by reading them into a stack buffer.
+/// Uses `read_exact` which is zero-syscall for a buffered reader,
+/// unlike `seek(SeekFrom::Current(n))` which calls `stream_position()` for every seek.
+#[inline]
+fn drain<R: Read>(reader: &mut R, n: usize) -> std::io::Result<()> {
+    // Stack buffer; large enough for all typical label/record skips.
+    let mut buf = [0u8; 512];
+    let mut remaining = n;
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len());
+        reader.read_exact(&mut buf[..chunk])?;
+        remaining -= chunk;
+    }
+    Ok(())
+}
+
 const REC_TYPE_VARIABLE: u32 = 2;
 const REC_TYPE_VALUE_LABEL: u32 = 3;
 const REC_TYPE_VALUE_LABEL_VARIABLES: u32 = 4;
@@ -45,11 +61,11 @@ fn prescan_char_encoding_inner<R: Read + Seek>(
                 if has_label != 0 {
                     let len = read_u32(reader, header.endian).ok()? as usize;
                     let padded = ((len + 3) / 4) * 4;
-                    reader.seek(SeekFrom::Current(padded as i64)).ok()?;
+                    drain(reader, padded).ok()?;
                 }
                 let abs_missing = n_missing.unsigned_abs() as usize;
                 if abs_missing > 0 {
-                    reader.seek(SeekFrom::Current((abs_missing * 8) as i64)).ok()?;
+                    drain(reader, abs_missing * 8).ok()?;
                 }
             }
             REC_TYPE_VALUE_LABEL => {
@@ -58,24 +74,24 @@ fn prescan_char_encoding_inner<R: Read + Seek>(
                 // followed by an embedded REC_TYPE_VALUE_LABEL_VARIABLES record.
                 let count = read_u32(reader, header.endian).ok()? as usize;
                 for _ in 0..count {
-                    reader.seek(SeekFrom::Current(8)).ok()?; // 8-byte raw value
+                    drain(reader, 8).ok()?; // 8-byte raw value
                     let vlen = read_u8(reader).ok()? as usize;
                     let padded = ((vlen + 8) / 8) * 8 - 1;
-                    reader.seek(SeekFrom::Current(padded as i64)).ok()?;
+                    drain(reader, padded).ok()?;
                 }
                 // Consume embedded value_label_variables record
                 let _rec = read_u32(reader, header.endian).ok()?; // should be 4
                 let var_count = read_u32(reader, header.endian).ok()? as usize;
-                reader.seek(SeekFrom::Current((var_count * 4) as i64)).ok()?;
+                drain(reader, var_count * 4).ok()?;
             }
             REC_TYPE_VALUE_LABEL_VARIABLES => {
                 // Should not normally appear here (consumed inside VALUE_LABEL), but skip it.
                 let var_count = read_u32(reader, header.endian).ok()? as usize;
-                reader.seek(SeekFrom::Current((var_count * 4) as i64)).ok()?;
+                drain(reader, var_count * 4).ok()?;
             }
             REC_TYPE_DOCUMENT => {
                 let line_count = read_u32(reader, header.endian).ok()? as usize;
-                reader.seek(SeekFrom::Current((line_count * 80) as i64)).ok()?;
+                drain(reader, line_count * 80).ok()?;
             }
             REC_TYPE_HAS_DATA => {
                 let subtype = read_u32(reader, header.endian).ok()?;
@@ -102,7 +118,7 @@ fn prescan_char_encoding_inner<R: Read + Seek>(
                         }
                     }
                 } else {
-                    reader.seek(SeekFrom::Current(data_len as i64)).ok()?;
+                    drain(reader, data_len).ok()?;
                 }
             }
             REC_TYPE_DICT_TERMINATION | _ => break,
@@ -152,12 +168,11 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
             REC_TYPE_VALUE_LABEL_VARIABLES => {
                 // part of value-label record; skip count and var indexes
                 let var_count = read_u32(reader, header.endian)? as usize;
-                reader.seek(SeekFrom::Current((var_count * 4) as i64))?;
+                drain(reader, var_count * 4)?;
             }
             REC_TYPE_DOCUMENT => {
                 let line_count = read_u32(reader, header.endian)? as usize;
-                let bytes = line_count * 80;
-                reader.seek(SeekFrom::Current(bytes as i64))?;
+                drain(reader, line_count * 80)?;
             }
             REC_TYPE_HAS_DATA => {
                 let subtype = read_u32(reader, header.endian)?;
@@ -195,7 +210,7 @@ pub fn read_metadata<R: Read + Seek>(reader: &mut R, header: &Header) -> Result<
                     reader.read_exact(&mut buf)?;
                     parse_long_string_missing_values(&buf, header, &mut metadata)?;
                 } else {
-                    reader.seek(SeekFrom::Current(data_len as i64))?;
+                    drain(reader, data_len)?;
                 }
             }
             REC_TYPE_DICT_TERMINATION => {

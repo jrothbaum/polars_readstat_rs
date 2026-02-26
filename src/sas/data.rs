@@ -611,3 +611,92 @@ fn is_known_metadata_signature(sig: &[u8]) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DataReader;
+    use crate::page::PageReader;
+    use crate::reader::Sas7bdatReader;
+    use std::io::{BufReader, Seek, SeekFrom};
+    use std::fs::File;
+
+    #[test]
+    #[ignore]
+    fn inspect_sas_missing_bits() {
+        let path = "tests/sas/data/info_nulls_test_data.sas7bdat";
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let reader = Sas7bdatReader::open(path).expect("open");
+        let meta = reader.metadata();
+        let header = reader.header();
+        let endian = reader.endian();
+        let format = reader.format();
+        let initial_subs = reader.initial_data_subheaders().to_vec();
+
+        println!("Row count: {}", meta.row_count);
+        println!("Endian: {:?}", endian);
+        println!("Row length: {}", meta.row_length);
+        for col in &meta.columns {
+            println!("  col name={:?} type={:?} format={:?} offset={} len={}",
+                col.name, col.col_type, col.format, col.offset, col.length);
+        }
+
+        // Collect all distinct NaN bit patterns across ALL rows
+        let mut file = BufReader::new(File::open(path).expect("open file"));
+        file.seek(SeekFrom::Start(header.header_length as u64)).unwrap();
+        let page_reader = PageReader::new(file, header.clone(), endian, format);
+        let mut data_reader = DataReader::new(page_reader, meta.clone(), endian, format, initial_subs).expect("data reader");
+
+        use std::collections::BTreeSet;
+        let mut nan_patterns: BTreeSet<u64> = BTreeSet::new();
+        let mut valid_count = 0usize;
+
+        loop {
+            match data_reader.read_row_borrowed() {
+                Ok(Some(row)) => {
+                    for col in &meta.columns {
+                        if col.col_type != crate::types::ColumnType::Numeric { continue; }
+                        let start = col.offset;
+                        let end = col.offset + col.length;
+                        if end > row.len() { continue; }
+                        let bytes = &row[start..end];
+                        let bits = if bytes.len() >= 8 {
+                            u64::from_le_bytes(bytes[..8].try_into().unwrap())
+                        } else {
+                            let mut buf = [0u8; 8];
+                            let pad = 8 - bytes.len();
+                            buf[pad..].copy_from_slice(bytes);
+                            u64::from_le_bytes(buf)
+                        };
+                        let abs = bits & 0x7fff_ffff_ffff_ffff;
+                        if abs >= 0x7ff0_0000_0000_0000 {
+                            nan_patterns.insert(bits);
+                        } else {
+                            valid_count += 1;
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => { println!("err: {}", e); break; }
+            }
+        }
+
+        println!("Valid values: {}", valid_count);
+        println!("Distinct NaN patterns ({}):", nan_patterns.len());
+        let mut sorted: Vec<u64> = nan_patterns.into_iter().collect();
+        sorted.sort();
+        for bits in &sorted {
+            let be_bytes = bits.to_be_bytes();
+            let sign = (bits >> 63) & 1;
+            let type_byte = (bits >> 40) & 0xff;
+            let as_char = if type_byte >= 0x41 && type_byte <= 0x7a {
+                (type_byte as u8) as char
+            } else { '?' };
+            println!("  bits=0x{:016x} sign={} be_bytes={} type_byte=0x{:02x}={} char={}",
+                bits, sign,
+                be_bytes.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(""),
+                type_byte, type_byte, as_char);
+        }
+    }
+}

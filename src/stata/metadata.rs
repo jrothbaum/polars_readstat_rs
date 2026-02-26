@@ -479,7 +479,7 @@ fn read_value_labels<R: Read + Seek>(
     }
 
     let mut labels = Vec::new();
-    let rules = crate::stata::value::missing_rules(header.version, false);
+    let rules = crate::stata::value::missing_rules(header.version);
 
     loop {
         let len = if layout.value_label_table_len_len == 2 {

@@ -1,11 +1,11 @@
 use polars::prelude::*;
 use polars_readstat_rs::{scan_dta, CompressOptionsLite, ScanOptions};
 
-/// Usage: stata_scan <file> [threads] [chunk_size] [missing_string_as_null] [user_missing_as_null] [value_labels_as_strings] [compress] [compress_cols]
+/// Usage: stata_scan <file> [threads] [chunk_size] [missing_string_as_null] [value_labels_as_strings] [compress] [compress_cols]
 fn main() -> PolarsResult<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: stata_scan <file> [threads] [chunk_size] [missing_string_as_null] [user_missing_as_null] [value_labels_as_strings] [compress] [compress_cols]");
+        eprintln!("Usage: stata_scan <file> [threads] [chunk_size] [missing_string_as_null] [value_labels_as_strings] [compress] [compress_cols]");
         std::process::exit(1);
     }
 
@@ -13,14 +13,13 @@ fn main() -> PolarsResult<()> {
     let threads = args.get(2).and_then(|s| s.parse::<usize>().ok());
     let chunk_size = args.get(3).and_then(|s| s.parse::<usize>().ok());
     let missing_string_as_null = args.get(4).map(|s| s == "true" || s == "1").unwrap_or(true);
-    let user_missing_as_null = args.get(5).map(|s| s == "true" || s == "1").unwrap_or(true);
-    let value_labels_as_strings = args.get(6).map(|s| s == "true" || s == "1").unwrap_or(true);
+    let value_labels_as_strings = args.get(5).map(|s| s == "true" || s == "1").unwrap_or(true);
     let compress = args
-        .get(7)
+        .get(6)
         .map(|s| s == "true" || s == "1")
         .unwrap_or(false);
     let compress_cols = args
-        .get(8)
+        .get(7)
         .map(|s| {
             s.split(',')
                 .map(|v| v.trim().to_string())
@@ -42,7 +41,7 @@ fn main() -> PolarsResult<()> {
         threads,
         chunk_size,
         missing_string_as_null: Some(missing_string_as_null),
-        user_missing_as_null: Some(user_missing_as_null),
+        informative_nulls: None,
         value_labels_as_strings: Some(value_labels_as_strings),
         preserve_order: Some(true),
         compress_opts,

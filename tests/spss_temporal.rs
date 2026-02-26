@@ -17,7 +17,6 @@ fn scan_file(path: PathBuf) -> PolarsResult<DataFrame> {
         chunk_size: None,
         missing_string_as_null: Some(true),
         value_labels_as_strings: Some(true),
-        user_missing_as_null: Some(true),
         ..Default::default()
     };
     scan_sav(path, opts)?.collect()

@@ -1,4 +1,4 @@
-use crate::spss::data::{read_data_columns_uncompressed, read_data_frame};
+use crate::spss::data::{read_data_columns_uncompressed, read_data_frame, read_data_frame_with_indicators};
 use crate::spss::error::{Error, Result};
 use crate::spss::header::read_header;
 use crate::spss::metadata::read_metadata;
@@ -62,8 +62,8 @@ pub struct ReadBuilder<'a> {
     num_threads: Option<usize>,
     chunk_size: Option<usize>,
     missing_string_as_null: bool,
-    user_missing_as_null: bool,
     value_labels_as_strings: bool,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 }
 
 impl<'a> ReadBuilder<'a> {
@@ -78,8 +78,8 @@ impl<'a> ReadBuilder<'a> {
             num_threads: None,
             chunk_size: None,
             missing_string_as_null: true,
-            user_missing_as_null: true,
             value_labels_as_strings: true,
+            informative_nulls: None,
         }
     }
 
@@ -115,12 +115,12 @@ impl<'a> ReadBuilder<'a> {
         self.missing_string_as_null = v;
         self
     }
-    pub fn user_missing_as_null(mut self, v: bool) -> Self {
-        self.user_missing_as_null = v;
-        self
-    }
     pub fn value_labels_as_strings(mut self, v: bool) -> Self {
         self.value_labels_as_strings = v;
+        self
+    }
+    pub fn informative_nulls(mut self, v: Option<crate::InformativeNullOpts>) -> Self {
+        self.informative_nulls = v;
         self
     }
 
@@ -130,6 +130,60 @@ impl<'a> ReadBuilder<'a> {
             .unwrap_or(self.reader.metadata.row_count as usize);
         let cols = resolve_column_indices(&self.reader.metadata, self.columns.as_deref())?;
 
+        // Informative nulls: serial path using the indicator-aware reader
+        if let Some(ref null_opts) = self.informative_nulls {
+            use crate::spss::types::VarType;
+            let metadata = &self.reader.metadata;
+            let var_names: Vec<&str> =
+                metadata.variables.iter().map(|v| v.name.as_str()).collect();
+            let eligible: Vec<&str> = metadata
+                .variables
+                .iter()
+                .filter(|v| {
+                    (v.var_type == VarType::Numeric
+                        && (!v.missing_doubles.is_empty() || v.missing_range))
+                        || (v.var_type == VarType::Str && !v.missing_strings.is_empty())
+                })
+                .map(|v| v.name.as_str())
+                .collect();
+            let pairs = crate::informative_null_pairs(&var_names, &eligible, null_opts);
+            crate::check_informative_null_collisions(&var_names, &pairs)
+                .map_err(|e| Error::ParseError(e.to_string()))?;
+            let pairs_map: std::collections::HashMap<&str, &str> = pairs
+                .iter()
+                .map(|(m, i)| (m.as_str(), i.as_str()))
+                .collect();
+            let effective_indices: Vec<usize> = cols
+                .clone()
+                .unwrap_or_else(|| (0..metadata.variables.len()).collect());
+            let indicator_col_names: Vec<Option<String>> = effective_indices
+                .iter()
+                .map(|&idx| {
+                    let vname = metadata.variables[idx].name.as_str();
+                    pairs_map.get(vname).map(|&ind| ind.to_string())
+                })
+                .collect();
+            let mut df = read_data_frame_with_indicators(
+                &self.reader.path,
+                metadata,
+                self.reader.header.endian,
+                self.reader.header.compression,
+                self.reader.header.bias,
+                cols.as_deref(),
+                self.offset,
+                limit,
+                self.missing_string_as_null,
+                self.value_labels_as_strings,
+                &indicator_col_names,
+            )?;
+            if let Some(schema) = self.schema {
+                df = cast_dataframe(df, &schema)?;
+            }
+            df = crate::apply_informative_null_mode(df, &null_opts.mode, &pairs)
+                .map_err(|e| Error::ParseError(e.to_string()))?;
+            return Ok(df);
+        }
+
         let mut df = if self.parallel && limit > 0 {
             self.reader.read_parallel(
                 self.offset,
@@ -138,7 +192,6 @@ impl<'a> ReadBuilder<'a> {
                 self.chunk_size,
                 cols.as_deref(),
                 self.missing_string_as_null,
-                self.user_missing_as_null,
                 self.value_labels_as_strings,
             )?
         } else {
@@ -152,7 +205,6 @@ impl<'a> ReadBuilder<'a> {
                 self.offset,
                 limit,
                 self.missing_string_as_null,
-                self.user_missing_as_null,
                 self.value_labels_as_strings,
             )?
         };
@@ -176,7 +228,6 @@ impl SpssReader {
         chunk_size: Option<usize>,
         cols: Option<&[usize]>,
         missing_string_as_null: bool,
-        user_missing_as_null: bool,
         value_labels_as_strings: bool,
     ) -> Result<DataFrame> {
         if self.header.compression != 0 {
@@ -190,7 +241,6 @@ impl SpssReader {
                 offset,
                 count,
                 missing_string_as_null,
-                user_missing_as_null,
                 value_labels_as_strings,
             );
         }
@@ -210,7 +260,6 @@ impl SpssReader {
                 offset,
                 count,
                 missing_string_as_null,
-                user_missing_as_null,
                 value_labels_as_strings,
             );
         }
@@ -244,7 +293,6 @@ impl SpssReader {
                         start,
                         cnt,
                         missing_string_as_null,
-                        user_missing_as_null,
                         value_labels_as_strings,
                     )
                     .map(|df| (i, df))

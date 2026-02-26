@@ -70,7 +70,7 @@ pub fn metadata_json(path: impl AsRef<Path>) -> Result<String> {
     let reader = StataReader::open(path)?;
     let meta = reader.metadata();
     let hdr = reader.header();
-    let missing_rules = crate::stata::value::missing_rules(hdr.version, false);
+    let missing_rules = crate::stata::value::missing_rules(hdr.version);
     let mut value_labels_by_name: HashMap<String, Value> = HashMap::new();
     for label in &meta.value_labels {
         let mut mapping = Map::new();

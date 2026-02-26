@@ -5,7 +5,7 @@ use crate::metadata::read_metadata;
 use crate::page::PageReader;
 use crate::pipeline::DEFAULT_PIPELINE_CHUNK_SIZE;
 use crate::polars_output::{ColumnPlan, DataFrameBuilder};
-use crate::types::{Compression, Endian, Format, Header, Metadata};
+use crate::types::{ColumnType, Compression, Endian, Format, Header, Metadata};
 use polars::prelude::*;
 use rayon::prelude::*;
 use std::fs::File;
@@ -16,7 +16,7 @@ use std::time::Instant;
 
 /// Entry in the data page index for fast parallel seeking
 #[derive(Debug, Clone)]
-struct DataPageEntry {
+pub(crate) struct DataPageEntry {
     /// Page number (0-indexed from start of file pages, after header)
     page_number: usize,
     /// Cumulative row count at the START of this page
@@ -135,9 +135,74 @@ impl Sas7bdatReader {
     pub fn initial_data_subheaders(&self) -> &[DataSubheader] {
         &self.initial_data_subheaders
     }
+    pub(crate) fn first_data_page(&self) -> usize {
+        self.first_data_page
+    }
+    pub(crate) fn mix_data_rows(&self) -> usize {
+        self.mix_data_rows
+    }
 
     /// The single internal execution path for all read operations
     fn execute_read(&self, opts: ReadBuilder) -> Result<DataFrame> {
+        // Informative-nulls path: use SerialSasBatchIter which handles per-row indicator decoding.
+        if let Some(null_opts) = opts.informative_nulls {
+            let col_indices = resolve_column_indices(&self.metadata, opts.columns.as_deref())?;
+            let limit = opts
+                .limit
+                .unwrap_or(self.metadata.row_count.saturating_sub(opts.offset));
+
+            let var_names: Vec<&str> = match col_indices.as_deref() {
+                Some(idx) => idx
+                    .iter()
+                    .map(|&i| self.metadata.columns[i].name.as_str())
+                    .collect(),
+                None => self.metadata.columns.iter().map(|c| c.name.as_str()).collect(),
+            };
+            let eligible_names: Vec<&str> = match col_indices.as_deref() {
+                Some(idx) => idx
+                    .iter()
+                    .map(|&i| &self.metadata.columns[i])
+                    .filter(|c| c.col_type == ColumnType::Numeric)
+                    .map(|c| c.name.as_str())
+                    .collect(),
+                None => self
+                    .metadata
+                    .columns
+                    .iter()
+                    .filter(|c| c.col_type == ColumnType::Numeric)
+                    .map(|c| c.name.as_str())
+                    .collect(),
+            };
+            let pairs = crate::informative_null_pairs(&var_names, &eligible_names, &null_opts);
+            crate::check_informative_null_collisions(&var_names, &pairs)?;
+
+            let mut iter = crate::polars_output::SerialSasBatchIter::new(
+                self.path.clone(),
+                self.header.clone(),
+                self.metadata.clone(),
+                self.endian,
+                self.format,
+                self.initial_data_subheaders.clone(),
+                col_indices,
+                limit.max(1),
+                limit,
+                opts.missing_string_as_null,
+                Some(null_opts),
+                opts.offset,
+            )?;
+
+            let mut df = match iter.next() {
+                Some(Ok(df)) => df,
+                Some(Err(e)) => return Err(e.into()),
+                None => DataFrame::empty(),
+            };
+
+            if let Some(schema) = opts.schema {
+                df = cast_dataframe(df, &schema)?;
+            }
+            return Ok(df);
+        }
+
         let col_indices = resolve_column_indices(&self.metadata, opts.columns.as_deref())?;
         let limit = opts
             .limit
@@ -322,6 +387,7 @@ pub struct ReadBuilder<'a> {
     chunk_size: Option<usize>,
     pipeline_chunk_size: Option<usize>,
     missing_string_as_null: bool,
+    informative_nulls: Option<crate::InformativeNullOpts>,
 }
 
 impl<'a> ReadBuilder<'a> {
@@ -338,6 +404,7 @@ impl<'a> ReadBuilder<'a> {
             chunk_size: None,
             pipeline_chunk_size: None,
             missing_string_as_null: true,
+            informative_nulls: None,
         }
     }
 
@@ -379,6 +446,10 @@ impl<'a> ReadBuilder<'a> {
     }
     pub fn missing_string_as_null(mut self, v: bool) -> Self {
         self.missing_string_as_null = v;
+        self
+    }
+    pub fn informative_nulls(mut self, v: Option<crate::InformativeNullOpts>) -> Self {
+        self.informative_nulls = v;
         self
     }
 
@@ -500,11 +571,10 @@ fn read_batch_selected_profiled(
 }
 
 /// Build a page index analytically — zero I/O, pure arithmetic from header/metadata.
-///
 /// For uncompressed SAS files all pages after the metadata section are DATA pages
 /// with a constant rows-per-page value derived from page_length and row_length.
 /// We simply enumerate them without touching the file.
-fn compute_page_index(
+pub(crate) fn compute_page_index(
     path: &Path,
     header: &Header,
     metadata: &Metadata,
@@ -589,7 +659,7 @@ fn read_first_data_page_block_count(
 /// this seeks directly to the page containing the target row.
 /// Falls back to skip_rows if target_row falls in the MIX-data prefix
 /// (i.e., before the first DATA page in the index).
-fn read_batch_with_page_index(
+pub(crate) fn read_batch_with_page_index(
     path: &Path,
     header: &Header,
     metadata: &Metadata,
