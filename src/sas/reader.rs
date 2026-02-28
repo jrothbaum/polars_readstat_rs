@@ -3,11 +3,8 @@ use crate::error::Result;
 use crate::header::{check_header, read_header};
 use crate::metadata::read_metadata;
 use crate::page::PageReader;
-use crate::pipeline::DEFAULT_PIPELINE_CHUNK_SIZE;
-use crate::polars_output::{ColumnPlan, DataFrameBuilder};
-use crate::types::{ColumnType, Compression, Endian, Format, Header, Metadata};
+use crate::types::{Endian, Format, Header, Metadata};
 use polars::prelude::*;
-use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -144,137 +141,38 @@ impl Sas7bdatReader {
 
     /// The single internal execution path for all read operations
     fn execute_read(&self, opts: ReadBuilder) -> Result<DataFrame> {
-        // Informative-nulls path: use SerialSasBatchIter which handles per-row indicator decoding.
-        if let Some(null_opts) = opts.informative_nulls {
-            let col_indices = resolve_column_indices(&self.metadata, opts.columns.as_deref())?;
-            let limit = opts
-                .limit
-                .unwrap_or(self.metadata.row_count.saturating_sub(opts.offset));
-
-            let var_names: Vec<&str> = match col_indices.as_deref() {
-                Some(idx) => idx
-                    .iter()
-                    .map(|&i| self.metadata.columns[i].name.as_str())
-                    .collect(),
-                None => self.metadata.columns.iter().map(|c| c.name.as_str()).collect(),
-            };
-            let eligible_names: Vec<&str> = match col_indices.as_deref() {
-                Some(idx) => idx
-                    .iter()
-                    .map(|&i| &self.metadata.columns[i])
-                    .filter(|c| c.col_type == ColumnType::Numeric)
-                    .map(|c| c.name.as_str())
-                    .collect(),
-                None => self
-                    .metadata
-                    .columns
-                    .iter()
-                    .filter(|c| c.col_type == ColumnType::Numeric)
-                    .map(|c| c.name.as_str())
-                    .collect(),
-            };
-            let pairs = crate::informative_null_pairs(&var_names, &eligible_names, &null_opts);
-            crate::check_informative_null_collisions(&var_names, &pairs)?;
-
-            let mut iter = crate::polars_output::SerialSasBatchIter::new(
-                self.path.clone(),
-                self.header.clone(),
-                self.metadata.clone(),
-                self.endian,
-                self.format,
-                self.initial_data_subheaders.clone(),
-                col_indices,
-                limit.max(1),
-                limit,
-                opts.missing_string_as_null,
-                Some(null_opts),
-                opts.offset,
-            )?;
-
-            let mut df = match iter.next() {
-                Some(Ok(df)) => df,
-                Some(Err(e)) => return Err(e.into()),
-                None => DataFrame::empty(),
-            };
-
-            if let Some(schema) = opts.schema {
-                df = cast_dataframe(df, &schema)?;
-            }
-            return Ok(df);
-        }
-
         let col_indices = resolve_column_indices(&self.metadata, opts.columns.as_deref())?;
         let limit = opts
             .limit
             .unwrap_or(self.metadata.row_count.saturating_sub(opts.offset));
 
         let missing_null = opts.missing_string_as_null;
+        let threads = if opts.parallel { opts.num_threads } else { Some(1) };
+        let mut iter = crate::sas::polars_output::sas_batch_iter_with_reader(
+            self,
+            self.path.clone(),
+            threads,
+            missing_null,
+            opts.chunk_size,
+            col_indices,
+            opts.offset,
+            Some(limit),
+            true,
+            opts.informative_nulls.clone(),
+        )
+        .map_err(|e| crate::error::Error::ParseError(e.to_string()))?;
 
-        // Logic switch: Use pipeline, parallel chunks, or sequential
-        let mut df = if opts.use_pipeline {
-            crate::pipeline::read_pipeline(
-                &self.path,
-                &self.header,
-                &self.metadata,
-                self.endian,
-                self.format,
-                opts.num_threads.unwrap_or_else(rayon::current_num_threads),
-                opts.pipeline_chunk_size
-                    .unwrap_or(DEFAULT_PIPELINE_CHUNK_SIZE),
-                opts.limit,
-                col_indices.as_deref(),
-                missing_null,
-                &self.initial_data_subheaders,
-            )?
-        } else if opts.parallel && self.metadata.compression == Compression::None {
-            self.read_parallel(
-                opts.offset,
-                limit,
-                opts.num_threads,
-                opts.chunk_size,
-                col_indices.as_deref(),
-                missing_null,
-            )?
-        } else if self.metadata.compression == Compression::None && opts.offset > 0 {
-            // Sequential read with a positive offset: use the page index for a direct file
-            // seek rather than skip_rows, which reads and discards every preceding page.
-            // This is critical for the multi-worker streaming path where each worker has
-            // a different start offset — without this, total I/O is O(n × threads).
-            let page_index = compute_page_index(
-                &self.path,
-                &self.header,
-                &self.metadata,
-                self.endian,
-                self.format,
-                self.first_data_page,
-                self.mix_data_rows,
-            );
-            read_batch_with_page_index(
-                &self.path,
-                &self.header,
-                &self.metadata,
-                self.endian,
-                self.format,
-                opts.offset,
-                limit,
-                col_indices.as_deref(),
-                missing_null,
-                &page_index,
-            )?
-        } else {
-            read_batch_selected(
-                &self.path,
-                &self.header,
-                &self.metadata,
-                self.endian,
-                self.format,
-                opts.offset,
-                limit,
-                col_indices.as_deref(),
-                missing_null,
-                &self.initial_data_subheaders,
-            )?
-        };
+        let mut df: Option<DataFrame> = None;
+        while let Some(batch) = iter.next() {
+            let batch =
+                batch.map_err(|e| crate::error::Error::ParseError(e.to_string()))?;
+            if let Some(acc) = df.as_mut() {
+                acc.vstack_mut(&batch)?;
+            } else {
+                df = Some(batch);
+            }
+        }
+        let mut df = df.unwrap_or_else(DataFrame::empty);
 
         if let Some(schema) = opts.schema {
             df = cast_dataframe(df, &schema)?;
@@ -283,94 +181,21 @@ impl Sas7bdatReader {
         Ok(df)
     }
 
-    /// Profiled read path (forces sequential, non-pipeline execution)
+    /// Profiled read path (streaming execution)
     fn execute_read_profiled(&self, opts: ReadBuilder) -> Result<(DataFrame, ReadProfile)> {
-        let col_indices = resolve_column_indices(&self.metadata, opts.columns.as_deref())?;
-        let limit = opts
-            .limit
-            .unwrap_or(self.metadata.row_count.saturating_sub(opts.offset));
-        let missing_null = opts.missing_string_as_null;
-
-        let (mut df, mut profile) = read_batch_selected_profiled(
-            &self.path,
-            &self.header,
-            &self.metadata,
-            self.endian,
-            self.format,
-            opts.offset,
-            limit,
-            col_indices.as_deref(),
-            missing_null,
-            &self.initial_data_subheaders,
-        )?;
-
-        if let Some(schema) = opts.schema {
-            let cast_start = Instant::now();
-            df = cast_dataframe(df, &schema)?;
-            profile.build_df_ms += cast_start.elapsed().as_secs_f64() * 1000.0;
-            profile.total_ms = profile.parse_rows_ms + profile.build_df_ms;
-        }
-
-        Ok((df, profile))
-    }
-
-    fn read_parallel(
-        &self,
-        offset: usize,
-        count: usize,
-        threads: Option<usize>,
-        chunk_size: Option<usize>,
-        cols: Option<&[usize]>,
-        missing_string_as_null: bool,
-    ) -> Result<DataFrame> {
-        let n_threads = threads.unwrap_or_else(rayon::current_num_threads);
-        let mut chunk_size = chunk_size.unwrap_or_else(|| (count / n_threads).max(1000).min(5000));
-        if chunk_size < 1000 {
-            chunk_size = 1000;
-        }
-        if chunk_size > count {
-            chunk_size = count;
-        }
-        let n_chunks = (count + chunk_size - 1) / chunk_size;
-
-        // Build page index analytically (one 6-byte read to validate, then pure arithmetic)
-        let page_index = compute_page_index(
-            &self.path,
-            &self.header,
-            &self.metadata,
-            self.endian,
-            self.format,
-            self.first_data_page,
-            self.mix_data_rows,
-        );
-
-        let path = Arc::new(self.path.clone());
-        let header = Arc::new(self.header.clone());
-        let metadata = Arc::new(self.metadata.clone());
-        let cols_arc = cols.map(|c| Arc::new(c.to_vec()));
-        let page_index = Arc::new(page_index);
-
-        let dfs = (0..n_chunks)
-            .into_par_iter()
-            .map(|i| {
-                let start = offset + (i * chunk_size);
-                let chunk_count = chunk_size.min(offset + count - start);
-                read_batch_with_page_index(
-                    &path,
-                    &header,
-                    &metadata,
-                    self.endian,
-                    self.format,
-                    start,
-                    chunk_count,
-                    cols_arc.as_deref().map(|v| v.as_slice()),
-                    missing_string_as_null,
-                    &page_index,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        combine_dataframes(dfs)
+        let total_start = Instant::now();
+        let df = self.execute_read(opts)?;
+        let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+        Ok((
+            df,
+            ReadProfile {
+                parse_rows_ms: 0.0,
+                parse_values_ms: 0.0,
+                add_row_ms: 0.0,
+                build_df_ms: total_ms,
+                total_ms,
+            },
+        ))
     }
 }
 
@@ -382,10 +207,8 @@ pub struct ReadBuilder<'a> {
     offset: usize,
     limit: Option<usize>,
     parallel: bool,
-    use_pipeline: bool,
     num_threads: Option<usize>,
     chunk_size: Option<usize>,
-    pipeline_chunk_size: Option<usize>,
     missing_string_as_null: bool,
     informative_nulls: Option<crate::InformativeNullOpts>,
 }
@@ -399,10 +222,8 @@ impl<'a> ReadBuilder<'a> {
             offset: 0,
             limit: None,
             parallel: true,
-            use_pipeline: false,
             num_threads: None,
             chunk_size: None,
-            pipeline_chunk_size: None,
             missing_string_as_null: true,
             informative_nulls: None,
         }
@@ -436,14 +257,6 @@ impl<'a> ReadBuilder<'a> {
         self.parallel = false;
         self
     }
-    pub fn pipeline(mut self) -> Self {
-        self.use_pipeline = true;
-        self
-    }
-    pub fn pipeline_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.pipeline_chunk_size = Some(chunk_size);
-        self
-    }
     pub fn missing_string_as_null(mut self, v: bool) -> Self {
         self.missing_string_as_null = v;
         self
@@ -460,114 +273,6 @@ impl<'a> ReadBuilder<'a> {
     pub fn finish_profiled(self) -> Result<(DataFrame, ReadProfile)> {
         self.reader.execute_read_profiled(self)
     }
-}
-
-// --- Internal Helpers (Reduced to single implementations) ---
-
-fn read_batch_selected(
-    path: &Path,
-    header: &Header,
-    metadata: &Metadata,
-    endian: Endian,
-    format: Format,
-    skip: usize,
-    count: usize,
-    col_indices: Option<&[usize]>,
-    missing_string_as_null: bool,
-    initial_data_subheaders: &[DataSubheader],
-) -> Result<DataFrame> {
-    let mut file = BufReader::new(File::open(path)?);
-    file.seek(SeekFrom::Start(header.header_length as u64))?;
-
-    let page_reader = PageReader::new(file, header.clone(), endian, format);
-    let mut data_reader = DataReader::new(
-        page_reader,
-        metadata.clone(),
-        endian,
-        format,
-        initial_data_subheaders.to_vec(),
-    )?;
-
-    data_reader.skip_rows(skip)?;
-
-    let mut builder = match col_indices {
-        Some(idx) => DataFrameBuilder::new_with_columns(metadata, idx, count),
-        None => DataFrameBuilder::new(metadata.clone(), count),
-    };
-
-    let plans = ColumnPlan::build_plans(metadata, col_indices, endian, missing_string_as_null);
-
-    for _ in 0..count {
-        if let Some(row_bytes) = data_reader.read_row_borrowed()? {
-            builder.add_row_raw(row_bytes, &plans);
-        } else {
-            break;
-        }
-    }
-    builder.build()
-}
-
-fn read_batch_selected_profiled(
-    path: &Path,
-    header: &Header,
-    metadata: &Metadata,
-    endian: Endian,
-    format: Format,
-    skip: usize,
-    count: usize,
-    col_indices: Option<&[usize]>,
-    missing_string_as_null: bool,
-    initial_data_subheaders: &[DataSubheader],
-) -> Result<(DataFrame, ReadProfile)> {
-    let total_start = Instant::now();
-    let mut file = BufReader::new(File::open(path)?);
-    file.seek(SeekFrom::Start(header.header_length as u64))?;
-
-    let page_reader = PageReader::new(file, header.clone(), endian, format);
-    let mut data_reader = DataReader::new(
-        page_reader,
-        metadata.clone(),
-        endian,
-        format,
-        initial_data_subheaders.to_vec(),
-    )?;
-
-    data_reader.skip_rows(skip)?;
-
-    let mut builder = match col_indices {
-        Some(idx) => DataFrameBuilder::new_with_columns(metadata, idx, count),
-        None => DataFrameBuilder::new(metadata.clone(), count),
-    };
-
-    let plans = ColumnPlan::build_plans(metadata, col_indices, endian, missing_string_as_null);
-
-    let parse_start = Instant::now();
-    let parse_values_ms = 0.0f64;
-    let add_row_ms = 0.0f64;
-    for _ in 0..count {
-        if let Some(row_bytes) = data_reader.read_row_borrowed()? {
-            builder.add_row_raw(row_bytes, &plans);
-        } else {
-            break;
-        }
-    }
-    let parse_rows_ms = parse_start.elapsed().as_secs_f64() * 1000.0;
-
-    let build_start = Instant::now();
-    let df = builder.build()?;
-    let build_df_ms = build_start.elapsed().as_secs_f64() * 1000.0;
-
-    let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
-    Ok((
-        df,
-        ReadProfile {
-            parse_rows_ms,
-            parse_values_ms,
-            add_row_ms,
-            build_df_ms,
-            total_ms,
-        },
-    ))
 }
 
 /// Build a page index analytically — zero I/O, pure arithmetic from header/metadata.
@@ -654,52 +359,60 @@ fn read_first_data_page_block_count(
     Ok(block_count as usize)
 }
 
-/// Read a batch of rows using the page index for direct seeking.
-/// Instead of skip_rows (which reads through all preceding pages),
-/// this seeks directly to the page containing the target row.
-/// Falls back to skip_rows if target_row falls in the MIX-data prefix
-/// (i.e., before the first DATA page in the index).
-pub(crate) fn read_batch_with_page_index(
+/// Create a DataReader positioned at `target_row` using the page index when possible.
+/// Falls back to the sequential skip_rows path when the target row is in the MIX prefix.
+pub(crate) fn data_reader_at_row(
     path: &Path,
     header: &Header,
     metadata: &Metadata,
     endian: Endian,
     format: Format,
     target_row: usize,
-    count: usize,
-    col_indices: Option<&[usize]>,
-    missing_string_as_null: bool,
+    initial_data_subheaders: &[DataSubheader],
     page_index: &[DataPageEntry],
-) -> Result<DataFrame> {
-    // Binary search for the DATA page containing target_row.
+) -> Result<DataReader<BufReader<File>>> {
+    if target_row >= metadata.row_count {
+        // Construct a reader at EOF (caller should handle empty range).
+        let mut file = BufReader::new(File::open(path)?);
+        file.seek(SeekFrom::Start(header.header_length as u64))?;
+        let page_reader = PageReader::new(file, header.clone(), endian, format);
+        let mut data_reader = DataReader::new(
+            page_reader,
+            metadata.clone(),
+            endian,
+            format,
+            initial_data_subheaders.to_vec(),
+        )?;
+        data_reader.set_current_row(metadata.row_count);
+        return Ok(data_reader);
+    }
+
     let page_idx = page_index
         .partition_point(|p| p.row_start + p.row_count <= target_row);
 
-    // If the target row falls before the first DATA-page entry (i.e., in the
-    // MIX-data prefix) or the index is empty, fall back to the sequential
-    // skip_rows path which handles MIX pages correctly.
     let use_index = page_idx < page_index.len()
         && target_row >= page_index.first().map_or(0, |e| e.row_start);
 
     if !use_index {
-        return read_batch_selected(
-            path,
-            header,
-            metadata,
+        let mut file = BufReader::new(File::open(path)?);
+        file.seek(SeekFrom::Start(header.header_length as u64))?;
+        let page_reader = PageReader::new(file, header.clone(), endian, format);
+        let mut data_reader = DataReader::new(
+            page_reader,
+            metadata.clone(),
             endian,
             format,
-            target_row,
-            count,
-            col_indices,
-            missing_string_as_null,
-            &[],
-        );
+            initial_data_subheaders.to_vec(),
+        )?;
+        if target_row > 0 {
+            data_reader.skip_rows(target_row)?;
+        }
+        return Ok(data_reader);
     }
 
     let entry = &page_index[page_idx];
     let within_page_skip = target_row - entry.row_start;
 
-    // Seek directly to the target page
     let page_byte_offset =
         header.header_length as u64 + (entry.page_number as u64 * header.page_length as u64);
     let mut file = BufReader::new(File::open(path)?);
@@ -711,30 +424,14 @@ pub(crate) fn read_batch_with_page_index(
         metadata.clone(),
         endian,
         format,
-        Vec::new(), // seeked past metadata, no initial data subheaders
+        Vec::new(),
     )?;
 
-    // Set current_row so the row-count guard fires at the right place
     data_reader.set_current_row(entry.row_start);
-
-    // Skip only within-page rows (no page reads needed)
-    data_reader.skip_rows(within_page_skip)?;
-
-    let mut builder = match col_indices {
-        Some(idx) => DataFrameBuilder::new_with_columns(metadata, idx, count),
-        None => DataFrameBuilder::new(metadata.clone(), count),
-    };
-
-    let plans = ColumnPlan::build_plans(metadata, col_indices, endian, missing_string_as_null);
-
-    for _ in 0..count {
-        if let Some(row_bytes) = data_reader.read_row_borrowed()? {
-            builder.add_row_raw(row_bytes, &plans);
-        } else {
-            break;
-        }
+    if within_page_skip > 0 {
+        data_reader.skip_rows(within_page_skip)?;
     }
-    builder.build()
+    Ok(data_reader)
 }
 
 fn resolve_column_indices(
@@ -757,17 +454,6 @@ fn resolve_column_indices(
                 .collect()
         })
         .transpose()
-}
-
-fn combine_dataframes(mut dfs: Vec<DataFrame>) -> Result<DataFrame> {
-    if dfs.is_empty() {
-        return Ok(DataFrame::empty());
-    }
-    let mut main_df = dfs.remove(0);
-    for df in dfs {
-        main_df.vstack_mut(&df)?;
-    }
-    Ok(main_df)
 }
 
 fn cast_dataframe(mut df: DataFrame, schema: &Schema) -> Result<DataFrame> {

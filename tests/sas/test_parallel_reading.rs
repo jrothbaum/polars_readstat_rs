@@ -27,18 +27,10 @@ fn test_parallel_vs_sequential_reading() {
         .finish()
         .expect("Failed to read (sequential)");
 
-    // 3. Read using Pipeline explicitly
-    let df_pipeline = reader.read()
-        .pipeline()
-        .with_limit(limit)
-        .finish()
-        .expect("Failed to read (pipeline)");
-
-    // Verify all strategies produce the same results
+    // Verify both strategies produce the same results
     assert_eq!(df_parallel.shape(), df_sequential.shape(), "Parallel vs Sequential shape mismatch");
-    assert_eq!(df_parallel.shape(), df_pipeline.shape(), "Parallel vs Pipeline shape mismatch");
 
-    println!("\n✓ Test passed: All reading strategies (Parallel, Sequential, Pipeline) are consistent");
+    println!("\n✓ Test passed: Parallel and Sequential paths are consistent");
 }
 
 #[test]

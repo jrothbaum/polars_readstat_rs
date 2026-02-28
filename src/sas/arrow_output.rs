@@ -99,7 +99,9 @@ pub fn read_to_arrow_stream_ffi(
         missing_string_as_null,
         Some(batch_size),
         None,
+        0,
         None,
+        opts.preserve_order.unwrap_or(false),
         None,
     )?;
     let iter = Box::new(std::iter::from_fn(move || {

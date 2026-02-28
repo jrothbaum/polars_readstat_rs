@@ -22,8 +22,9 @@ fn test_file(path: &Path) -> Result<(), String> {
     file.seek(SeekFrom::Start(header.header_length as u64))
         .map_err(|e| format!("Failed to seek: {}", e))?;
 
-    let (metadata, _data_subheaders) = read_metadata(file, &header, endian, format)
-        .map_err(|e| format!("read_metadata failed: {}", e))?;
+    let (metadata, _data_subheaders, _first_data_page, _mix_data_rows) =
+        read_metadata(file, &header, endian, format)
+            .map_err(|e| format!("read_metadata failed: {}", e))?;
 
     // Basic validation
     if metadata.row_count == 0 {

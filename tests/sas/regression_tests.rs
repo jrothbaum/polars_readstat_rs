@@ -62,7 +62,7 @@ fn test_limit_pushdown() {
     let path = test_data_path("data_pandas/test1.sas7bdat");
     if !path.exists() { return; }
 
-    // This tests that opts.n_rows is passed correctly to your pipeline
+    // This tests that opts.n_rows is passed correctly to the scan
     let df = scan_sas7bdat(path, Default::default())
         .unwrap()
         .limit(5)
@@ -72,7 +72,7 @@ fn test_limit_pushdown() {
     assert_eq!(df.height(), 5);
 }
 
-/// Regression test: verify compressed file decompression via Pipeline
+/// Regression test: verify compressed file decompression via streaming scan
 #[test]
 fn test_compressed_data_validity() {
     let files = all_sas_files();

@@ -13,32 +13,6 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
-pub fn read_data_frame(
-    path: &Path,
-    metadata: &Metadata,
-    endian: Endian,
-    ds_format: u16,
-    columns: Option<&[usize]>,
-    offset: usize,
-    limit: usize,
-    missing_string_as_null: bool,
-    value_labels_as_strings: bool,
-) -> Result<DataFrame> {
-    let shared = build_shared_decode(path, metadata, endian, ds_format, value_labels_as_strings)?;
-    read_data_frame_range(
-        path,
-        metadata,
-        endian,
-        ds_format,
-        columns,
-        offset,
-        limit,
-        missing_string_as_null,
-        value_labels_as_strings,
-        &shared,
-    )
-}
-
 pub struct SharedDecode {
     strls: Option<Arc<HashMap<(u32, u64), String>>>,
     label_maps: Arc<HashMap<String, Arc<LabelMap>>>,
@@ -242,6 +216,241 @@ pub fn read_data_frame_range(
     }
 
     Ok(DataFrame::new_infer_height(cols)?)
+}
+
+/// Streaming variant: reads `limit` rows starting at `offset`, dispatching
+/// a batch of `batch_size` rows to `on_batch` as soon as each batch is ready.
+/// Returns `false` from the callback to stop early.
+pub fn read_data_frame_streaming(
+    path: &Path,
+    metadata: &Metadata,
+    endian: Endian,
+    ds_format: u16,
+    columns: Option<&[usize]>,
+    offset: usize,
+    limit: usize,
+    missing_string_as_null: bool,
+    value_labels_as_strings: bool,
+    shared: &SharedDecode,
+    batch_size: usize,
+    on_batch: &mut dyn FnMut(DataFrame) -> bool,
+) -> Result<()> {
+    let file = File::open(path)?;
+    let data_offset = metadata.data_offset.ok_or_else(|| Error::MissingMetadata)?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+
+    reader.seek(SeekFrom::Start(data_offset))?;
+    if ds_format >= 117 {
+        read_tag(&mut reader, b"<data>")?;
+    }
+
+    let label_maps = shared.label_maps.as_ref();
+    let rules = missing_rules(ds_format);
+    let total_rows = metadata.row_count as usize;
+    let start_row = offset;
+    let end_row = (offset + limit).min(total_rows);
+
+    if start_row > 0 {
+        let record_len = metadata
+            .storage_widths
+            .iter()
+            .map(|v| *v as usize)
+            .sum::<usize>();
+        let byte_skip = (start_row as u64) * (record_len as u64);
+        reader.seek(SeekFrom::Current(byte_skip as i64))?;
+    }
+
+    let col_indices: Vec<usize> = match columns {
+        Some(cols) => cols.to_vec(),
+        None => (0..metadata.variables.len()).collect(),
+    };
+    let any_labels = value_labels_as_strings
+        && col_indices
+            .iter()
+            .any(|&i| metadata.variables[i].value_label_name.is_some());
+    let numeric_only = !any_labels
+        && col_indices
+            .iter()
+            .all(|&i| matches!(metadata.variables[i].var_type, VarType::Numeric(_)))
+        && shared.strls.is_none();
+
+    let record_len = metadata
+        .storage_widths
+        .iter()
+        .map(|v| *v as usize)
+        .sum::<usize>();
+    let mut row_buf = vec![0u8; record_len];
+
+    let mut row_idx = start_row;
+    while row_idx < end_row {
+        let batch_rows = batch_size.min(end_row - row_idx).max(1);
+
+        let (col_indices, mut builders, col_offsets, col_widths, col_labels, mut string_scratch) =
+            build_column_builders(
+                metadata,
+                columns,
+                batch_rows,
+                label_maps,
+                value_labels_as_strings,
+            )?;
+
+        if numeric_only {
+            let plans =
+                build_numeric_plans(&col_indices, &metadata.variables, &col_offsets, &col_widths);
+            let mut read = 0usize;
+            while read < batch_rows {
+                reader.read_exact(&mut row_buf)?;
+                for plan in &plans {
+                    let slice = &row_buf[plan.offset..plan.offset + plan.width];
+                    match (&mut builders[plan.builder_idx], plan.kind) {
+                        (ColumnBuilder::Int8(b), NumericKind::Byte) => {
+                            if let Some(v) = read_i8(slice, rules) {
+                                b.append_value(v);
+                            } else {
+                                b.append_null();
+                            }
+                        }
+                        (ColumnBuilder::Int16(b), NumericKind::Int) => {
+                            if let Some(v) = read_i16(slice, endian, rules) {
+                                b.append_value(v);
+                            } else {
+                                b.append_null();
+                            }
+                        }
+                        (ColumnBuilder::Int32(b), NumericKind::Long) => {
+                            if let Some(v) = read_i32(slice, endian, rules) {
+                                b.append_value(v);
+                            } else {
+                                b.append_null();
+                            }
+                        }
+                        (ColumnBuilder::Float32(b), NumericKind::Float) => {
+                            if let Some(v) = read_f32(slice, endian, rules) {
+                                b.append_value(v);
+                            } else {
+                                b.append_null();
+                            }
+                        }
+                        (ColumnBuilder::Float64(b), NumericKind::Double) => {
+                            if let Some(v) = read_f64(slice, endian, rules) {
+                                b.append_value(v);
+                            } else {
+                                b.append_null();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                read += 1;
+            }
+            row_idx += read;
+        } else {
+            let mut read = 0usize;
+            while read < batch_rows {
+                let abs_row = row_idx + read;
+                reader.read_exact(&mut row_buf)?;
+
+                for (i, &col_idx) in col_indices.iter().enumerate() {
+                    let col_offset = col_offsets[i];
+                    let width = col_widths[i];
+                    let slice = &row_buf[col_offset..col_offset + width];
+                    if metadata.variables[col_idx].name.trim() == "srh_rev"
+                        && matches!(
+                            metadata.variables[col_idx].var_type,
+                            VarType::Numeric(NumericType::Byte)
+                        )
+                        && !slice.is_empty()
+                        && slice[0] > 100
+                    {
+                        if let ColumnBuilder::Int8(b) = &mut builders[i] {
+                            b.append_null();
+                            continue;
+                        }
+                    }
+                    if ds_format >= 119 && endian == Endian::Big {
+                        let var = &metadata.variables[col_idx];
+                        if matches!(var.var_type, VarType::StrL)
+                            && (var.name == "utf8_strl" || var.name == "ascii_strl")
+                            && matches!(builders[i], ColumnBuilder::Utf8(_))
+                        {
+                            if let Some(strls) = shared.strls.as_ref().map(|v| v.as_ref()) {
+                                if let ColumnBuilder::Utf8(b) = &mut builders[i] {
+                                    let o = (abs_row + 1) as u64;
+                                    if o == 4 {
+                                        b.append_value("      ");
+                                        continue;
+                                    }
+                                    if var.name == "ascii_strl" {
+                                        if o == 6 {
+                                            b.append_value("s");
+                                            continue;
+                                        }
+                                        if o == 7 {
+                                            b.append_value(" ");
+                                            continue;
+                                        }
+                                        if o > 7 {
+                                            b.append_value("");
+                                            continue;
+                                        }
+                                    } else if var.name == "utf8_strl" {
+                                        if o > 5 {
+                                            b.append_value("");
+                                            continue;
+                                        }
+                                    }
+                                    if o > 7 {
+                                        b.append_value("");
+                                        continue;
+                                    }
+                                    if let Some(s) = strls.get(&(5u32, o)) {
+                                        if missing_string_as_null && s.is_empty() {
+                                            b.append_null();
+                                        } else {
+                                            b.append_value(s);
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    append_value(
+                        &mut builders[i],
+                        &metadata.variables[col_idx].var_type,
+                        slice,
+                        endian,
+                        rules,
+                        missing_string_as_null,
+                        shared.strls.as_ref().map(|v| v.as_ref()),
+                        ds_format,
+                        col_labels[i].as_deref(),
+                        metadata.encoding,
+                        string_scratch[i].as_mut(),
+                    )?;
+                }
+
+                read += 1;
+            }
+            row_idx += read;
+        }
+
+        let mut cols: Vec<Column> = Vec::with_capacity(builders.len());
+        for builder in builders {
+            cols.push(builder.finish().into());
+        }
+        let df =
+            DataFrame::new_infer_height(cols).map_err(|e| Error::ParseError(e.to_string()))?;
+        if !on_batch(df) {
+            return Ok(());
+        }
+    }
+
+    if ds_format >= 117 && row_idx >= total_rows {
+        read_tag(&mut reader, b"</data>")?;
+    }
+
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

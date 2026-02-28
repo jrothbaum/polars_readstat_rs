@@ -103,6 +103,7 @@ pub fn read_to_arrow_stream_ffi(
         Some(batch_size),
         true,
         None,
+        0,
         None,
         None,
     )?;

@@ -6,7 +6,7 @@ use std::io::{Seek, SeekFrom};
 // Helper to make internal modules accessible for testing
 mod integration {
     use super::*;
-    // We need to manually construct the pipeline since modules aren't public
+    // Manual end-to-end read using internal modules
     #[test]
     fn test_end_to_end_read() {
         let path = "crates/cpp-sas7bdat/vendor/test/data/file1.sas7bdat";
@@ -24,7 +24,8 @@ mod integration {
         // Step 2: Read metadata
         let mut file = File::open(path).expect("Failed to reopen test file");
         file.seek(SeekFrom::Start(header.header_length as u64)).expect("Failed to seek");
-        let (metadata, _data_subheaders) = read_metadata(file, &header, endian, format).expect("Failed to read metadata");
+        let (metadata, _data_subheaders, _first_data_page, _mix_data_rows) =
+            read_metadata(file, &header, endian, format).expect("Failed to read metadata");
 
         println!("\n=== Metadata ===");
         println!("Row count: {}", metadata.row_count);

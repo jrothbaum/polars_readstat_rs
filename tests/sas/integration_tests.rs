@@ -99,7 +99,7 @@ fn test_batch_reading_matches_full_read() {
 }
 
 #[test]
-fn test_parallel_and_pipeline_match() {
+fn test_parallel_and_sequential_match() {
     let test_file = test_data_path("test1.sas7bdat");
     if !test_file.exists() { return; }
 
@@ -112,11 +112,7 @@ fn test_parallel_and_pipeline_match() {
     // 2. Sequential
     let df_seq = reader.read().sequential().with_limit(limit).finish().unwrap();
 
-    // 3. Pipeline
-    let df_pipe = reader.read().pipeline().with_limit(limit).finish().unwrap();
-
     assert_eq!(df_par.height(), df_seq.height());
-    assert_eq!(df_par.height(), df_pipe.height());
 }
 
 #[test]
@@ -149,7 +145,7 @@ fn test_column_selection_builder() {
 }
 
 #[test]
-fn test_large_file_streaming_pipeline() {
+fn test_large_file_streaming_default() {
     let files = all_sas_files();
 
     for file in &files {
@@ -157,16 +153,15 @@ fn test_large_file_streaming_pipeline() {
             if metadata.len() > 100 * 1024 * 1024 && metadata.len() < 1024 * 1024 * 1024 { // 100MB-1GB (skip 11GB+ files)
                 let reader = Sas7bdatReader::open(file).unwrap();
                 
-                // For large files, test the Pipeline with a limit
+                // For large files, test streaming with a limit
                 // This validates the I/O + Worker logic without filling RAM
                 let df = reader.read()
-                    .pipeline()
                     .with_limit(5000)
                     .finish()
                     .unwrap();
 
                 assert_eq!(df.height(), 5000);
-                println!("✓ Pipeline limit test passed for {}", file.display());
+                println!("✓ Streaming limit test passed for {}", file.display());
             }
         }
     }

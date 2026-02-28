@@ -15,7 +15,8 @@ fn test_read_metadata_file1() {
     println!("Dataset: {}, {} rows in {} pages", header.dataset_name, header.page_count, header.page_length);
 
     // Read metadata
-    let (metadata, _data_subheaders) = read_metadata(file, &header, endian, format).expect("Failed to read metadata");
+    let (metadata, _data_subheaders, _first_data_page, _mix_data_rows) =
+        read_metadata(file, &header, endian, format).expect("Failed to read metadata");
 
     println!("\n=== Metadata ===");
     println!("Compression: {:?}", metadata.compression);

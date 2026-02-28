@@ -2,8 +2,8 @@ mod common;
 
 use common::{sas_files, spss_files, stata_files};
 use polars_readstat_rs::{
-    readstat_batch_iter, readstat_metadata_json, readstat_schema, ReadStatFormat, Sas7bdatReader,
-    SpssReader, StataReader,
+    readstat_metadata_json, readstat_schema, ReadStatFormat, Sas7bdatReader, SpssReader,
+    StataReader,
 };
 
 const MAX_ROWS: usize = 100_000;

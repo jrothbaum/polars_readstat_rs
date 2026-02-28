@@ -18,7 +18,6 @@ pub(crate) use sas::decompressor;
 pub(crate) use sas::encoding;
 pub(crate) use sas::error;
 pub(crate) use sas::page;
-pub(crate) use sas::pipeline;
 pub use sas::polars_output as sas_polars_output;
 pub(crate) use sas::polars_output;
 pub(crate) use sas::types;
@@ -51,7 +50,14 @@ pub use stata::{
 };
 
 use polars::prelude::DataFrame;
+use polars_core::POOL;
 use std::path::Path;
+
+pub(crate) fn default_thread_count() -> usize {
+    let polars_threads = POOL.current_num_threads().max(1);
+    let physical = num_cpus::get_physical().max(1);
+    polars_threads.min(physical)
+}
 
 /// Which columns to track informative nulls for.
 #[derive(Debug, Clone)]

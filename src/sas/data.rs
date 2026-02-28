@@ -96,7 +96,7 @@ impl<R: Read + Seek> DataReader<R> {
         self.current_row = row;
     }
 
-    /// Read the next row (allocating). Used by pipeline which needs owned data.
+    /// Read the next row (allocating). Used by streaming paths that need owned data.
     pub fn read_row(&mut self) -> Result<Option<RowBytes>> {
         // Check if we've read all rows
         if self.current_row >= self.metadata.row_count {

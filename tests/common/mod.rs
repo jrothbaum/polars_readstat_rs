@@ -29,6 +29,7 @@ fn collect_files_inner(dir: &Path, exts: &[&str], out: &mut Vec<PathBuf>) {
     }
 }
 
+#[allow(dead_code)]
 pub fn sas_files() -> Vec<PathBuf> {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -37,6 +38,7 @@ pub fn sas_files() -> Vec<PathBuf> {
     collect_files(&base, &["sas7bdat"])
 }
 
+#[allow(dead_code)]
 pub fn stata_files() -> Vec<PathBuf> {
     let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

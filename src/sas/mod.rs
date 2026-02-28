@@ -5,7 +5,6 @@ pub(crate) mod decompressor;
 pub(crate) mod encoding;
 pub(crate) mod error;
 pub(crate) mod page;
-pub(crate) mod pipeline;
 pub mod polars_output;
 pub(crate) mod types;
 pub(crate) mod value;

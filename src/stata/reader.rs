@@ -1,13 +1,8 @@
-use crate::stata::data::{build_shared_decode, read_data_frame, read_data_frame_range, read_data_frame_range_with_indicators};
-use std::collections::HashSet;
 use crate::stata::error::Result;
 use crate::stata::header::read_header;
 use crate::stata::metadata::read_metadata;
-use crate::stata::polars_output::{apply_stata_time_formats, stata_time_format_kind};
 use crate::stata::types::{Header, Metadata};
 use polars::prelude::*;
-use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -88,113 +83,35 @@ impl StataReader {
     }
 
     fn execute_read(&self, _opts: ReadBuilder) -> Result<DataFrame> {
-        let col_indices = resolve_column_indices(&self.metadata, _opts.columns.as_deref())?;
         let limit = _opts
             .limit
             .unwrap_or(self.metadata.row_count.saturating_sub(_opts.offset as u64) as usize);
+        let threads = if _opts.parallel { _opts.num_threads } else { Some(1) };
+        let mut iter = crate::stata::polars_output::stata_batch_iter_with_reader(
+            self,
+            self.path.clone(),
+            threads,
+            _opts.missing_string_as_null,
+            _opts.value_labels_as_strings,
+            _opts.chunk_size,
+            true,
+            _opts.columns,
+            _opts.offset,
+            Some(limit),
+            _opts.informative_nulls.clone(),
+        )
+        .map_err(|e| crate::stata::error::Error::ParseError(e.to_string()))?;
 
-        // Informative nulls: serial path using the indicator-aware reader
-        if let Some(ref null_opts) = _opts.informative_nulls {
-            let var_names: Vec<&str> = self
-                .metadata
-                .variables
-                .iter()
-                .map(|v| v.name.as_str())
-                .collect();
-            let eligible: Vec<&str> = self
-                .metadata
-                .variables
-                .iter()
-                .filter(|v| {
-                    matches!(v.var_type, crate::stata::types::VarType::Numeric(_))
-                })
-                .map(|v| v.name.as_str())
-                .collect();
-            let pairs = crate::informative_null_pairs(&var_names, &eligible, null_opts);
-            crate::check_informative_null_collisions(&var_names, &pairs)?;
-            let suffix = match &null_opts.mode {
-                crate::InformativeNullMode::SeparateColumn { suffix } => suffix.clone(),
-                _ => "_null".to_string(),
-            };
-            let indicator_set: HashSet<String> =
-                pairs.iter().map(|(m, _)| m.clone()).collect();
-            let shared = build_shared_decode(
-                &self.path,
-                &self.metadata,
-                self.header.endian,
-                self.header.version,
-                _opts.value_labels_as_strings,
-            )?;
-            let mut df = read_data_frame_range_with_indicators(
-                &self.path,
-                &self.metadata,
-                self.header.endian,
-                self.header.version,
-                col_indices.as_deref(),
-                _opts.offset,
-                limit,
-                _opts.missing_string_as_null,
-                _opts.value_labels_as_strings,
-                &shared,
-                &indicator_set,
-                null_opts.use_value_labels,
-                &suffix,
-            )?;
-            if df.height() > 0 {
-                let mut formats = Vec::new();
-                for var in &self.metadata.variables {
-                    if let Some(kind) =
-                        stata_time_format_kind(var.format.as_deref(), &var.var_type)
-                    {
-                        formats.push((var.name.clone(), kind));
-                    }
-                }
-                if !formats.is_empty() {
-                    apply_stata_time_formats(&mut df, &formats)?;
-                }
-            }
-            if let Some(schema) = _opts.schema {
-                df = cast_dataframe(df, &schema)?;
-            }
-            df = crate::apply_informative_null_mode(df, &null_opts.mode, &pairs)?;
-            return Ok(df);
-        }
-
-        let mut df = if _opts.parallel && limit > 0 {
-            self.read_parallel(
-                _opts.offset,
-                limit,
-                _opts.num_threads,
-                _opts.chunk_size,
-                col_indices.as_deref(),
-                _opts.missing_string_as_null,
-                _opts.value_labels_as_strings,
-            )?
-        } else {
-            read_data_frame(
-                &self.path,
-                &self.metadata,
-                self.header.endian,
-                self.header.version,
-                col_indices.as_deref(),
-                _opts.offset,
-                limit,
-                _opts.missing_string_as_null,
-                _opts.value_labels_as_strings,
-            )?
-        };
-
-        if df.height() > 0 {
-            let mut formats = Vec::new();
-            for var in &self.metadata.variables {
-                if let Some(kind) = stata_time_format_kind(var.format.as_deref(), &var.var_type) {
-                    formats.push((var.name.clone(), kind));
-                }
-            }
-            if !formats.is_empty() {
-                apply_stata_time_formats(&mut df, &formats)?;
+        let mut df: Option<DataFrame> = None;
+        while let Some(batch) = iter.next() {
+            let batch = batch.map_err(|e| crate::stata::error::Error::ParseError(e.to_string()))?;
+            if let Some(acc) = df.as_mut() {
+                acc.vstack_mut(&batch)?;
+            } else {
+                df = Some(batch);
             }
         }
+        let mut df = df.unwrap_or_else(DataFrame::empty);
 
         if let Some(schema) = _opts.schema {
             df = cast_dataframe(df, &schema)?;
@@ -300,124 +217,6 @@ impl<'a> ReadBuilder<'a> {
     pub fn finish_profiled(self) -> Result<(DataFrame, ReadProfile)> {
         self.reader.execute_read_profiled(self)
     }
-}
-
-impl StataReader {
-    const DEFAULT_CHUNK_SIZE: usize = 100_000;
-
-    fn read_parallel(
-        &self,
-        offset: usize,
-        count: usize,
-        threads: Option<usize>,
-        chunk_size: Option<usize>,
-        cols: Option<&[usize]>,
-        missing_string_as_null: bool,
-        value_labels_as_strings: bool,
-    ) -> Result<DataFrame> {
-        let n_threads = threads.unwrap_or_else(|| {
-            let cur = rayon::current_num_threads();
-            cur.min(4).max(1)
-        });
-        if n_threads <= 1 || count < 1000 {
-            return read_data_frame(
-                &self.path,
-                &self.metadata,
-                self.header.endian,
-                self.header.version,
-                cols,
-                offset,
-                count,
-                missing_string_as_null,
-                value_labels_as_strings,
-            );
-        }
-
-        let mut chunk_size = chunk_size.unwrap_or(Self::DEFAULT_CHUNK_SIZE);
-        if chunk_size < 1_000 {
-            chunk_size = 1_000;
-        }
-        if chunk_size > count {
-            chunk_size = count;
-        }
-        let n_chunks = (count + chunk_size - 1) / chunk_size;
-
-        let shared = build_shared_decode(
-            &self.path,
-            &self.metadata,
-            self.header.endian,
-            self.header.version,
-            value_labels_as_strings,
-        )?;
-        let shared = std::sync::Arc::new(shared);
-
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(n_threads)
-            .build()
-            .map_err(|e| {
-                crate::stata::error::Error::ParseError(format!("thread pool error: {}", e))
-            })?;
-
-        let mut dfs: Vec<(usize, DataFrame)> = pool.install(|| {
-            (0..n_chunks)
-                .into_par_iter()
-                .map(|i| {
-                    let start = offset + i * chunk_size;
-                    let end = (offset + count).min(start + chunk_size);
-                    let cnt = end - start;
-                    read_data_frame_range(
-                        &self.path,
-                        &self.metadata,
-                        self.header.endian,
-                        self.header.version,
-                        cols,
-                        start,
-                        cnt,
-                        missing_string_as_null,
-                        value_labels_as_strings,
-                        &shared,
-                    )
-                    .map(|df| (i, df))
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
-
-        dfs.sort_by_key(|(i, _)| *i);
-        let frames = dfs.into_iter().map(|(_, df)| df).collect::<Vec<_>>();
-        combine_dataframes(frames)
-    }
-}
-
-fn combine_dataframes(mut dfs: Vec<DataFrame>) -> Result<DataFrame> {
-    if dfs.is_empty() {
-        return Ok(DataFrame::empty());
-    }
-    let mut main = dfs.remove(0);
-    for df in dfs {
-        main.vstack_mut(&df)?;
-    }
-    Ok(main)
-}
-
-fn resolve_column_indices(
-    metadata: &Metadata,
-    cols: Option<&[String]>,
-) -> Result<Option<Vec<usize>>> {
-    let Some(cols) = cols else {
-        return Ok(None);
-    };
-    let mut indices = Vec::with_capacity(cols.len());
-    for name in cols {
-        let idx = metadata
-            .variables
-            .iter()
-            .position(|v| v.name == *name)
-            .ok_or_else(|| {
-                crate::stata::error::Error::ParseError(format!("Unknown column: {}", name))
-            })?;
-        indices.push(idx);
-    }
-    Ok(Some(indices))
 }
 
 fn cast_dataframe(mut df: DataFrame, schema: &Schema) -> Result<DataFrame> {

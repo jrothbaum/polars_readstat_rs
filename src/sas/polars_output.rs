@@ -4,7 +4,7 @@ use crate::constants::{
 use crate::error::{Error, Result};
 use crate::data::DataReader;
 use crate::page::PageReader;
-use crate::reader::{compute_page_index, read_batch_with_page_index, Sas7bdatReader};
+use crate::reader::{compute_page_index, data_reader_at_row, Sas7bdatReader};
 use crate::types::{Column as SasColumn, ColumnType, Endian, Format, Header, Metadata};
 use crate::value::Value;
 use polars::prelude::*;
@@ -13,10 +13,11 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+
+const DEFAULT_SAS_BATCH_SIZE: usize = 8192;
 
 /// Build a Polars DataFrame from rows of parsed values
 pub struct DataFrameBuilder {
@@ -87,8 +88,8 @@ enum ColumnBuffer {
 }
 
 impl DataFrameBuilder {
-    pub fn new(metadata: Metadata, capacity: usize) -> Self {
-        let columns_meta = metadata.columns;
+    pub fn new(metadata: &Metadata, capacity: usize) -> Self {
+        let columns_meta = metadata.columns.clone();
         let buffers = columns_meta
             .iter()
             .map(|col| ColumnBuffer::with_capacity(kind_for_column(col), &col.name, capacity))
@@ -375,6 +376,7 @@ pub struct SasScan {
     num_threads: Option<usize>,
     missing_string_as_null: bool,
     chunk_size: Option<usize>,
+    preserve_order: bool,
     compress_opts: crate::CompressOptionsLite,
     informative_nulls: Option<crate::InformativeNullOpts>,
 }
@@ -385,6 +387,7 @@ impl SasScan {
         threads: Option<usize>,
         missing_string_as_null: bool,
         chunk_size: Option<usize>,
+        preserve_order: bool,
         compress_opts: crate::CompressOptionsLite,
         informative_nulls: Option<crate::InformativeNullOpts>,
     ) -> Self {
@@ -393,6 +396,7 @@ impl SasScan {
             num_threads: threads,
             missing_string_as_null,
             chunk_size,
+            preserve_order,
             compress_opts,
             informative_nulls,
         }
@@ -401,18 +405,34 @@ impl SasScan {
 
 enum ChunkMessage {
     Data { idx: usize, df: DataFrame },
-    Done,
-    Err(String),
+    Err { idx: usize, msg: String },
 }
 
 pub(crate) type SasBatchIter = Box<dyn Iterator<Item = PolarsResult<DataFrame>> + Send>;
 
+fn split_batch_ranges(total_batches: usize, n_workers: usize) -> Vec<(usize, usize)> {
+    if total_batches == 0 || n_workers == 0 {
+        return Vec::new();
+    }
+    let n = n_workers.min(total_batches);
+    let base = total_batches / n;
+    let rem = total_batches % n;
+    let mut ranges = Vec::with_capacity(n);
+    let mut start = 0usize;
+    for i in 0..n {
+        let len = base + if i < rem { 1 } else { 0 };
+        ranges.push((start, len));
+        start += len;
+    }
+    ranges
+}
+
 struct ParallelSasBatchIter {
     rx: mpsc::Receiver<ChunkMessage>,
-    buffer: BTreeMap<usize, DataFrame>,
+    preserve_order: bool,
+    buffer: BTreeMap<usize, PolarsResult<DataFrame>>,
     next_idx: usize,
-    completed: usize,
-    total_workers: usize,
+    total_chunks: usize,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -420,27 +440,36 @@ impl Iterator for ParallelSasBatchIter {
     type Item = PolarsResult<DataFrame>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if !self.preserve_order {
+            return match self.rx.recv() {
+                Ok(ChunkMessage::Data { df, .. }) => Some(Ok(df)),
+                Ok(ChunkMessage::Err { msg, .. }) => {
+                    Some(Err(PolarsError::ComputeError(msg.into())))
+                }
+                Err(_) => None,
+            };
+        }
+        if self.next_idx >= self.total_chunks {
+            return None;
+        }
         loop {
-            if let Some(df) = self.buffer.remove(&self.next_idx) {
+            if let Some(item) = self.buffer.remove(&self.next_idx) {
                 self.next_idx += 1;
-                return Some(Ok(df));
+                return Some(item);
             }
-
-            if self.completed == self.total_workers {
-                return None;
-            }
-
             match self.rx.recv() {
                 Ok(ChunkMessage::Data { idx, df }) => {
-                    self.buffer.insert(idx, df);
+                    self.buffer.insert(idx, Ok(df));
                 }
-                Ok(ChunkMessage::Done) => {
-                    self.completed += 1;
-                }
-                Ok(ChunkMessage::Err(e)) => {
-                    return Some(Err(PolarsError::ComputeError(e.into())));
+                Ok(ChunkMessage::Err { idx, msg }) => {
+                    self.buffer
+                        .insert(idx, Err(PolarsError::ComputeError(msg.into())));
                 }
                 Err(_) => {
+                    if let Some(item) = self.buffer.remove(&self.next_idx) {
+                        self.next_idx += 1;
+                        return Some(item);
+                    }
                     return None;
                 }
             }
@@ -602,7 +631,7 @@ impl Iterator for SerialSasBatchIter {
         let take = self.batch_size.min(self.remaining);
         let mut builder = match self.col_indices.as_deref() {
             Some(idx) => DataFrameBuilder::new_with_columns(&self.metadata, idx, take),
-            None => DataFrameBuilder::new(self.metadata.clone(), take),
+            None => DataFrameBuilder::new(&self.metadata, take),
         };
 
         // Set up indicator builders if tracking informative nulls.
@@ -717,15 +746,42 @@ pub(crate) fn sas_batch_iter(
     missing_string_as_null: bool,
     chunk_size: Option<usize>,
     col_indices: Option<Vec<usize>>,
+    offset: usize,
     n_rows: Option<usize>,
+    preserve_order: bool,
     informative_nulls: Option<crate::InformativeNullOpts>,
 ) -> PolarsResult<SasBatchIter> {
     let reader =
         Sas7bdatReader::open(&path).map_err(|e| PolarsError::ComputeError(e.to_string().into()))?;
-    let total = n_rows.unwrap_or(reader.metadata().row_count as usize);
-    let batch_size = chunk_size
-        .unwrap_or(crate::pipeline::DEFAULT_PIPELINE_CHUNK_SIZE)
-        .max(1);
+    sas_batch_iter_with_reader(
+        &reader,
+        path,
+        threads,
+        missing_string_as_null,
+        chunk_size,
+        col_indices,
+        offset,
+        n_rows,
+        preserve_order,
+        informative_nulls,
+    )
+}
+
+pub(crate) fn sas_batch_iter_with_reader(
+    reader: &Sas7bdatReader,
+    path: PathBuf,
+    threads: Option<usize>,
+    missing_string_as_null: bool,
+    chunk_size: Option<usize>,
+    col_indices: Option<Vec<usize>>,
+    offset: usize,
+    n_rows: Option<usize>,
+    preserve_order: bool,
+    informative_nulls: Option<crate::InformativeNullOpts>,
+) -> PolarsResult<SasBatchIter> {
+    let max_rows = reader.metadata().row_count.saturating_sub(offset);
+    let total = n_rows.unwrap_or(max_rows).min(max_rows);
+    let batch_size = chunk_size.unwrap_or(DEFAULT_SAS_BATCH_SIZE).max(1);
     let total_chunks = total.div_ceil(batch_size);
 
     if total_chunks == 0 {
@@ -774,7 +830,7 @@ pub(crate) fn sas_batch_iter(
             total,
             missing_string_as_null,
             Some(null_opts),
-            0,
+            offset,
         )?;
         let (tx, rx) = mpsc::sync_channel::<PolarsResult<DataFrame>>(2);
         let handle = std::thread::spawn(move || {
@@ -792,9 +848,9 @@ pub(crate) fn sas_batch_iter(
         .unwrap_or(1)
         .max(1);
     // Uncompressed SAS is I/O-bound: hyperthreads don't help and cost extra RAM.
-    // Default to physical core count; users can override with `threads` explicitly.
+    // Default to min(Polars thread pool, physical cores); users can override with `threads`.
     let default_threads = if threads.is_none() {
-        num_cpus::get_physical().max(1).min(n_cpus)
+        crate::default_thread_count().min(n_cpus)
     } else {
         n_cpus
     };
@@ -805,13 +861,6 @@ pub(crate) fn sas_batch_iter(
 
     // Use sequential streaming for compressed files or when explicitly single-threaded.
     if reader.metadata().compression != crate::Compression::None || n_workers <= 1 {
-        let col_names: Option<Vec<String>> = col_indices.as_ref().map(|indices| {
-            indices
-                .iter()
-                .map(|&i| reader.metadata().columns[i].name.clone())
-                .collect()
-        });
-        let _ = col_names;
         let header = reader.header().clone();
         let metadata = reader.metadata().clone();
         let endian = reader.endian();
@@ -829,7 +878,7 @@ pub(crate) fn sas_batch_iter(
             total,
             missing_string_as_null,
             None,
-            0,
+            offset,
         )?;
         let (tx, rx) = mpsc::sync_channel::<PolarsResult<DataFrame>>(2);
         let handle = std::thread::spawn(move || {
@@ -848,9 +897,11 @@ pub(crate) fn sas_batch_iter(
     let metadata = Arc::new(reader.metadata().clone());
     let endian = reader.endian();
     let format = reader.format();
+    let initial_data_subheaders = reader.initial_data_subheaders().to_vec();
+
     // Build page index once — pure arithmetic, one 6-byte validation read.
-    // Each worker uses this to seek directly to its target page instead of
-    // calling skip_rows(), which reads through every preceding page (O(n) I/O).
+    // Each worker uses this to seek directly to its first page, then reads
+    // sequentially within its assigned row range.
     let page_index = Arc::new(compute_page_index(
         &path,
         &header,
@@ -862,58 +913,109 @@ pub(crate) fn sas_batch_iter(
     ));
     let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(n_workers);
 
-    // Work-stealing: workers atomically claim the next chunk index.
-    // This bounds the BTreeMap reorder-buffer to at most n_workers entries,
-    // preventing the old fixed-range approach from accumulating O(total_chunks)
-    // out-of-order batches in RAM when workers raced ahead.
-    let next_chunk_counter = Arc::new(AtomicUsize::new(0));
+    // Split total batches into contiguous ranges for sequential per-thread reads.
+    let ranges = split_batch_ranges(total_chunks, n_workers);
 
-    for _ in 0..n_workers {
+    for (batch_start, batch_count) in ranges.into_iter() {
         let tx = tx.clone();
         let path = path.clone();
         let header = header.clone();
         let metadata = metadata.clone();
         let page_index = page_index.clone();
         let col_indices = col_indices.clone();
-        let next_chunk_counter = next_chunk_counter.clone();
+        let initial_data_subheaders = initial_data_subheaders.clone();
         let handle = std::thread::spawn(move || {
-            loop {
-                // Claim the next chunk atomically.
-                let out_idx = next_chunk_counter.fetch_add(1, Ordering::Relaxed);
-                if out_idx >= total_chunks {
+            if batch_count == 0 {
+                return;
+            }
+
+            let start_row = offset + batch_start * batch_size;
+            if start_row >= offset + total {
+                return;
+            }
+            let range_rows = (batch_count * batch_size).min(total - batch_start * batch_size);
+            let mut data_reader = match data_reader_at_row(
+                &path,
+                &header,
+                &metadata,
+                endian,
+                format,
+                start_row,
+                &initial_data_subheaders,
+                &page_index,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(ChunkMessage::Err {
+                        idx: batch_start,
+                        msg: e.to_string(),
+                    });
+                    return;
+                }
+            };
+
+            let plans = ColumnPlan::build_plans(
+                &metadata,
+                col_indices.as_deref(),
+                endian,
+                missing_string_as_null,
+            );
+
+            let mut remaining = range_rows;
+            let mut local_idx = 0usize;
+            while remaining > 0 {
+                let take = batch_size.min(remaining);
+                let mut builder = match col_indices.as_deref() {
+                    Some(idx) => DataFrameBuilder::new_with_columns(&metadata, idx, take),
+                    None => DataFrameBuilder::new(metadata.as_ref(), take),
+                };
+
+                let mut read = 0usize;
+                while read < take {
+                    match data_reader.read_row_borrowed() {
+                        Ok(Some(row_bytes)) => {
+                            builder.add_row_raw(row_bytes, &plans);
+                            read += 1;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = tx.send(ChunkMessage::Err {
+                                idx: batch_start + local_idx,
+                                msg: e.to_string(),
+                            });
+                            return;
+                        }
+                    }
+                }
+
+                if read == 0 {
                     break;
                 }
-                let start_row = out_idx * batch_size;
-                if start_row >= total {
-                    break;
-                }
-                let count = min(batch_size, total - start_row);
-                // Direct page seek: O(1) file seek regardless of start_row.
-                let result = read_batch_with_page_index(
-                    &path,
-                    &header,
-                    &metadata,
-                    endian,
-                    format,
-                    start_row,
-                    count,
-                    col_indices.as_deref(),
-                    missing_string_as_null,
-                    &page_index,
-                );
-                match result {
+
+                match builder.build() {
                     Ok(df) => {
-                        if tx.send(ChunkMessage::Data { idx: out_idx, df }).is_err() {
+                        if tx
+                            .send(ChunkMessage::Data {
+                                idx: batch_start + local_idx,
+                                df,
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(ChunkMessage::Err(e.to_string()));
+                        let _ = tx.send(ChunkMessage::Err {
+                            idx: batch_start + local_idx,
+                            msg: e.to_string(),
+                        });
                         return;
                     }
                 }
+
+                local_idx += 1;
+                remaining -= read;
             }
-            let _ = tx.send(ChunkMessage::Done);
         });
         handles.push(handle);
     }
@@ -921,10 +1023,10 @@ pub(crate) fn sas_batch_iter(
 
     Ok(Box::new(ParallelSasBatchIter {
         rx,
+        preserve_order,
         buffer: BTreeMap::new(),
         next_idx: 0,
-        completed: 0,
-        total_workers: n_workers,
+        total_chunks,
         handles,
     }))
 }
@@ -959,13 +1061,16 @@ impl AnonymousScan for SasScan {
             None
         };
 
-        let iter = sas_batch_iter(
+        let iter = sas_batch_iter_with_reader(
+            &reader,
             self.path.clone(),
             self.num_threads,
             self.missing_string_as_null,
             self.chunk_size,
             col_indices,
+            0,
             opts.n_rows,
+            self.preserve_order,
             self.informative_nulls.clone(),
         )?;
 
@@ -1086,6 +1191,7 @@ pub fn scan_sas7bdat(
         opts.threads,
         missing_string_as_null,
         opts.chunk_size,
+        opts.preserve_order.unwrap_or(false),
         opts.compress_opts,
         opts.informative_nulls,
     ));
@@ -1121,8 +1227,18 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let mut iter =
-            sas_batch_iter(path, None, true, Some(10), None, Some(25), None).expect("batch iter");
+        let mut iter = sas_batch_iter(
+            path,
+            None,
+            true,
+            Some(10),
+            None,
+            0,
+            Some(25),
+            true,
+            None,
+        )
+        .expect("batch iter");
         let mut batches = 0usize;
         let mut rows = 0usize;
         while let Some(batch) = iter.next() {

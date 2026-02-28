@@ -2,6 +2,7 @@ use crate::buffer::Buffer;
 use crate::constants::*;
 use crate::encoding;
 use crate::error::{Error, Result};
+use crate::data::DataSubheader;
 use crate::page::{PageHeader, PageReader, PageSubheader};
 use crate::types::{Column, ColumnType, Compression, Endian, Format, Header, Metadata};
 use std::io::{Read, Seek};
@@ -102,8 +103,6 @@ fn is_metadata_page(page_header: &PageHeader) -> bool {
     )
 }
 
-use crate::data::DataSubheader;
-
 /// Helper struct for building metadata incrementally
 struct MetadataBuilder {
     encoding: &'static encoding_rs::Encoding,
@@ -112,17 +111,17 @@ struct MetadataBuilder {
     row_length: Option<usize>,
     mix_page_row_count: Option<usize>,
     column_count: Option<usize>,
+    col_count_p1: Option<usize>,
+    col_count_p2: Option<usize>,
     compression: Compression,
-    columns: Vec<ColumnBuilder>,
     creator: String,
     creator_proc: String,
     lcs: usize, // length of creator string (from row_size subheader)
     lcp: usize, // length of creator_proc string (from row_size subheader)
     column_texts: Vec<Vec<u8>>, // Keep as bytes to preserve offset indexing
-    next_column_name_position: usize, // Track position across multiple COLUMN_NAME subheaders
-    next_column_attributes_position: usize, // Track position across multiple COLUMN_ATTRIBUTES subheaders
-    next_format_label_position: usize, // Track position across multiple FORMAT_AND_LABEL subheaders
-    data_subheaders: Vec<DataSubheader>, // Data subheaders collected during metadata reading
+    column_name_entries: Vec<ColumnNameEntry>,
+    column_attr_entries: Vec<ColumnAttrEntry>,
+    format_label_entries: Vec<ColumnFormatLabelEntry>,
 }
 
 #[derive(Default, Clone)]
@@ -135,6 +134,30 @@ struct ColumnBuilder {
     length: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ColumnNameEntry {
+    text_idx: usize,
+    offset: usize,
+    length: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ColumnAttrEntry {
+    offset: usize,
+    length: usize,
+    col_type: ColumnType,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ColumnFormatLabelEntry {
+    format_idx: usize,
+    format_offset: usize,
+    format_length: usize,
+    label_idx: usize,
+    label_offset: usize,
+    label_length: usize,
+}
+
 impl MetadataBuilder {
     fn new(encoding_byte: u8) -> Self {
         Self {
@@ -144,29 +167,18 @@ impl MetadataBuilder {
             row_length: None,
             mix_page_row_count: None,
             column_count: None,
+            col_count_p1: None,
+            col_count_p2: None,
             compression: Compression::None,
-            columns: Vec::new(),
             creator: String::new(),
             creator_proc: String::new(),
             lcs: 0,
             lcp: 0,
             column_texts: Vec::new(),
-            next_column_name_position: 0,
-            next_column_attributes_position: 0,
-            next_format_label_position: 0,
-            data_subheaders: Vec::new(),
+            column_name_entries: Vec::new(),
+            column_attr_entries: Vec::new(),
+            format_label_entries: Vec::new(),
         }
-    }
-
-    /// Check if a subheader is a data subheader (matches C++ DataSubHeader::check)
-    fn is_data_subheader(&self, subheader: &PageSubheader) -> bool {
-        // Data subheaders have:
-        // 1. compression != none (file must be compressed)
-        // 2. subheader.compression == 4 (compressed) - exclude compression=0 as those are metadata/padding
-        // 3. subheader.type == 1
-        self.compression != Compression::None
-            && subheader.compression == 4  // Only accept compressed=4, not 0
-            && subheader.subheader_type == 1
     }
 
     fn process_subheader(
@@ -194,13 +206,6 @@ impl MetadataBuilder {
             self.process_column_attributes_subheader(buf, subheader, format)?;
         } else if matches_signature(signature, &get_format_and_label_signatures(format)) {
             self.process_format_and_label_subheader(buf, subheader, format)?;
-        } else if self.is_data_subheader(subheader) {
-            // Collect data subheaders during metadata reading (matching C++ behavior)
-            self.data_subheaders.push(DataSubheader {
-                offset: subheader.offset,
-                length: subheader.length,
-                compression: subheader.compression,
-            });
         }
 
         Ok(())
@@ -225,8 +230,10 @@ impl MetadataBuilder {
         let row_count = buf.get_integer(offset + 6 * integer_size, format)? as usize;
         self.row_count = Some(row_count);
 
-        let _col_count_p1 = buf.get_integer(offset + 9 * integer_size, format)? as usize;
-        let _col_count_p2 = buf.get_integer(offset + 10 * integer_size, format)? as usize;
+        let col_count_p1 = buf.get_integer(offset + 9 * integer_size, format)? as usize;
+        let col_count_p2 = buf.get_integer(offset + 10 * integer_size, format)? as usize;
+        self.col_count_p1 = Some(col_count_p1);
+        self.col_count_p2 = Some(col_count_p2);
         let mix_page_row_count = buf.get_integer(offset + 15 * integer_size, format)? as usize;
         self.mix_page_row_count = Some(mix_page_row_count);
 
@@ -263,15 +270,7 @@ impl MetadataBuilder {
 
         // C++ code: buf.get_uinteger(_subheader.offset + integer_size)
         let column_count = buf.get_integer(offset + integer_size, format)? as usize;
-
-        // C++ code always updates column_count (no if check)
-        // Initialize columns vector if not already done
-        if self.columns.is_empty() || self.columns.len() != column_count {
-            self.column_count = Some(column_count);
-            self.columns = vec![ColumnBuilder::default(); column_count];
-        } else {
-            self.column_count = Some(column_count);
-        }
+        self.column_count = Some(column_count);
 
         Ok(())
     }
@@ -291,7 +290,7 @@ impl MetadataBuilder {
         // Length is at offset + integer_size (2 bytes)
         let text_block_size = buf.get_u16(offset + integer_size)? as usize;
 
-        if text_block_size > 0 && text_block_size < subheader.length {
+        if text_block_size > 0 {
             // Text starts at offset + integer_size and is text_block_size bytes long
             let text_offset = offset + integer_size;
             let text_bytes = buf.get_bytes(text_offset, text_block_size)?;
@@ -374,16 +373,12 @@ impl MetadataBuilder {
             let name_offset = buf.get_u16(entry_offset + 2)? as usize;
             let name_len = buf.get_u16(entry_offset + 4)? as usize;
 
-            if name_len > 0 {
-                // Extract name from column_texts[text_idx]
-                let name = self.extract_text_from_text_block(text_idx, name_offset, name_len)?;
-
-                // Assign names sequentially across all COLUMN_NAME subheaders
-                if self.next_column_name_position < self.columns.len() {
-                    self.columns[self.next_column_name_position].name = name;
-                    self.next_column_name_position += 1;
-                }
-            }
+            // Keep entry order even when name_len is 0 to preserve column alignment
+            self.column_name_entries.push(ColumnNameEntry {
+                text_idx,
+                offset: name_offset,
+                length: name_len,
+            });
 
             entry_offset += 8; // Fixed 8-byte increment
         }
@@ -418,13 +413,11 @@ impl MetadataBuilder {
                 ColumnType::Character
             };
 
-            if self.next_column_attributes_position < self.columns.len() {
-                let idx = self.next_column_attributes_position;
-                self.columns[idx].offset = col_offset;
-                self.columns[idx].length = col_length;
-                self.columns[idx].col_type = col_type;
-                self.next_column_attributes_position += 1;
-            }
+            self.column_attr_entries.push(ColumnAttrEntry {
+                offset: col_offset,
+                length: col_length,
+                col_type,
+            });
 
             entry_offset += integer_size + 8; // Format-dependent increment
         }
@@ -456,20 +449,72 @@ impl MetadataBuilder {
         let label_offset = buf.get_u16(base_offset + 30)? as usize;
         let label_length = buf.get_u16(base_offset + 32)? as usize;
 
-        // Extract format and label strings from text blocks
-        let column_format =
-            self.extract_text_from_text_block(format_idx, format_offset, format_length)?;
-        let column_label =
-            self.extract_text_from_text_block(label_idx, label_offset, label_length)?;
-
-        // Assign to the next column sequentially
-        if self.next_format_label_position < self.columns.len() {
-            self.columns[self.next_format_label_position].format = column_format;
-            self.columns[self.next_format_label_position].label = column_label;
-            self.next_format_label_position += 1;
-        }
+        self.format_label_entries.push(ColumnFormatLabelEntry {
+            format_idx,
+            format_offset,
+            format_length,
+            label_idx,
+            label_offset,
+            label_length,
+        });
 
         Ok(())
+    }
+
+    fn resolve_column_count(&self) -> Option<usize> {
+        if let Some(count) = self.column_count {
+            return Some(count);
+        }
+        if let (Some(p1), Some(p2)) = (self.col_count_p1, self.col_count_p2) {
+            return Some(p1 + p2);
+        }
+        let derived = self
+            .column_name_entries
+            .len()
+            .max(self.column_attr_entries.len())
+            .max(self.format_label_entries.len());
+        if derived > 0 {
+            Some(derived)
+        } else {
+            None
+        }
+    }
+
+    fn trim_column_text_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0usize;
+        let mut end = bytes.len();
+
+        // Trim leading ASCII whitespace (only for bytes <= 0x7F)
+        while start < end {
+            let b = bytes[start];
+            if b <= 0x7F && (b as char).is_ascii_whitespace() {
+                start += 1;
+            } else {
+                break;
+            }
+        }
+
+        // Trim trailing ASCII whitespace (only for bytes <= 0x7F)
+        while end > start {
+            let b = bytes[end - 1];
+            if b <= 0x7F && (b as char).is_ascii_whitespace() {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        // Trim trailing non-printable ASCII (includes NULs)
+        while end > start {
+            let b = bytes[end - 1];
+            if b < 32 {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+
+        &bytes[start..end]
     }
 
     fn extract_text_from_text_block(
@@ -478,51 +523,73 @@ impl MetadataBuilder {
         offset: usize,
         length: usize,
     ) -> Result<String> {
-        // C++ code: get_column_text_substr uses text_idx to index into column_texts
-        if text_idx < self.column_texts.len() {
-            let text_bytes = &self.column_texts[text_idx];
-            let text_len = text_bytes.len();
-
-            // Bounds check
-            let offset = offset.min(text_len);
-            let length = length.min(text_len - offset);
-
-            if length == 0 {
-                return Ok(String::new());
-            }
-
-            let extracted_bytes = &text_bytes[offset..offset + length];
-
-            // Decode using the file's encoding
-            let decoded =
-                encoding::decode_string(extracted_bytes, self.encoding_byte, self.encoding);
-
-            // Trim whitespace and unprintable characters
-            Ok(decoded.trim().to_string())
-        } else {
-            Ok(String::new())
+        // C++ code: get_column_text_substr uses text_idx to index into column_texts,
+        // and falls back to the last block if idx is out of range.
+        if self.column_texts.is_empty() {
+            return Ok(String::new());
         }
+        let idx = if text_idx < self.column_texts.len() {
+            text_idx
+        } else {
+            self.column_texts.len().saturating_sub(1)
+        };
+        let text_bytes = &self.column_texts[idx];
+        let text_len = text_bytes.len();
+
+        // Bounds check
+        let offset = offset.min(text_len);
+        let length = length.min(text_len.saturating_sub(offset));
+
+        if length == 0 {
+            return Ok(String::new());
+        }
+
+        let extracted_bytes = &text_bytes[offset..offset + length];
+        let trimmed_bytes = Self::trim_column_text_bytes(extracted_bytes);
+        if trimmed_bytes.is_empty() {
+            return Ok(String::new());
+        }
+
+        // Decode using the file's encoding
+        let decoded = encoding::decode_string(trimmed_bytes, self.encoding_byte, self.encoding);
+        Ok(decoded)
     }
 
     fn build(self) -> Result<Metadata> {
         let row_count = self.row_count.ok_or(Error::MissingMetadata)?;
         let row_length = self.row_length.ok_or(Error::MissingMetadata)?;
-        let column_count = self.column_count.ok_or(Error::MissingMetadata)?;
+        let column_count = self.resolve_column_count().ok_or(Error::MissingMetadata)?;
         let mix_page_row_count = self.mix_page_row_count.unwrap_or(row_count);
 
-        // Check for empty column names and return error if found
-        let empty_count = self.columns.iter().filter(|c| c.name.is_empty()).count();
-        if empty_count > 0 {
-            return Err(Error::ParseError(format!(
-                "Failed to parse column names: {} of {} columns have empty names. \
-                 This indicates missing or incorrectly parsed COLUMN_NAME subheaders.",
-                empty_count,
-                self.columns.len()
-            )));
+        let mut columns = vec![ColumnBuilder::default(); column_count];
+
+        for (idx, entry) in self.column_name_entries.iter().enumerate().take(column_count) {
+            let name = self.extract_text_from_text_block(entry.text_idx, entry.offset, entry.length)?;
+            columns[idx].name = name;
         }
 
-        let columns = self
-            .columns
+        for (idx, entry) in self.column_attr_entries.iter().enumerate().take(column_count) {
+            columns[idx].offset = entry.offset;
+            columns[idx].length = entry.length;
+            columns[idx].col_type = entry.col_type;
+        }
+
+        for (idx, entry) in self.format_label_entries.iter().enumerate().take(column_count) {
+            let format = self.extract_text_from_text_block(
+                entry.format_idx,
+                entry.format_offset,
+                entry.format_length,
+            )?;
+            let label = self.extract_text_from_text_block(
+                entry.label_idx,
+                entry.label_offset,
+                entry.label_length,
+            )?;
+            columns[idx].format = format;
+            columns[idx].label = label;
+        }
+
+        let columns = columns
             .into_iter()
             .map(|cb| Column {
                 name: cb.name,

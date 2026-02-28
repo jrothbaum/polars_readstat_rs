@@ -29,7 +29,7 @@ fn main() {
     // Pipeline read
     let start = Instant::now();
     let reader = Sas7bdatReader::open(&path).expect("Failed to open");
-    let df = reader.read().pipeline().finish().expect("Failed to read");
+    let df = reader.read().finish().expect("Failed to read");
     let elapsed = start.elapsed();
     println!("Pipeline:   {rows} rows x {cols} cols in {:.3}s ({} df rows)", elapsed.as_secs_f64(), df.height());
 }

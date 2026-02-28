@@ -72,34 +72,6 @@ pub(crate) fn profile_print() {
     );
 }
 
-pub fn read_data_frame(
-    path: &Path,
-    metadata: &Metadata,
-    endian: Endian,
-    compression: i32,
-    bias: f64,
-    columns: Option<&[usize]>,
-    offset: usize,
-    limit: usize,
-    missing_string_as_null: bool,
-    value_labels_as_strings: bool,
-) -> Result<DataFrame> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
-    read_data_frame_with_reader(
-        &mut reader,
-        metadata,
-        endian,
-        compression,
-        bias,
-        columns,
-        offset,
-        limit,
-        missing_string_as_null,
-        value_labels_as_strings,
-    )
-}
-
 /// Streaming variant: reads `limit` rows starting at `offset`, dispatching
 /// a batch of `batch_size` rows to `on_batch` as soon as each batch is ready.
 /// Returns `false` from the callback to stop early.
@@ -495,6 +467,7 @@ pub fn read_data_frame_with_reader(
     DataFrame::new_infer_height(cols).map_err(|e| Error::ParseError(e.to_string()))
 }
 
+#[allow(dead_code)]
 pub fn read_data_columns_uncompressed(
     path: &Path,
     metadata: &Metadata,

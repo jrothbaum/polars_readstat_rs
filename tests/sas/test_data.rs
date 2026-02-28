@@ -21,7 +21,8 @@ fn test_read_data_file1() {
     let mut file = File::open(path).expect("Failed to reopen test file");
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(header.header_length as u64)).expect("Failed to seek");
-    let (metadata, _data_subheaders) = read_metadata(file, &header, endian, format).expect("Failed to read metadata");
+    let (metadata, _data_subheaders, _first_data_page, _mix_data_rows) =
+        read_metadata(file, &header, endian, format).expect("Failed to read metadata");
 
     println!("\n=== Metadata ===");
     println!("Row count: {}", metadata.row_count);

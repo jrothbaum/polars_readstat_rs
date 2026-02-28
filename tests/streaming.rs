@@ -101,8 +101,8 @@ fn test_sas_psam_multithread_benchmark() {
         return;
     }
 
-    let n_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let all_cpus_label = format!("{} threads (all CPUs)", n_cpus);
+    let n_cpus = num_cpus::get_physical().max(1);
+    let all_cpus_label = format!("{} threads (physical)", n_cpus);
     let configs: Vec<(&str, Option<usize>)> = vec![
         ("1 thread", Some(1)),
         ("2 threads", Some(2)),
@@ -206,12 +206,13 @@ fn test_sas_pu2023_stream_discard() {
     const PU_ROWS: usize = 476_744;
 
     let n_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let all_cpus_label = format!("{} threads (all CPUs)", n_cpus);
+    let capped_cpus = n_cpus.min(8);
+    let all_cpus_label = format!("{} threads (physical)", capped_cpus);
     // (label, threads)
     let configs: Vec<(&str, Option<usize>)> = vec![
         ("1 thread", Some(1)),
         ("4 threads", Some(4)),
-        (all_cpus_label.as_str(), Some(n_cpus)),
+        (all_cpus_label.as_str(), Some(capped_cpus)),
     ];
 
     println!(

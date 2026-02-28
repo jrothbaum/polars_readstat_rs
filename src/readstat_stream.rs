@@ -87,7 +87,9 @@ pub fn readstat_batch_iter(
                 missing_string_as_null,
                 chunk_size,
                 col_indices,
+                0,
                 n_rows,
+                preserve_order,
                 opts.informative_nulls.clone(),
             )?;
             Box::new(iter)
@@ -101,6 +103,7 @@ pub fn readstat_batch_iter(
                 chunk_size,
                 preserve_order,
                 columns,
+                0,
                 n_rows,
                 opts.informative_nulls.clone(),
             )?;
@@ -115,6 +118,7 @@ pub fn readstat_batch_iter(
                 chunk_size,
                 preserve_order,
                 columns,
+                0,
                 n_rows,
                 opts.informative_nulls.clone(),
             )?;
