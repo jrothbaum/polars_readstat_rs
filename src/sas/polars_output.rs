@@ -185,8 +185,14 @@ impl DataFrameBuilder {
                         let bytes = &row_bytes[start..end];
                         // Trim trailing spaces and nulls
                         let mut trimmed_end = bytes.len();
-                        while trimmed_end > 0 && (bytes[trimmed_end - 1] == b' ' || bytes[trimmed_end - 1] == 0) {
+                        while trimmed_end > 0
+                            && (bytes[trimmed_end - 1] == b' ' || bytes[trimmed_end - 1] == 0)
+                        {
                             trimmed_end -= 1;
+                        }
+                        // Stop at the first NUL to match ReadStat's C-string behavior
+                        if let Some(pos) = bytes[..trimmed_end].iter().position(|&b| b == 0) {
+                            trimmed_end = pos;
                         }
                         if trimmed_end == 0 {
                             if plan.missing_string_as_null {

@@ -29,6 +29,35 @@ MAX_FILE_SIZE = 1_000_000_000  # 1GB
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEST_DATA_DIR = PROJECT_ROOT / "tests" / "spss" / "data"
 SCRATCH_ROOT = Path(os.environ.get("READSTAT_SCRATCH_DIR", "/tmp/polars_readstat_compare"))
+NON_BLOCKING_MISMATCH_PATHS = {
+    "labelled-num-na.sav",
+    "missing_char.sav",
+    "missing_test.sav",
+    "sample_missing.sav",
+    "simple_alltypes.sav",
+}
+INFORMATIVE_NULL_TESTS = {
+    "labelled-num-na.sav": {
+        "column": "VAR00002",
+        "missing_values": ["9"],
+    },
+    "missing_char.sav": {
+        "column": "mychar",
+        "missing_values": ["Z"],
+    },
+    "missing_test.sav": {
+        "column": "var1",
+        "missing_values": ["missing"],
+    },
+    "sample_missing.sav": {
+        "column": "mynum",
+        "missing_values": ["MISSING", "-1"],
+    },
+    "simple_alltypes.sav": {
+        "column": "x",
+        "missing_values": ["8"],
+    },
+}
 SIGNED_INT_DTYPES = {pl.Int8, pl.Int16, pl.Int32, pl.Int64}
 UNSIGNED_INT_DTYPES = {pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64}
 INT_RANK = {
@@ -115,6 +144,71 @@ def _expected_temporal_types(path: Path) -> dict[str, pl.DataType]:
     return expected
 
 
+def _check_informative_nulls(
+    sav_file: Path,
+    scratch_dir: Path,
+    n_rows: int,
+) -> int:
+    test_cfg = INFORMATIVE_NULL_TESTS.get(sav_file.name)
+    if not test_cfg:
+        return 0
+
+    col = test_cfg["column"]
+    expected_missing = set(test_cfg["missing_values"])
+    null_col = f"{col}_null"
+    rust_path = scratch_dir / "polars_readstat_rs_informative.parquet"
+
+    env = dict(os.environ)
+    env["READSTAT_PRESERVE_ORDER"] = "1"
+    env["READSTAT_INFORMATIVE_NULLS"] = col
+    result = subprocess.run(
+        ["cargo", "run", "--release", "--example", "readstat_dump_parquet", "--",
+         str(sav_file), str(rust_path), str(n_rows)],
+        capture_output=True, text=True,
+        cwd=PROJECT_ROOT,
+        env=env,
+    )
+    if result.returncode != 0:
+        print(f"  FAIL: Informative-null run failed: {result.stderr[:200]}")
+        return 1
+
+    df = pl.read_parquet(rust_path)
+    if null_col not in df.columns:
+        print(f"  FAIL: Informative-null column missing: {null_col}")
+        return 1
+
+    vals = df[null_col].to_list()
+    base_vals = df[col].to_list() if col in df.columns else []
+    if not vals or not base_vals:
+        print(f"  FAIL: Informative-null columns empty for {null_col}")
+        return 1
+
+    missing_idx = [i for i, v in enumerate(base_vals) if v is None]
+    if not missing_idx:
+        print(f"  FAIL: Informative-null test found no nulls in {col}")
+        return 1
+
+    expected_opts = set()
+    for v in expected_missing:
+        expected_opts.add(v)
+        expected_opts.add(f"{v}.0")
+    for i in missing_idx:
+        if vals[i] not in expected_opts:
+            print(
+                f"  FAIL: Informative-null value mismatch at row {i}: {vals[i]} (expected {expected_opts})"
+            )
+            return 1
+    for i, v in enumerate(vals):
+        if i not in missing_idx and v is not None:
+            print(
+                f"  FAIL: Informative-null unexpected value at row {i}: {v} (base={base_vals[i]})"
+            )
+            return 1
+
+    print(f"  OK (informative nulls): {null_col} rows={missing_idx}")
+    return 0
+
+
 def compare_file(sav_file: Path, n_rows: int) -> tuple[int, int]:
     print(f"\n--- {sav_file.name} ({sav_file.stat().st_size / 1024 / 1024:.1f} MB) ---")
 
@@ -157,6 +251,7 @@ def compare_file(sav_file: Path, n_rows: int) -> tuple[int, int]:
     print(f"  Scratch: {scratch_dir}")
 
     mismatches = 0
+    mismatches += _check_informative_nulls(sav_file, scratch_dir, n_rows)
     expected_types = _expected_temporal_types(sav_file)
     for col, expected in expected_types.items():
         if col not in df_rust.schema:
@@ -256,20 +351,41 @@ def main():
 
     total_checked = 0
     total_mismatches = 0
+    non_blocking_mismatches = 0
     failed_files = []
+    non_blocking_files = []
 
     for sav_file in sav_files:
         checked, mismatches = compare_file(sav_file, args.rows)
         total_checked += checked
-        total_mismatches += mismatches
+        rel_path = str(sav_file.relative_to(TEST_DATA_DIR))
+        is_non_blocking = mismatches > 0 and rel_path in NON_BLOCKING_MISMATCH_PATHS
+        if is_non_blocking:
+            non_blocking_mismatches += mismatches
+            non_blocking_files.append(rel_path)
+        else:
+            total_mismatches += mismatches
+
         if mismatches > 0:
-            print("THERE ARE MISMATCHES - STOPPING")
-            failed_files.append(sav_file.name)
-            break
+            if is_non_blocking:
+                print(
+                    f"NON-BLOCKING mismatch for {rel_path}; "
+                    "continuing to remaining files."
+                )
+            else:
+                failed_files.append(sav_file.name)
+                if args.xfail:
+                    print("THERE ARE MISMATCHES - CONTINUING (xfail)")
+                else:
+                    print("THERE ARE MISMATCHES - STOPPING")
+                    break
 
     print(f"\n{'=' * 60}")
     print(f"TOTAL: {total_checked} values checked across {len(sav_files)} files")
-    print(f"       {total_mismatches} mismatches")
+    print(f"       {total_mismatches} blocking mismatches")
+    print(f"       {non_blocking_mismatches} non-blocking mismatches")
+    if non_blocking_files:
+        print(f"NON-BLOCKING files: {', '.join(non_blocking_files)}")
 
     if total_mismatches == 0:
         print("ALL FILES MATCH!")

@@ -32,9 +32,9 @@ pub fn read_metadata<R: Read + Seek>(
     let mut page_reader = PageReader::new(reader, header.clone(), endian, format);
     let mut metadata_builder = MetadataBuilder::new(header.encoding_byte);
     let mut pages_read = 0usize;
+    let mut first_data_page: Option<usize> = None;
     let mut mix_data_rows = 0usize;
 
-    // Read metadata pages until we have all column information
     loop {
         if !page_reader.read_page()? {
             break;
@@ -43,9 +43,12 @@ pub fn read_metadata<R: Read + Seek>(
 
         let page_header = page_reader.get_page_header()?;
 
-        // Only process metadata pages
+        // Record the first DATA page index, but keep scanning to capture AMD pages.
         if !is_metadata_page(&page_header) {
-            break; // Stop when we hit data pages
+            if first_data_page.is_none() {
+                first_data_page = Some(pages_read.saturating_sub(1));
+            }
+            continue;
         }
 
         let subheaders = page_reader.get_subheaders(&page_header)?;
@@ -84,9 +87,8 @@ pub fn read_metadata<R: Read + Seek>(
         // COLUMN_NAME, COLUMN_ATTRIBUTES, and FORMAT_AND_LABEL subheaders
     }
 
-    // The last page read was the first DATA page (or EOF if no data pages).
-    // first_data_page = pages_read - 1 (0-indexed).
-    let first_data_page = pages_read.saturating_sub(1);
+    // If no DATA pages were encountered, fall back to the total pages read.
+    let first_data_page = first_data_page.unwrap_or(pages_read.saturating_sub(1));
 
     // Don't collect data_subheaders - causes issues with page state management
     // Instead, filter during data reading phase
@@ -282,18 +284,20 @@ impl MetadataBuilder {
         format: Format,
     ) -> Result<()> {
         let offset = subheader.offset;
-        let integer_size = match format {
+        let signature_len = match format {
             Format::Bit64 => 8,
             Format::Bit32 => 4,
         };
 
-        // Length is at offset + integer_size (2 bytes)
-        let text_block_size = buf.get_u16(offset + integer_size)? as usize;
+        // Read remainder (for parity with ReadStat) but do not use as the text length.
+        // ReadStat copies the entire subheader payload: len - signature_len.
+        let _remainder = buf.get_u16(offset + signature_len)? as usize;
+        let text_len = subheader.length.saturating_sub(signature_len);
 
-        if text_block_size > 0 {
-            // Text starts at offset + integer_size and is text_block_size bytes long
-            let text_offset = offset + integer_size;
-            let text_bytes = buf.get_bytes(text_offset, text_block_size)?;
+        if text_len > 0 {
+            // Text starts at offset + signature_len and spans the full payload.
+            let text_offset = offset + signature_len;
+            let text_bytes = buf.get_bytes(text_offset, text_len)?;
 
             // Check for compression signatures (these are ASCII so no encoding needed)
             if text_bytes

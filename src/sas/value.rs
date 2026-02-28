@@ -99,6 +99,11 @@ impl ValueParser {
             end -= 1;
         }
 
+        // Stop at the first NUL to match ReadStat's C-string behavior
+        if let Some(pos) = bytes[..end].iter().position(|&b| b == 0) {
+            end = pos;
+        }
+
         // Check for empty or all-space/null string
         if end == 0 {
             return if self.missing_string_as_null {
@@ -302,6 +307,7 @@ mod tests {
     fn test_parse_character() {
         // Use UTF-8 encoding (byte 20)
         let parser = ValueParser::new(Endian::Little, 20, true);
+        let parser_keep_empty = ValueParser::new(Endian::Little, 20, false);
 
         // Test normal string
         let bytes = b"hello   ";
@@ -317,6 +323,14 @@ mod tests {
         match value {
             Value::Character(None) => {}
             _ => panic!("Expected missing character value"),
+        }
+
+        // Leading NUL should truncate to empty (ReadStat C-string behavior)
+        let bytes = b"\0@f";
+        let value = parser_keep_empty.parse_character(bytes).unwrap();
+        match value {
+            Value::Character(Some(s)) => assert_eq!(s, ""),
+            _ => panic!("Expected empty character value"),
         }
     }
 }

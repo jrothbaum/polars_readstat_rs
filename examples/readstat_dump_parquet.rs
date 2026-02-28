@@ -1,5 +1,5 @@
 use polars::prelude::*;
-use polars_readstat_rs::{readstat_scan, ScanOptions};
+use polars_readstat_rs::{readstat_scan, InformativeNullColumns, InformativeNullOpts, ScanOptions};
 use std::path::PathBuf;
 
 fn main() -> PolarsResult<()> {
@@ -16,6 +16,22 @@ fn main() -> PolarsResult<()> {
 
     let mut opts = ScanOptions::default();
     opts.missing_string_as_null = Some(false);
+    if let Ok(value) = std::env::var("READSTAT_INFORMATIVE_NULLS") {
+        let value = value.trim();
+        if !value.is_empty() {
+            let columns = if matches!(value, "1" | "true" | "all" | "ALL") {
+                InformativeNullColumns::All
+            } else {
+                let cols = value
+                    .split(',')
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect::<Vec<_>>();
+                InformativeNullColumns::Selected(cols)
+            };
+            opts.informative_nulls = Some(InformativeNullOpts::new(columns));
+        }
+    }
     if std::env::var("READSTAT_VALUE_LABELS_AS_STRINGS")
         .ok()
         .is_some()

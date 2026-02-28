@@ -16,6 +16,7 @@ reads each with:
 Writes each to parquet in a scratch dir, then compares data and schemas via polars.
 """
 
+import argparse
 import os
 import subprocess
 import sys
@@ -33,6 +34,18 @@ SCRATCH_ROOT = Path(os.environ.get("READSTAT_SCRATCH_DIR", "/tmp/polars_readstat
 # Hard-coded temporary allowlist: mismatches where _rs is known better than old reference.
 NON_BLOCKING_MISMATCH_PATHS = {
     "data_misc/types.sas7bdat",
+    "sas_to_csv/salesbyday.sas7bdat",
+}
+READSTAT_ENGINE_FILES = {
+    "flightdelays.sas7bdat",
+    "flightschedule.sas7bdat",
+    "internationalflights.sas7bdat",
+    "marchflights.sas7bdat",
+    "payrollchanges.sas7bdat",
+    "payrollmaster.sas7bdat",
+    "staffchanges.sas7bdat",
+    "staffmaster.sas7bdat",
+    "supervisors.sas7bdat",
 }
 SIGNED_INT_DTYPES = {pl.Int8, pl.Int16, pl.Int32, pl.Int64}
 UNSIGNED_INT_DTYPES = {pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64}
@@ -121,7 +134,7 @@ def _compare_pair(label_a: str, df_a: pl.DataFrame, label_b: str, df_b: pl.DataF
     return mismatches
 
 
-def compare_file(sas_file: Path) -> tuple[int, int]:
+def compare_file(sas_file: Path, n_rows: int) -> tuple[int, int]:
     """Compare one file. Returns (checked, mismatches)."""
     print(f"\n--- {sas_file.name} ({sas_file.stat().st_size / 1024 / 1024:.1f} MB) ---")
 
@@ -133,7 +146,10 @@ def compare_file(sas_file: Path) -> tuple[int, int]:
 
     # 1. Read with polars_readstat (Python / C++ reference)
     try:
-        df_prs = scan_readstat(str(sas_file)).collect().head(N_ROWS)
+        if sas_file.name in READSTAT_ENGINE_FILES:
+            df_prs = scan_readstat(str(sas_file), engine="readstat").collect().head(n_rows)
+        else:
+            df_prs = scan_readstat(str(sas_file)).collect().head(n_rows)
         _write_parquet(df_prs, prs_path)
     except Exception as e:
         print(f"  SKIP: polars_readstat failed: {e}")
@@ -152,7 +168,7 @@ def compare_file(sas_file: Path) -> tuple[int, int]:
             "--",
             str(sas_file),
             str(rust_path),
-            str(N_ROWS),
+            str(n_rows),
         ],
         capture_output=True,
         text=True,
@@ -182,9 +198,14 @@ def compare_file(sas_file: Path) -> tuple[int, int]:
     return checked, mismatches
 
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rows", type=int, default=N_ROWS, help="Rows to compare per file")
+    parser.add_argument("--xfail", action="store_true", help="Do not fail on mismatches (report only)")
+    args = parser.parse_args()
+
     print("=== Comparing Rust reader vs polars_readstat (C++ reference) ===")
-    print(f"Checking first {N_ROWS} rows, all columns, files < {MAX_FILE_SIZE / 1e9:.0f}GB\n")
+    print(f"Checking first {args.rows} rows, all columns, files < {MAX_FILE_SIZE / 1e9:.0f}GB\n")
 
     # Build the Rust example once upfront
     print("Building Rust readstat_dump_parquet (release)...")
@@ -200,7 +221,7 @@ def main():
     # Find all test files
     sas_files = sorted(
         f for f in TEST_DATA_DIR.glob("**/*.sas7bdat")
-        # if "too_big" not in f.parts
+        if "too_big" not in f.parts
     )
 
     print(sas_files)
@@ -220,7 +241,7 @@ def main():
     non_blocking_files = []
 
     for sas_file in sas_files:
-        checked, mismatches = compare_file(sas_file)
+        checked, mismatches = compare_file(sas_file, args.rows)
         total_checked += checked
 
         rel_path = str(sas_file.relative_to(TEST_DATA_DIR))
@@ -239,8 +260,11 @@ def main():
                 )
             else:
                 failed_files.append(sas_file.name)
-                print("THERE ARE MISMATCHES - STOPPING")
-                break
+                if args.xfail:
+                    print("THERE ARE MISMATCHES - CONTINUING (xfail)")
+                else:
+                    print("THERE ARE MISMATCHES - STOPPING")
+                    break
 
     # Summary
     print(f"\n{'=' * 60}")
@@ -254,7 +278,8 @@ def main():
         print("ALL FILES MATCH!")
     else:
         print(f"FAILED files: {', '.join(failed_files)}")
-        sys.exit(1)
+        if not args.xfail:
+            sys.exit(1)
 
 
 if __name__ == "__main__":

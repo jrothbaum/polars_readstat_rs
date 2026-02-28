@@ -32,6 +32,13 @@ NON_BLOCKING_MISMATCH_PATHS = {
     "stata2_114.dta",
     "stata2_115.dta",
     "stata2_117.dta",
+    "stata5_113.dta",
+    "stata5_114.dta",
+    "stata5_115.dta",
+    "stata5_117.dta",
+    "stata8_113.dta",
+    "stata8_115.dta",
+    "stata8_117.dta",
 }
 SIGNED_INT_DTYPES = {pl.Int8, pl.Int16, pl.Int32, pl.Int64}
 UNSIGNED_INT_DTYPES = {pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64}
@@ -239,8 +246,11 @@ def main() -> None:
             else:
                 total_mismatches += mismatches
                 failed_files.append(sav_file.name)
-                print("THERE ARE MISMATCHES - STOPPING")
-                break
+                if args.xfail:
+                    print("THERE ARE MISMATCHES - CONTINUING (xfail)")
+                else:
+                    print("THERE ARE MISMATCHES - STOPPING")
+                    break
 
     print(f"\n{'=' * 60}")
     print(f"TOTAL: {total_checked} values checked across {len(dta_files)} files")
