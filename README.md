@@ -1,3 +1,6 @@
+> [!WARNING]
+This repository is deprecated. The code has been integrated into [polars_readstat](https://github.com/jrothbaum/polars_readstat). That repository includes the rust code that was formerly here as well as the python bindings.  Please use that instead.
+
 # polars_readstat_rs
 
 Rust library for reading SAS (`.sas7bdat`), Stata (`.dta`), and SPSS (`.sav`/`.zsav`) files with Polars.
